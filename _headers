@@ -1,0 +1,22 @@
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: SAMEORIGIN
+  Referrer-Policy: strict-origin-when-cross-origin
+
+/index.html
+  Cache-Control: no-cache
+
+/content/manifest.json
+  Cache-Control: no-cache
+
+/content/*.md
+  Cache-Control: public, max-age=300
+
+/assets/*
+  Cache-Control: public, max-age=604800
+
+# 脚本与 SQL 直接下载，不在浏览器里打开
+/downloads/*
+  Content-Disposition: attachment
+  Cache-Control: no-cache
+  X-Content-Type-Options: nosniff

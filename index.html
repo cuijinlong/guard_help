@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>能源管理平台 · 使用手册</title>
+  <meta name="description" content="能源管理平台使用手册与系统运维手册">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <button class="menu-toggle" id="menuToggle" aria-label="菜单">
+      <span></span><span></span><span></span>
+    </button>
+    <a class="brand" href="#/user/quick-start">
+      <span class="brand-mark"></span>
+      <span class="brand-text">能源管理平台<em>使用手册</em></span>
+    </a>
+    <div class="topbar-right">
+      <span class="version" id="version"></span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar" id="sidebar">
+      <nav id="nav" class="nav"></nav>
+    </aside>
+
+    <main class="main" id="main">
+      <div class="content-wrap">
+        <article class="markdown" id="content">
+          <div class="loading">正在加载…</div>
+        </article>
+        <aside class="toc" id="toc"></aside>
+      </div>
+    </main>
+  </div>
+
+  <script src="assets/vendor/marked.min.js"></script>
+  <script src="assets/app.js"></script>
+</body>
+</html>
