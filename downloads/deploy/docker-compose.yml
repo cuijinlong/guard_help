@@ -1,12 +1,26 @@
 # 能源管理平台 · 单机 Docker 部署
 #
-# 设计取舍：
-#   · 不构建自定义镜像 —— 直接挂载官方 JRE 跑 jar。
-#     这样镜像层里不落任何业务文件，卸载时删掉目录就真的没有残留。
-#   · 数据库与业务数据都走「命名卷 / 挂载目录」，不做匿名卷。
-#   · install 放在独立 profile 里，正常 up 不会误跑。
+# 架构（全部在同一个 compose 网络里）：
 #
-# 使用：所有变量从同目录 .env 读取，不要在这里写死密码。
+#   浏览器 ──▶ gateway (nginx :80) ──┬──▶ energy-server (Java, 8090)
+#                                    ├──▶ ngxai-backend (Python, 18801)
+#                                    └──▶ /ngxai/ 静态文件（前端构建产物）
+#
+# 对外只暴露 gateway 一个端口。数据库与应用服务都不直接对外。
+#
+# 两种部署模式，由 .env 的 DEPLOY_MODE 选择：
+#
+#   DEPLOY_MODE=split     （默认）分容器：每个组件独立容器，可单独重启/升级
+#   DEPLOY_MODE=allinone  单容器：全部进程跑在一个容器里，只暴露一个端口
+#
+# 两种模式用 compose profile 隔离，不会互相启动对方的服务。
+# 单容器模式的 install 由容器 entrypoint 自动完成，不需要 install 服务。
+#
+# 设计取舍：
+#   · 不构建自定义 Java/nginx 镜像 —— 官方镜像 + 挂载 jar / 配置 / 静态文件。
+#     镜像层里不落业务文件，卸载时删目录就干净了。
+#   · ngxai-backend 必须构建镜像：pip 依赖（含 Prophet 编译 Stan）无法挂载复用。
+#   · install 放在独立 profile，正常 up 不会误跑。
 
 name: energy
 
@@ -26,6 +40,7 @@ x-db-env: &db-env
 services:
 
   postgres:
+    profiles: ["split"]
     image: postgres:16-alpine
     container_name: energy-postgres
     restart: unless-stopped
@@ -33,7 +48,6 @@ services:
       POSTGRES_DB: ${DB_NAME:-thingsboard}
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
-      # 中文标题、客户名需要正确的排序与编码
       LANG: C.UTF-8
     command:
       - postgres
@@ -43,23 +57,18 @@ services:
       - shared_buffers=256MB
     volumes:
       - pgdata:/var/lib/postgresql/data
-    ports:
-      # 只绑回环：数据库不对外暴露。需要远程连库时用 SSH 隧道。
-      - "127.0.0.1:${DB_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-thingsboard}"]
       interval: 5s
       timeout: 3s
       retries: 20
       start_period: 10s
+    # 数据库不对外暴露：调试用 docker compose exec postgres psql
     logging: *default-logging
 
   # 一次性任务：建表 + 装载系统资源。跑完即退出，不常驻。
-  #   docker compose --profile install run --rm install
   install:
     image: eclipse-temurin:25-jre
-    # 刻意不设 container_name：compose run --rm 会自己命名并在退出后删除，
-    # 固定名字会让它创建 <name>-run-<hash> 后删不掉，留下 Created 残留。
     profiles: ["install"]
     environment:
       <<: *db-env
@@ -83,7 +92,8 @@ services:
       - --server.port=0
     logging: *default-logging
 
-  server:
+  energy-server:
+    profiles: ["split"]
     image: eclipse-temurin:25-jre
     container_name: energy-server
     restart: unless-stopped
@@ -92,7 +102,6 @@ services:
         condition: service_healthy
     environment:
       <<: *db-env
-      # 单机版关闭集群组件，避免额外的端口与外部依赖
       HTTP_ENABLED: "false"
       MQTT_ENABLED: "false"
       COAP_ENABLED: "false"
@@ -104,15 +113,115 @@ services:
       - ${APP_HOME}/guard-server-4.4.0.jar:/opt/energy/app.jar:ro
       - ${APP_HOME}/data:/opt/energy/data:ro
       - ${APP_HOME}/logs:/opt/energy/logs
-    ports:
-      - "${HTTP_PORT:-8090}:8090"
+    # 不对宿主暴露端口：所有访问都经 gateway。排障用 docker compose exec。
+    expose:
+      - "8090"
     entrypoint: ["java", "-Dinstall.data_dir=/opt/energy/data", "-jar", "/opt/energy/app.jar"]
     command:
       - --spring.config.name=thingsboard
       - --spring.profiles.active=${SPRING_PROFILE:-dev}
       - --server.port=8090
+    healthcheck:
+      # temurin 镜像里没有 curl/wget，只能用 bash 的 /dev/tcp 探端口
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8090"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+    logging: *default-logging
+
+  ngxai-backend:
+    profiles: ["split"]
+    # 首次 up 会自动构建；镜像已存在且源码未变时秒过（有层缓存）
+    build:
+      context: ${APP_HOME}/ngxai-backend
+      dockerfile: Dockerfile.prod
+    image: ${AI_IMAGE:-energy/ngxai-backend:4.4.0}
+    container_name: energy-ngxai-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      energy-server:
+        condition: service_started
+    environment:
+      # 容器内互相访问用服务名；这里的 127.0.0.1 会是容器自己，必须是服务名
+      TB_BASE_URL: http://energy-server:8090
+      TB_USERNAME: ${TB_API_USERNAME:-tenant@thingsboard.org}
+      TB_PASSWORD: ${TB_API_PASSWORD:-tenant}
+      TB_MAX_CONCURRENCY: "16"
+      PG_ENABLED: "1"
+      PG_DSN: postgresql://${DB_USER:-postgres}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-thingsboard}
+      SQLITE_PATH: /app/data/ngxai.db
+      # 同源访问（都经 gateway），CORS 实际不触发；保留内网地址便于直连调试
+      CORS_ORIGINS: http://localhost:${HTTP_PORT:-8090},http://127.0.0.1:${HTTP_PORT:-8090}
+    volumes:
+      - ngxai-data:/app/data
+    expose:
+      - "18801"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18801/ngxapi/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+    logging: *default-logging
+
+  gateway:
+    profiles: ["split"]
+    image: nginx:1.27-alpine
+    container_name: energy-gateway
+    restart: unless-stopped
+    depends_on:
+      - energy-server
+      - ngxai-backend
+    ports:
+      - "${HTTP_PORT:-8090}:80"
+    volumes:
+      - ${APP_HOME}/nginx/energy.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${APP_HOME}/ngxai-dist:/usr/share/nginx/html/ngxai:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    logging: *default-logging
+
+  # ---------------------------------------------------------------- 单容器模式
+  allinone:
+    profiles: ["allinone"]
+    build:
+      context: ${APP_HOME}
+      dockerfile: allinone/Dockerfile
+    image: ${ALLINONE_IMAGE:-energy/allinone:4.4.0}
+    container_name: energy-allinone
+    restart: unless-stopped
+    environment:
+      DB_NAME: ${DB_NAME:-thingsboard}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
+      SERVER_HEAP_MB: ${SERVER_HEAP_MB:-2048}
+      SPRING_PROFILE: ${SPRING_PROFILE:-dev}
+      TB_API_USERNAME: ${TB_API_USERNAME:-tenant@thingsboard.org}
+      TB_API_PASSWORD: ${TB_API_PASSWORD:-tenant}
+    ports:
+      - "${HTTP_PORT:-8090}:80"
+    volumes:
+      # PostgreSQL 数据、SQLite、日志都在这里；升级镜像不丢数据
+      - allinone-data:/var/lib/energy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1/api/noauth/setup/state | grep -q '\"status\"' || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+      start_period: 240s
     logging: *default-logging
 
 volumes:
   pgdata:
     name: energy-pgdata
+  ngxai-data:
+    name: energy-ngxai-data
+  allinone-data:
+    name: energy-allinone-data

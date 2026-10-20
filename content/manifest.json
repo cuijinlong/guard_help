@@ -1,6 +1,6 @@
 {
   "title": "能源管理平台 · 使用手册",
-  "version": "v0.4",
+  "version": "v0.5",
   "updated": "2026-10-20",
   "sections": [
     {
@@ -76,6 +76,11 @@
           "id": "deploy",
           "title": "部署：选场景",
           "file": "admin/02-deploy.md"
+        },
+        {
+          "id": "deploy-modes",
+          "title": "单容器 or 分容器",
+          "file": "admin/02c-deploy-modes.md"
         },
         {
           "id": "deploy-local",

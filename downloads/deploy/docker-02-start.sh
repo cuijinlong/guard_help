@@ -33,30 +33,59 @@ done
 set -a; . ./.env; set +a
 PORT="${HTTP_PORT:-8090}"
 BASE="http://127.0.0.1:${PORT}"
+MODE="${DEPLOY_MODE:-split}"
+case "$MODE" in
+  split)    PROFILE_ARGS="--profile split";    TARGET="energy-server gateway" ;;
+  allinone) PROFILE_ARGS="--profile allinone"; TARGET="allinone" ;;
+  *) die "DEPLOY_MODE 只能是 split 或 allinone，当前：$MODE" ;;
+esac
 # 本机代理会把 127.0.0.1 也接管，必须绕过
 ncurl() { curl -s --noproxy '*' "$@"; }
 
 # ---------------- 1. 检查 install 是否做过 ----------------
-TABLES=$($COMPOSE exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc \
+if [[ "$MODE" == "allinone" ]]; then
+  # 单容器的表在容器内，先确保容器起来再问表数
+  $COMPOSE $PROFILE_ARGS up -d --build allinone
+  log "等待容器内 PostgreSQL 与 install 完成（首次约 3-5 分钟）"
+else
+TABLES=$($COMPOSE $PROFILE_ARGS exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc \
   "select count(*) from information_schema.tables where table_schema='public'" 2>/dev/null | tr -d ' ' || echo 0)
 [[ "${TABLES:-0}" -ge 100 ]] || die "库还没初始化（${TABLES:-0} 张表）。先跑 bash docker-01-install.sh"
+fi
 
 # ---------------- 2. 启动服务 ----------------
+if [[ "$MODE" == "allinone" ]]; then
+  log "启动单容器（已在上一步拉起，等待就绪）"
+else
 log "启动服务"
-$COMPOSE up -d server
+# 不带服务名：把 postgres / energy-server / ngxai-backend / gateway 一起拉起来。
+# 首次运行会构建 ngx-ai 后端镜像（pip 装依赖 + 编译 Stan，约 5-10 分钟）。
+log "启动全部服务（首次构建 ngx-ai 镜像较慢，请耐心）"
+$COMPOSE $PROFILE_ARGS up -d --build
+fi
 
-log "等待服务就绪（首次约 60–120 秒）"
+if [[ "$MODE" == "allinone" ]]; then
+  WAIT_MAX=180   # 单容器首次要跑 install，给 15 分钟
+  log "等待服务就绪（单容器首次含 install，约 3–5 分钟）"
+else
+  WAIT_MAX=48
+  log "等待服务就绪（首次约 60–120 秒）"
+fi
+
 STATE=""
-for i in $(seq 1 48); do
+for i in $(seq 1 $WAIT_MAX); do
   sleep 5
-  STATE=$(ncurl -m 4 "$BASE/api/noauth/setup/state" 2>/dev/null || true)
-  if [[ -n "$STATE" ]]; then
+  # 只认 JSON 响应。nginx 在上游还没起来时会返回 502 HTML，
+  # 那不是"就绪"——旧逻辑只判断"有输出"，会把 502 当成功。
+  RESP=$(ncurl -m 4 "$BASE/api/noauth/setup/state" 2>/dev/null || true)
+  if echo "$RESP" | grep -q '"status"'; then
+    STATE="$RESP"
     ok "服务已就绪（$((i*5))s）：$STATE"
     break
   fi
-  if [[ "$i" == "48" ]]; then
-    $COMPOSE logs --tail=40 server
-    die "240 秒内服务未就绪（上面是容器日志尾部）"
+  if [[ "$i" == "$WAIT_MAX" ]]; then
+    $COMPOSE $PROFILE_ARGS logs --tail=60 $TARGET
+    die "等待超时（$((WAIT_MAX*5)) 秒），上面是容器日志尾部"
   fi
 done
 

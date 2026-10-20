@@ -26,6 +26,7 @@ JAR="$ROOT/guard-server/target/guard-server-4.4.0.jar"
 TARGET=""
 PACK="false"
 FORCE="false"
+SKIP_AI="false"
 
 log()  { printf '\033[36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 ok()   { printf '\033[32m  ✓\033[0m %s\n' "$*"; }
@@ -36,6 +37,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --pack)   PACK="true"; shift ;;
     --force)  FORCE="true"; shift ;;
+    --skip-ai) SKIP_AI="true"; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     -*)       die "未知参数：$1" ;;
     *)        TARGET="$1"; shift ;;
@@ -92,7 +94,68 @@ cp "$HERE/docker-02-start.sh"        "$STAGE/"
 cp "$HERE/docker-99-uninstall.sh"    "$STAGE/"
 cp "$HERE/../scripts/02-onboard.sh"  "$STAGE/scripts/"
 cp "$HERE/../scripts/03-verify.sh"   "$STAGE/scripts/"
+
+# 网关配置（生产专用，仓库里的开发配置一律不动）
+mkdir -p "$STAGE/nginx"
+cp "$HERE/nginx/energy.conf" "$STAGE/nginx/"
+
+# 单容器模式所需的构建文件
+mkdir -p "$STAGE/allinone"
+cp "$HERE/allinone/Dockerfile"        "$STAGE/allinone/"
+cp "$HERE/allinone/supervisord.conf"  "$STAGE/allinone/"
+cp "$HERE/allinone/entrypoint.sh"     "$STAGE/allinone/"
+chmod +x "$STAGE/allinone/entrypoint.sh"
+
 chmod +x "$STAGE"/docker-*.sh "$STAGE"/scripts/*.sh
+
+# 单容器构建上下文 = 部署目录。必须排除 .env（含密码）与运行时产物，
+# 否则密码会被烤进镜像层，卸载重装也删不掉。
+cat > "$STAGE/.dockerignore" <<'IGNEOF'
+# 运行时与敏感文件，绝不能进镜像
+.env
+logs/
+scripts/
+docker-*.sh
+env.example
+.dockerignore
+IGNEOF
+
+# ---------------- 2b. ngx-ai（前端产物 + 后端源码） ----------------
+if [[ "$SKIP_AI" != "true" ]]; then
+  AI_ROOT="$ROOT/ngx-ai"
+  if [[ -d "$AI_ROOT/backend" && -d "$AI_ROOT/frontend" ]]; then
+    log "打包 ngx-ai"
+
+    # 后端源码：排除宿主虚拟环境与数据，Linux 容器里不能用 macOS 的 .venv
+    mkdir -p "$STAGE/ngxai-backend"
+    ( cd "$AI_ROOT/backend" && tar -cf - \
+        --exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' \
+        --exclude='.pytest_cache' --exclude='data' --exclude='.env' \
+        --exclude='.DS_Store' . ) | ( cd "$STAGE/ngxai-backend" && tar -xf - )
+    cp "$HERE/ngxai/Dockerfile.backend" "$STAGE/ngxai-backend/Dockerfile.prod"
+    ok "后端源码：$(du -sh "$STAGE/ngxai-backend" | cut -f1)"
+
+    # 前端构建产物：base 用 /ngxai/，由 nginx 直接托管，不跑 node 容器
+    log "构建前端（base=/ngxai/，约 1 分钟）"
+    if [[ -d "$AI_ROOT/frontend/node_modules" ]]; then
+      ( cd "$AI_ROOT/frontend" && VITE_BASE=/ngxai/ npx vite build >/tmp/ngxai-build.log 2>&1 ) \
+        || { tail -20 /tmp/ngxai-build.log; die "前端构建失败"; }
+    else
+      docker run --rm -v "$AI_ROOT/frontend:/app" -w /app -e VITE_BASE=/ngxai/ \
+        node:22-slim sh -c 'corepack enable >/dev/null 2>&1; pnpm install --frozen-lockfile && pnpm exec vite build' \
+        >/tmp/ngxai-build.log 2>&1 \
+        || { tail -20 /tmp/ngxai-build.log; die "前端构建失败（容器方式）"; }
+    fi
+    rm -rf "$STAGE/ngxai-dist"
+    cp -R "$AI_ROOT/frontend/dist" "$STAGE/ngxai-dist"
+    grep -q '/ngxai/assets/' "$STAGE/ngxai-dist/index.html" \
+      || die "前端产物路径不对：index.html 里没有 /ngxai/assets/"
+    ok "前端产物：$(du -sh "$STAGE/ngxai-dist" | cut -f1)（base=/ngxai/）"
+  else
+    [[ "$SKIP_AI" == "true" ]] && die "已指定 --skip-ai，但 compose 仍引用 ngxai-backend；请使用默认的完整打包"
+    die "找不到 ngx-ai 源码（$AI_ROOT/backend 或 frontend），无法打包完整部署包"
+  fi
+fi
 
 # ---------------- 3. 生成 .env ----------------
 # APP_HOME 自动填成实际目录，避免手改路径出错；DB_PASSWORD 自动生成随机密码。
@@ -122,6 +185,7 @@ if [[ "$PACK" != "true" ]]; then
   cat > "$STAGE/.env" <<ENVEOF
 # 由 docker-00-prepare.sh 自动生成于 $(date '+%Y-%m-%d %H:%M:%S')
 # 想改端口或密码，直接改这个文件。
+DEPLOY_MODE=${DEPLOY_MODE:-split}
 APP_HOME=$STAGE
 HTTP_PORT=$HTTP_PORT
 DB_NAME=thingsboard
@@ -129,7 +193,12 @@ DB_USER=postgres
 DB_PASSWORD=$DB_PASS
 DB_PORT=$DB_PORT
 SERVER_HEAP=2g
+SERVER_HEAP_MB=2048
 SPRING_PROFILE=dev
+AI_IMAGE=energy/ngxai-backend:4.4.0
+ALLINONE_IMAGE=energy/allinone:4.4.0
+TB_API_USERNAME=tenant@thingsboard.org
+TB_API_PASSWORD=tenant
 ENVEOF
   ok "已生成 .env（APP_HOME 已填好，端口检测后取 ${HTTP_PORT}/${DB_PORT}，密码随机生成）"
 fi

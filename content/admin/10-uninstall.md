@@ -96,16 +96,38 @@ bash docker-99-uninstall.sh --purge --yes
 
 > 脚本执行到最后会把自己的目录删掉，所以提示符之后 `cd` 会失效，属正常。回到上级目录即可：`cd ~`。
 
-## 三、连镜像一起删
+## 三、镜像删不删（节省二次部署时间）
 
-默认**不删** `postgres:16-alpine` 和 `eclipse-temurin:25-jre` —— 可能被别的项目在用。确实要清理时：
+镜像清理是独立开关，**默认一个都不删**。
 
 ```bash
 cd ~/energy-app
-bash docker-99-uninstall.sh --purge --yes --purge-images
+
+# 保留全部镜像（最快再部署：自建镜像重建要 5-20 分钟）
+bash docker-99-uninstall.sh --purge --yes --images=none
+
+# 只删自建镜像（energy/ngxai-backend、energy/allinone）
+bash docker-99-uninstall.sh --purge --yes --images=app
+
+# 连公共基础镜像一起删（postgres、nginx、temurin、python、node）
+bash docker-99-uninstall.sh --purge --yes --images=all
 ```
 
-如果提示「仍被其他容器使用，已跳过」，说明有别的项目依赖它，跳过是正确行为。
+三个选项怎么选：
+
+| 场景 | 建议 |
+| --- | --- |
+| 马上要重装 / 只是改配置重来 | `--images=none` |
+| 不再用这个项目，但机器上还有别的 Docker 项目 | `--images=app` |
+| 完全清理这台机器 | `--images=all` |
+
+**为什么默认保留**：
+
+- `energy/ngxai-backend` 要 pip 装依赖 + 编译 Stan，重建 5–10 分钟
+- `energy/allinone` 更大，重建 10–20 分钟
+- `postgres:16-alpine` / `nginx` / `temurin` 常被其他项目复用，删了会影响别人
+
+如果提示「仍被其他项目使用，已跳过」，说明确实有别的容器依赖它，跳过是正确行为。
 
 ## 四、自己再验一遍（可选）
 

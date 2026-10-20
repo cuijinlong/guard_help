@@ -1,0 +1,55 @@
+# ngx-ai 后端 · 生产镜像
+#
+# 与开发镜像（ngx-ai/backend/Dockerfile）的区别：
+#   · 不带 --reload，不挂载源码
+#   · 只 COPY 运行必需的文件，.venv / __pycache__ / data 都排除
+#   · 非 root 用户运行
+#
+# 构建上下文必须是 ngx-ai/backend（源码目录），由 compose 的 build.context 指定。
+# 本文件放在部署包内，不修改开发用 Dockerfile。
+
+FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TZ=Asia/Shanghai
+
+# build-essential: cmdstanpy 首次 import 会编译 Stan 模型
+# curl: 容器健康检查
+# tzdata: 峰谷时段按本地时区划分
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        tzdata \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 依赖层单独缓存：只改源码不会触发 pip 重装
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 构建期编译一次 Stan 模型，避免首次预测多等 40 秒
+RUN python -c "from prophet import Prophet; print('stan model cached')"
+
+COPY . .
+
+# 数据目录归非 root 用户，配合 compose 的命名卷
+RUN mkdir -p /app/data \
+    && useradd --create-home --uid 10001 ngxai \
+    && chown -R ngxai:ngxai /app
+
+USER ngxai
+
+EXPOSE 18801
+
+# 生产：单 worker（SQLite 写入并发有限），不开 reload
+# timeout-keep-alive 与 nginx 的 300s 对齐，避免长预测被提前断开
+CMD ["python", "-m", "uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "18801", \
+     "--workers", "1", \
+     "--timeout-keep-alive", "300"]
