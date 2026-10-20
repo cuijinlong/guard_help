@@ -1,6 +1,6 @@
 {
   "title": "能源管理平台 · 使用手册",
-  "version": "v0.5",
+  "version": "v0.6",
   "updated": "2026-10-20",
   "sections": [
     {
@@ -74,7 +74,7 @@
         },
         {
           "id": "deploy",
-          "title": "部署：选场景",
+          "title": "部署：照着做",
           "file": "admin/02-deploy.md"
         },
         {
@@ -83,13 +83,8 @@
           "file": "admin/02c-deploy-modes.md"
         },
         {
-          "id": "deploy-local",
-          "title": "A · 本机 Docker",
-          "file": "admin/02a-deploy-local.md"
-        },
-        {
           "id": "deploy-remote",
-          "title": "B · 上传到服务器",
+          "title": "部署到服务器",
           "file": "admin/02b-deploy-remote.md"
         },
         {
@@ -134,7 +129,7 @@
         },
         {
           "id": "baremetal",
-          "title": "C · 裸机部署",
+          "title": "裸机部署",
           "file": "admin/11-baremetal.md"
         }
       ]

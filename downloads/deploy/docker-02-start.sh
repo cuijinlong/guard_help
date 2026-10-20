@@ -28,9 +28,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -f .env ]] || die "缺少 .env"
+[[ -f .env ]] || die "缺少 .env。先跑 bash docker-01-install.sh（它会生成并校验配置）"
 # shellcheck disable=SC1091
 set -a; . ./.env; set +a
+
+# APP_HOME 是 compose 里挂载 jar 与 data 的基准路径，空值会让 compose 直接报错。
+# 正常流程是 01 → 02，这里只是防止跳过 01 直接跑 02。
+if [[ -z "${APP_HOME:-}" || ! -f "${APP_HOME}/guard-server-4.4.0.jar" ]]; then
+  die "APP_HOME 未设置或无效（当前：${APP_HOME:-空}）。先跑 bash docker-01-install.sh，它会自动修正"
+fi
 PORT="${HTTP_PORT:-8090}"
 BASE="http://127.0.0.1:${PORT}"
 MODE="${DEPLOY_MODE:-split}"
@@ -125,14 +131,41 @@ fi
 
 ME=$(ncurl -m 20 -H "X-Authorization: Bearer $TOKEN" "$BASE/api/auth/user")
 echo "$ME" | grep -q '"authority":"SYS_ADMIN"' || die "登录成功但不是 SYS_ADMIN，返回：$ME"
-ok "系统管理员可登录，权限 SYS_ADMIN"
 
-echo
-ok "第 2 步完成"
-echo "   访问地址：http://<服务器IP>:${PORT}/"
-echo "   管理员：  $ADMIN_EMAIL"
-echo "   下一步：  开租户与客户"
-echo "             bash ../scripts/02-onboard.sh --base http://127.0.0.1:${PORT} \\"
-echo "               --admin $ADMIN_EMAIL --admin-pass '...' \\"
-echo "               --tenant \"某某集团\" --tenant-email tenant@example.com --tenant-pass '...' \\"
-echo "               --customer \"某某厂区\" --customer-email customer@example.com --customer-pass '...'"
+cat <<DONE
+
+============================================================
+ 第 3 步完成：服务已启动，管理员已就绪
+============================================================
+
+  访问地址
+    http://localhost:${PORT}/
+    （服务器部署则用 http://服务器IP:${PORT}/）
+
+  系统管理员
+    ${ADMIN_EMAIL}
+
+  现在可以用浏览器登录了。
+
+------------------------------------------------------------
+ 下一步：开一个租户和一个客户（可选，不建也能登录）
+------------------------------------------------------------
+
+  cd ${APP_HOME} && bash scripts/02-onboard.sh \\
+    --base http://127.0.0.1:${PORT} \\
+    --admin ${ADMIN_EMAIL} --admin-pass '你刚设的密码' \\
+    --tenant "环宇能源集团" \\
+    --tenant-email tenant@example.com --tenant-pass 'Tenant@12345' \\
+    --customer "星河工业园" \\
+    --customer-email customer@example.com --customer-pass 'Customer@123'
+
+  开完后跑验收：
+  cd ${APP_HOME} && bash scripts/03-verify.sh \\
+    --base http://127.0.0.1:${PORT} \\
+    --tenant tenant@example.com --tenant-pass 'Tenant@12345' \\
+    --customer customer@example.com --customer-pass 'Customer@123' \\
+    --ai http://127.0.0.1:${PORT}
+
+  预期最后一行：通过 22 / 失败 0
+
+DONE

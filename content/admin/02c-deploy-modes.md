@@ -56,8 +56,8 @@ energy-postgres (仅内网，无端口映射)
 ```bash
 cd ~/energy-app
 
-bash docker-01-install.sh                       # 建库 + install
-bash docker-02-start.sh --admin-email ... --admin-pass ...
+bash docker-01-install.sh
+bash docker-02-start.sh --admin-email admin@example.com --admin-pass 'ChangeMe123!'
 ```
 
 ### 单组件操作

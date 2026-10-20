@@ -73,9 +73,37 @@ fi
 
 # 已有部署时默认不动它：覆盖 .env 会换掉数据库密码，旧库立刻连不上
 if [[ "$PACK" != "true" && -f "$STAGE/.env" && "$FORCE" != "true" ]]; then
-  warn "目录 $STAGE 已存在且已初始化过（有 .env）"
-  echo "     要重新准备（会覆盖脚本与 .env，换掉数据库密码）请加 --force"
-  echo "     只想升级 jar/脚本、保留数据库，请用：bash docker-99-uninstall.sh 后重来，或手工替换 jar"
+  cat <<DONE
+
+============================================================
+ 第 1 步已经做过了
+============================================================
+
+  部署目录已存在，里面已有配置：
+    ${STAGE}
+    ${STAGE}/.env
+
+  不用再准备一遍。直接跳到下一步：
+
+    cd ${STAGE} && bash docker-01-install.sh
+
+  如果你已经跑过第 2 步（install），那条会提示"库已有 N 张表"并拒绝，
+  这也是正常的 —— 直接跳到第 3 步：
+
+    cd ${STAGE} && bash docker-02-start.sh --admin-email admin@example.com --admin-pass 'ChangeMe123!'
+
+------------------------------------------------------------
+ 真的要推翻重来
+------------------------------------------------------------
+
+  先卸载（会删掉数据库数据）：
+    cd ${STAGE} && bash docker-99-uninstall.sh --purge --yes
+  然后重新跑本脚本。
+
+  只覆盖脚本与 .env、不要旧数据，也可以加 --force：
+    bash $0 --force
+
+DONE
   exit 1
 fi
 
@@ -88,7 +116,9 @@ cp -R "$DATA_SRC/json" "$STAGE/data/"
 # 仓库里 data/sql 是符号链接，必须从 dao 的真实目录拷贝
 cp "$SQL_SRC"/*.sql "$STAGE/data/sql/"
 cp "$HERE/docker-compose.yml"        "$STAGE/"
-cp "$HERE/env.example"               "$STAGE/"
+# 不再拷 env.example 到部署目录：第 3 节会直接生成 .env，
+# 目录里只留一个配置文件，避免“到底该改哪个”的困惑。
+# env.example 仍保留在下载区，供查阅全部配置项含义。
 cp "$HERE/docker-01-install.sh"      "$STAGE/"
 cp "$HERE/docker-02-start.sh"        "$STAGE/"
 cp "$HERE/docker-99-uninstall.sh"    "$STAGE/"
@@ -116,7 +146,6 @@ cat > "$STAGE/.dockerignore" <<'IGNEOF'
 logs/
 scripts/
 docker-*.sh
-env.example
 .dockerignore
 IGNEOF
 
@@ -158,17 +187,26 @@ if [[ "$SKIP_AI" != "true" ]]; then
 fi
 
 # ---------------- 3. 生成 .env ----------------
-# APP_HOME 自动填成实际目录，避免手改路径出错；DB_PASSWORD 自动生成随机密码。
-if [[ "$PACK" != "true" ]]; then
-  gen_pass() {
-    if command -v openssl >/dev/null 2>&1; then
-      openssl rand -hex 12
-    else
-      # 没有 openssl 时的纯 shell 兜底，拼到 24 位十六进制样式
-      printf '%s%s%s' "$(date +%s)" "$$" "$RANDOM$RANDOM" | shasum | cut -c1-24
-    fi
-  }
-  DB_PASS=$(gen_pass)
+# 两种模式都生成 .env，用户不需要再 cp env.example：
+#   本机模式：APP_HOME 直接写实际目录，端口探测可用值
+#   打包模式：目标机路径未知，APP_HOME 留空，由 docker-01-install.sh
+#              在解压后的目录里自动填入（脚本里有自愈逻辑）
+gen_pass() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 12
+  else
+    # 没有 openssl 时的纯 shell 兜底，拼到 24 位十六进制样式
+    printf '%s%s%s' "$(date +%s)" "$$" "$RANDOM$RANDOM" | shasum | cut -c1-24
+  fi
+}
+DB_PASS=$(gen_pass)
+
+if [[ "$PACK" == "true" ]]; then
+  # 目标机器路径与端口都未知，用默认值；APP_HOME 留空待解压后自愈
+  ENV_APP_HOME=""
+  ENV_HTTP_PORT=8090
+  ENV_DB_PORT=5432
+else
   # 端口占用时自动顺延，省得用户手工排查
   port_free() {
     if command -v lsof >/dev/null 2>&1; then
@@ -181,17 +219,24 @@ if [[ "$PACK" != "true" ]]; then
   while ! port_free "$HTTP_PORT" && [[ "$HTTP_PORT" -lt 8200 ]]; do HTTP_PORT=$((HTTP_PORT+1)); done
   DB_PORT=5432
   while ! port_free "$DB_PORT" && [[ "$DB_PORT" -lt 5600 ]]; do DB_PORT=$((DB_PORT+1)); done
+  ENV_APP_HOME="$STAGE"
+  ENV_HTTP_PORT=$HTTP_PORT
+  ENV_DB_PORT=$DB_PORT
+fi
 
-  cat > "$STAGE/.env" <<ENVEOF
-# 由 docker-00-prepare.sh 自动生成于 $(date '+%Y-%m-%d %H:%M:%S')
-# 想改端口或密码，直接改这个文件。
+cat > "$STAGE/.env" <<ENVEOF
+# 由 docker-00-prepare.sh 生成于 $(date '+%Y-%m-%d %H:%M:%S')
+# 改端口或密码就改这个文件；改完删掉容器重跑 docker-01-install.sh。
+#
+# APP_HOME 留空时，docker-01-install.sh 会自动填成脚本所在目录：
+# 同一个包解压到任何路径都能直接跑，不必手工改路径。
 DEPLOY_MODE=${DEPLOY_MODE:-split}
-APP_HOME=$STAGE
-HTTP_PORT=$HTTP_PORT
+APP_HOME=$ENV_APP_HOME
+HTTP_PORT=$ENV_HTTP_PORT
 DB_NAME=thingsboard
 DB_USER=postgres
 DB_PASSWORD=$DB_PASS
-DB_PORT=$DB_PORT
+DB_PORT=$ENV_DB_PORT
 SERVER_HEAP=2g
 SERVER_HEAP_MB=2048
 SPRING_PROFILE=dev
@@ -200,38 +245,93 @@ ALLINONE_IMAGE=energy/allinone:4.4.0
 TB_API_USERNAME=tenant@thingsboard.org
 TB_API_PASSWORD=tenant
 ENVEOF
-  ok "已生成 .env（APP_HOME 已填好，端口检测后取 ${HTTP_PORT}/${DB_PORT}，密码随机生成）"
+
+if [[ "$PACK" == "true" ]]; then
+  ok "已生成 .env（随包分发；APP_HOME 解压后自动填入，密码随机）"
+else
+  ok "已生成 .env（APP_HOME 已填好，端口检测后取 ${ENV_HTTP_PORT}/${ENV_DB_PORT}，密码随机生成）"
 fi
 
 # ---------------- 4. 输出 ----------------
-echo
+# 输出规则：只说三件事 —— 东西在哪、密码是什么、下一条命令是什么。
+# 不要再罗列目录、不要再给多个选项，用户只需要照着敲。
+if [[ "$PACK" != "true" ]]; then
+  cat <<DONE
+
+============================================================
+ 第 1 步完成：部署文件已准备好
+============================================================
+
+  部署目录
+    ${STAGE}
+    （脚本默认装到 ~/energy-app，不是当前目录）
+
+  配置文件
+    ${STAGE}/.env
+    （隐藏文件，ls 看不到；要看内容用：cat ${STAGE}/.env）
+
+  数据库密码
+    ${DB_PASS}
+    ⚠ 现在就记到密码管理器，重装时还要用
+
+------------------------------------------------------------
+ 下一步：复制下面这一整行执行
+------------------------------------------------------------
+
+  cd ${STAGE} && bash docker-01-install.sh
+
+  预期输出最后一行：✓ 第 1 步完成
+  （注意：这里的"第 1 步"是安装脚本自己的计数，
+    与你正在走的"准备→安装→启动"编号无关）
+
+DONE
+  exit 0
+fi
+
 if [[ "$PACK" == "true" ]]; then
   OUT="$ROOT/dist"
   mkdir -p "$OUT"
   TAR="$OUT/energy-deploy-$(date +%Y%m%d).tar.gz"
   tar -czf "$TAR" -C "$(dirname "$STAGE")" energy-deploy
-  ok "发布包：${TAR}（$(du -h "$TAR" | cut -f1)）"
-  echo
-  echo "下一步：把包传到服务器。下面的 root@1.2.3.4 换成 你的用户名@你的服务器IP。"
-  echo
-  echo "  ── 在你自己的电脑上执行 ──"
-  echo "    scp $TAR root@1.2.3.4:/opt/"
-  echo
-  echo "  ── 登录服务器后执行 ──"
-  echo "    ssh root@1.2.3.4"
-  echo "    cd /opt && tar -xzf $(basename "$TAR") && cd energy-deploy"
-  echo "    bash docker-01-install.sh    # 会自动生成 .env，无需手工配置"
-  echo
-  echo "  没有服务器、只是本机试用：不用 --pack，直接"
-  echo "    bash $HERE/docker-00-prepare.sh"
-else
-  ok "部署目录已就绪：$STAGE"
-  echo "   内容："
-  ls -1 "$STAGE" | sed 's/^/      /'
-  echo
-  echo "   数据库密码（已写入 .env）：${DB_PASS}"
-  echo "   ⚠ 请把这行密码记到你的密码管理器，卸载重装时需要。"
-  echo
-  echo "   下一步（复制这一条就行）："
-  echo "      cd $STAGE && bash docker-01-install.sh"
+  cat <<DONE
+
+============================================================
+ 打包完成
+============================================================
+
+  发布包
+    ${TAR}
+    （$(du -h "$TAR" | cut -f1)）
+
+  数据库密码（已写进包内 .env）
+    ${DB_PASS}
+    ⚠ 现在就记到密码管理器
+
+------------------------------------------------------------
+ 下一步 A：在你自己的电脑上执行
+------------------------------------------------------------
+
+  scp ${TAR} root@1.2.3.4:/opt/
+
+  把 root@1.2.3.4 换成 你的用户名@你的服务器IP
+
+------------------------------------------------------------
+ 下一步 B：登录服务器后执行
+------------------------------------------------------------
+
+  ssh root@1.2.3.4
+  cd /opt && tar -xzf $(basename "$TAR") && cd energy-deploy
+  bash docker-01-install.sh
+
+  .env 已在包里，APP_HOME 会自动填成解压目录，不用手改。
+
+------------------------------------------------------------
+ 没有服务器、只是本机试用？
+------------------------------------------------------------
+
+  不要加 --pack，直接重跑：
+    bash $HERE/docker-00-prepare.sh
+
+DONE
+  exit 0
 fi

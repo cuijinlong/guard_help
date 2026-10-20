@@ -60,14 +60,14 @@ shiyongshouce/
 |---|---|
 | Framework preset | None |
 | Build command | （留空） |
-| Build output directory | `shiyongshouce` |
+| Build output directory | `/`（仓库根目录就是站点根） |
 
 推送后自动构建，几十秒生效。
 
 **方式二：直接上传**
 
 ```bash
-npx wrangler pages deploy shiyongshouce --project-name=energy-manual
+npx wrangler pages deploy . --project-name=energy-manual
 ```
 
 **自定义域名**：Cloudflare Pages → Custom domains，按提示加 CNAME。

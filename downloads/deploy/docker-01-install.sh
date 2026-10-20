@@ -3,8 +3,10 @@
 # 能源管理平台 · Docker 部署 第 1 步：环境检查 + 建库 + 初始化
 #
 # 用法（在 energy-deploy 目录内）：
-#   cp env.example .env && vi .env      # 先改密码和 APP_HOME
 #   bash docker-01-install.sh
+#
+# .env 已经由 docker-00-prepare.sh 生成，无需手工创建。
+# 若 .env 里的 APP_HOME 为空或指向不存在的目录，本脚本会自动改成当前目录。
 #
 # 做完这一步：数据库里有了 112 张表、726 个系统部件、34 个 bundle，
 # 但**还没有任何用户**，服务也还没启动。下一步跑 docker-02-start.sh。
@@ -63,6 +65,40 @@ ENVEOF
   log "未找到 .env，已自动生成（APP_HOME=$(pwd)，端口 ${_hp}/${_dp}，密码随机）"
 fi
 
+# .env 存在但 APP_HOME 不可用时自动修正为当前目录。
+# 典型场景：发布包里的 .env 是打包机生成的，APP_HOME 故意留空，
+# 解压到任意路径后直接跑本脚本，不该因为路径没改就报“找不到 jar”。
+if [[ -f .env ]]; then
+  _env_home=$(grep -E '^APP_HOME=' .env 2>/dev/null | head -1 | cut -d= -f2- || true)
+  if [[ -z "${_env_home:-}" || ! -f "${_env_home}/guard-server-4.4.0.jar" ]]; then
+    if [[ -f "$(pwd)/guard-server-4.4.0.jar" ]]; then
+      _abs_home="$(pwd)"
+      # 路径里若含 & 或 #，直接传给 sed 会被当成特殊字符，先转义
+      _safe_home=$(printf '%s' "$_abs_home" | sed 's/[&#]/\\&/g')
+      if grep -qE '^APP_HOME=' .env; then
+        # sed -i.bak 同时兼容 macOS 与 GNU sed；.bak 立即删掉
+        sed -i.bak "s#^APP_HOME=.*#APP_HOME=${_safe_home}#" .env && rm -f .env.bak
+      else
+        printf '\nAPP_HOME=%s\n' "$_abs_home" >> .env
+      fi
+      log "已把 .env 的 APP_HOME 修正为当前目录：${_abs_home}"
+    else
+      die "当前目录没有 guard-server-4.4.0.jar，无法作为部署目录：$(pwd)"
+    fi
+  fi
+
+  # 密码为空时补一个随机值，避免 compose 因空密码拒绝启动
+  if ! grep -qE '^DB_PASSWORD=.+$' .env; then
+    _p=$(openssl rand -hex 12 2>/dev/null || printf '%s%s' "$(date +%s)" "$RANDOM")
+    if grep -qE '^DB_PASSWORD=' .env; then
+      sed -i.bak "s#^DB_PASSWORD=.*#DB_PASSWORD=${_p}#" .env && rm -f .env.bak
+    else
+      printf 'DB_PASSWORD=%s\n' "$_p" >> .env
+    fi
+    log "DB_PASSWORD 为空，已补一个随机密码"
+  fi
+fi
+
 # shellcheck disable=SC1091
 set -a; . ./.env; set +a
 
@@ -116,9 +152,24 @@ if [[ "$MODE" == "allinone" ]]; then
   [[ -f "$APP_HOME/allinone/Dockerfile" ]] || die "找不到 $APP_HOME/allinone/Dockerfile"
   [[ -d "$APP_HOME/ngxai-dist" ]] || die "找不到 $APP_HOME/ngxai-dist"
   ok "单容器模式无需单独 install：首次启动时由容器自动建库并初始化"
-  echo
-  ok "第 1 步完成"
-  echo "   下一步：bash docker-02-start.sh --admin-email admin@example.com --admin-pass '你的密码'"
+  cat <<DONE
+
+============================================================
+ 第 2 步完成：配置检查通过
+============================================================
+
+  单容器模式下，建库与初始化由容器在首次启动时自动完成。
+  服务尚未启动，现在还不能用浏览器访问。
+
+------------------------------------------------------------
+ 下一步：复制下面这一整行执行
+------------------------------------------------------------
+
+  cd ${APP_HOME} && bash docker-02-start.sh --admin-email admin@example.com --admin-pass 'ChangeMe123!'
+
+  首次启动会构建镜像并跑 install，约 10-20 分钟。
+
+DONE
   exit 0
 fi
 
@@ -140,8 +191,27 @@ done
 TABLES=$($COMPOSE $PROFILE_ARGS exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc \
   "select count(*) from information_schema.tables where table_schema='public'" 2>/dev/null | tr -d ' ')
 if [[ -n "$TABLES" && "$TABLES" != "0" ]]; then
-  warn "库 ${DB_NAME:-thingsboard} 已有 ${TABLES} 张表"
-  die "拒绝重复初始化。要重新来过请先执行：bash docker-99-uninstall.sh --purge --yes，再从本步开始"
+  cat <<DONE
+
+============================================================
+ 第 2 步已经做过了
+============================================================
+
+  数据库 ${DB_NAME:-thingsboard} 已有 ${TABLES} 张表，不用再初始化。
+
+  直接跳到下一步：
+
+    cd ${APP_HOME} && bash docker-02-start.sh --admin-email admin@example.com --admin-pass 'ChangeMe123!'
+
+------------------------------------------------------------
+ 真的要清空数据重来
+------------------------------------------------------------
+
+    cd ${APP_HOME} && bash docker-99-uninstall.sh --purge --yes
+  然后从第 1 步重新开始。
+
+DONE
+  exit 1
 fi
 
 # ---------------- 4. 执行 install ----------------
@@ -171,6 +241,24 @@ USERS=$($COMPOSE $PROFILE_ARGS exec -T postgres psql -U "${DB_USER:-postgres}" -
 
 ok "install 完成：${TABLES} 张表 / ${WIDGETS} 个部件 / ${BUNDLES} 个 bundle / ${USERS} 个用户"
 
-echo
-ok "第 1 步完成"
-echo "   下一步：bash docker-02-start.sh --admin-email admin@example.com --admin-pass '你的密码'"
+cat <<DONE
+
+============================================================
+ 第 2 步完成：数据库已初始化
+============================================================
+
+  表 ${TABLES} 张 / 部件 ${WIDGETS} 个 / bundle ${BUNDLES} 个 / 用户 ${USERS} 个
+  用户数为 0 是正常的：install 只建表，不建账号。
+
+  服务尚未启动，现在还不能用浏览器访问。
+
+------------------------------------------------------------
+ 下一步：复制下面这一整行执行（在哪个目录都行）
+------------------------------------------------------------
+
+  cd ${APP_HOME} && bash docker-02-start.sh --admin-email admin@example.com --admin-pass 'ChangeMe123!'
+
+  把邮箱和密码换成你自己要用的（密码至少 8 位）。
+  首次会构建 ngx-ai 镜像，约 5-10 分钟；就绪提示约 2 分钟。
+
+DONE
