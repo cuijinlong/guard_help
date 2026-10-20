@@ -283,7 +283,24 @@ docker image prune -f        # 清悬空镜像（<none>）
 
 完整的磁盘调优、日志轮转、`data-root` 迁移见[Docker 安装与运维](/admin/docker-ops) 第八节。
 
-## 11. 排障通用三件套
+## 11. 平时该盯什么
+
+| 指标 | 怎么看 | 异常信号 |
+| --- | --- | --- |
+| 服务存活 | `docker compose ps` | 容器反复重启 → 看 `docker inspect --format '{{.State.OOMKilled}}'` |
+| 数据库连接数 | `SELECT count(*) FROM pg_stat_activity;` | 接近 200 说明连接泄漏 |
+| 遥测写入 | 日志搜 `totalFailed` | 非 0 说明写库受阻 |
+| 磁盘 | `df -h /` | 低于 10% 立即清理，见第 10 节 |
+| 慢查询 | `SELECT * FROM pg_stat_activity WHERE state='active' AND now()-query_start > interval '30s';` | 长时间 active 的查询要优化 |
+
+日志位置：
+
+```bash
+docker compose logs --tail=200 energy-server | grep -E "ERROR|Caused by"
+docker compose logs --tail=100 gateway
+```
+
+## 12. 排障通用三件套
 
 ```bash
 # 1. 端口在不在

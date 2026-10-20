@@ -1,11 +1,11 @@
 {
   "title": "能源管理平台 · 使用手册",
-  "version": "v0.7",
+  "version": "v1.0",
   "updated": "2026-10-20",
   "sections": [
     {
       "id": "user",
-      "title": "用户手册",
+      "title": "客户使用手册",
       "desc": "面向试用客户与正式客户：从登录到出第一份报告",
       "icon": "user",
       "items": [
@@ -16,7 +16,7 @@
         },
         {
           "id": "quick-start",
-          "title": "快速开始",
+          "title": "5 分钟上手",
           "file": "user/01-quick-start.md"
         },
         {
@@ -26,7 +26,7 @@
         },
         {
           "id": "pages",
-          "title": "看懂七个分析页",
+          "title": "看懂分析页",
           "file": "user/03-pages.md"
         },
         {
@@ -35,30 +35,16 @@
           "file": "user/04-onboarding.md"
         },
         {
-          "id": "saving",
-          "title": "节能记录与核验",
-          "file": "user/05-saving.md"
-        },
-        {
-          "id": "audit-report",
-          "title": "盘查报告",
-          "file": "user/06-audit-report.md"
-        },
-        {
           "id": "faq",
           "title": "常见问题",
-          "file": "user/07-faq.md"
-        },
-        {
-          "id": "glossary",
-          "title": "术语表",
-          "file": "user/08-glossary.md"
+          "file": "user/05-faq.md"
         }
-      ]
+      ],
+      "description": "给客户的：怎么看数据、怎么换成自己的设备"
     },
     {
       "id": "admin",
-      "title": "系统运维手册",
+      "title": "平台运维手册",
       "desc": "面向平台方：部署、开租户、备份、监控、排障、升级",
       "icon": "server",
       "items": [
@@ -66,11 +52,6 @@
           "id": "index",
           "title": "运维总览",
           "file": "admin/00-index.md"
-        },
-        {
-          "id": "architecture",
-          "title": "架构与组件",
-          "file": "admin/01-architecture.md"
         },
         {
           "id": "docker-ops",
@@ -93,39 +74,19 @@
           "file": "admin/02b-deploy-remote.md"
         },
         {
-          "id": "config",
-          "title": "配置项",
-          "file": "admin/03-config.md"
-        },
-        {
           "id": "tenant",
           "title": "开租户与开客户",
           "file": "admin/04-tenant-onboarding.md"
         },
         {
-          "id": "data",
-          "title": "数据备份与恢复",
-          "file": "admin/05-data.md"
-        },
-        {
-          "id": "monitoring",
-          "title": "监控与告警",
-          "file": "admin/06-monitoring.md"
+          "id": "customer-data",
+          "title": "新客户上线：按流程做",
+          "file": "admin/13-customer-data.md"
         },
         {
           "id": "troubleshoot",
           "title": "故障排查",
           "file": "admin/07-troubleshooting.md"
-        },
-        {
-          "id": "upgrade",
-          "title": "升级与回滚",
-          "file": "admin/08-upgrade.md"
-        },
-        {
-          "id": "security",
-          "title": "安全加固",
-          "file": "admin/09-security.md"
         },
         {
           "id": "uninstall",
@@ -137,7 +98,8 @@
           "title": "裸机部署",
           "file": "admin/11-baremetal.md"
         }
-      ]
+      ],
+      "description": "给平台方的：怎么部署、开租户、导入数据、排障"
     }
   ]
 }

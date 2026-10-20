@@ -74,12 +74,17 @@
         const active = key === activeKey ? ' class="active"' : '';
         return `<a href="#/${key}"${active}>${escapeHtml(item.title)}</a>`;
       }).join('');
+      // 分组标题下的说明：让读者一眼知道这组是给谁看的
+      const desc = section.description
+        ? `<div class="nav-group-desc">${escapeHtml(section.description)}</div>`
+        : '';
       return `
         <div class="nav-group">
           <div class="nav-group-title">
             <span class="nav-icon nav-icon-${section.icon || 'doc'}"></span>
             <span>${escapeHtml(section.title)}</span>
           </div>
+          ${desc}
           <div class="nav-items">${items}</div>
         </div>`;
     }).join('');

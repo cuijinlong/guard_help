@@ -226,6 +226,17 @@ bash scripts/03-verify.sh \
 
 ---
 
+## 上线前必改的三项
+
+| 项 | 位置 | 为什么 |
+| --- | --- | --- |
+| JWT 签名密钥 | `thingsboard.yml` → `security.jwt.tokenSigningKey` | 默认值公开，不换等于任何人可伪造 token |
+| 站点地址 | 系统管理员 → 常规设置 → `baseUrl` | 影响激活邮件链接与前端跳转，填错用户点不开 |
+| 邮件服务器 | `spring.mail.*` | 不发激活邮件可后置，但客户自助注册要用 |
+
+> 默认账号 `tenant/tenant`、`customer/customer` 只用于演示，**对外开服前必须改密码**。
+> 数据库端口不对宿主暴露（compose 里已做到），客户隔离已由验收脚本的两处 403 覆盖。
+
 ## 日常命令
 
 **在哪执行：【`~/energy-app`】**

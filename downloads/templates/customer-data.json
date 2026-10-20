@@ -1,0 +1,93 @@
+{
+  "_readme": [
+    "客户基础数据模板。把下面 3 处改成你自己的内容即可，其余保持不动。",
+    "1. customer  改成客户名称",
+    "2. sites[].name  改成你的场站名（按配电室/楼栋/车间划分）",
+    "3. devices[]  每台表计一项，points 是 RTU 点位地址 → 平台标准键名",
+    "",
+    "profile 可选：电能表 / 单相电能表 / 水表 / 燃气表 / 蒸汽表 / 温湿度变送器 / 网关",
+    "level 含义：1=总表(进线)  2=分表(楼层/车间)  3=支路表(末端回路)",
+    "vendor/model 可留空；填的话必须与平台「厂商与型号」里已有的名称完全一致",
+    "item 是分项名称，留空则不挂分项",
+    "",
+    "标准键名完整清单见手册「新客户上线：要准备的数据」第三节。",
+    "填完运行：python3 05-import-customer-data.py customer-data.json --base ... --tenant-admin ... --tenant-pass ..."
+  ],
+
+  "customer": "星河工业园",
+
+  "sites": [
+    {
+      "name": "1号厂房",
+      "groups": ["A区"],
+      "devices": [
+        {
+          "name": "1号厂房-进线总表",
+          "profile": "电能表",
+          "level": 1,
+          "vendor": "威胜",
+          "model": "DTSD341",
+          "item": "动力分项",
+          "points": {
+            "energy_reading": "40001",
+            "voltage_a": "40010",
+            "voltage_b": "40012",
+            "voltage_c": "40014",
+            "current_a": "40016",
+            "current_b": "40018",
+            "current_c": "40020",
+            "power_total": "40028",
+            "power_factor_total": "40030",
+            "frequency": "40036"
+          }
+        },
+        {
+          "name": "1号厂房-照明回路",
+          "profile": "单相电能表",
+          "level": 3,
+          "vendor": "威胜",
+          "model": "DDZY102",
+          "item": "照明分项",
+          "points": {
+            "energy_reading": "40101",
+            "voltage_a": "40110",
+            "current_a": "40116",
+            "power_a": "40122"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2号厂房",
+      "devices": [
+        {
+          "name": "2号厂房-空压站表",
+          "profile": "电能表",
+          "level": 2,
+          "vendor": "安科瑞",
+          "model": "ACREL DTSD1352",
+          "item": "动力分项",
+          "points": {
+            "energy_reading": "40201",
+            "voltage_a": "40210",
+            "voltage_b": "40212",
+            "voltage_c": "40214",
+            "current_a": "40216",
+            "current_b": "40218",
+            "current_c": "40220",
+            "power_total": "40228"
+          }
+        },
+        {
+          "name": "2号厂房-温湿度",
+          "profile": "温湿度变送器",
+          "level": 3,
+          "points": {
+            "temperature": "40301",
+            "humidity": "40302"
+          }
+        }
+      ]
+    }
+  ]
+}
