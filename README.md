@@ -72,6 +72,22 @@ npx wrangler pages deploy . --project-name=energy-manual
 
 **自定义域名**：Cloudflare Pages → Custom domains，按提示加 CNAME。
 
+## 与仓库副本的同步
+
+本仓库是手册的**发布源**。`iot-rule-engine/shiyongshouce/` 是同一份内容的仓库副本，
+两边必须逐字节一致。
+
+改完手册后：
+
+```bash
+./sync.sh            # 覆盖到 iot-rule-engine/shiyongshouce/
+./sync.sh --check    # 只检查差异（退出码 1 = 有差异）
+./sync.sh --dry-run  # 看会改哪些文件，不落盘
+```
+
+方向固定为 **guard_help → shiyongshouce**，不要反向覆盖。
+`sync.sh` 只比对内容校验和（忽略时间戳与权限），并会删除副本里多余的文件。
+
 ## 缓存策略
 
 `_headers` 已经配好：
