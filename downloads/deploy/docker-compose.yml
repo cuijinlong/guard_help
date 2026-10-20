@@ -1,0 +1,118 @@
+# 能源管理平台 · 单机 Docker 部署
+#
+# 设计取舍：
+#   · 不构建自定义镜像 —— 直接挂载官方 JRE 跑 jar。
+#     这样镜像层里不落任何业务文件，卸载时删掉目录就真的没有残留。
+#   · 数据库与业务数据都走「命名卷 / 挂载目录」，不做匿名卷。
+#   · install 放在独立 profile 里，正常 up 不会误跑。
+#
+# 使用：所有变量从同目录 .env 读取，不要在这里写死密码。
+
+name: energy
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-db-env: &db-env
+  SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-thingsboard}
+  SPRING_DATASOURCE_USERNAME: ${DB_USER:-postgres}
+  SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
+  DATABASE_TS_TYPE: sql
+  DATABASE_ENTITIES_TYPE: sql
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: energy-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-thingsboard}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
+      # 中文标题、客户名需要正确的排序与编码
+      LANG: C.UTF-8
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # 只绑回环：数据库不对外暴露。需要远程连库时用 SSH 隧道。
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-thingsboard}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    logging: *default-logging
+
+  # 一次性任务：建表 + 装载系统资源。跑完即退出，不常驻。
+  #   docker compose --profile install run --rm install
+  install:
+    image: eclipse-temurin:25-jre
+    # 刻意不设 container_name：compose run --rm 会自己命名并在退出后删除，
+    # 固定名字会让它创建 <name>-run-<hash> 后删不掉，留下 Created 残留。
+    profiles: ["install"]
+    environment:
+      <<: *db-env
+    volumes:
+      - ${APP_HOME}/guard-server-4.4.0.jar:/opt/energy/app.jar:ro
+      - ${APP_HOME}/data:/opt/energy/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["java"]
+    command:
+      - -Xms128m
+      - -Xmx768m
+      - -Dloader.main=com.guard.server.ThingsboardInstallApplication
+      - -Dinstall.upgrade=false
+      - -Dinstall.data_dir=/opt/energy/data
+      - -cp
+      - /opt/energy/app.jar
+      - org.springframework.boot.loader.launch.PropertiesLauncher
+      - --spring.config.name=thingsboard
+      - --server.port=0
+    logging: *default-logging
+
+  server:
+    image: eclipse-temurin:25-jre
+    container_name: energy-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *db-env
+      # 单机版关闭集群组件，避免额外的端口与外部依赖
+      HTTP_ENABLED: "false"
+      MQTT_ENABLED: "false"
+      COAP_ENABLED: "false"
+      LWM2M_ENABLED: "false"
+      COAP_SERVER_ENABLED: "false"
+      TB_QUEUE_TYPE: in-memory
+      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx${SERVER_HEAP:-2g}"
+    volumes:
+      - ${APP_HOME}/guard-server-4.4.0.jar:/opt/energy/app.jar:ro
+      - ${APP_HOME}/data:/opt/energy/data:ro
+      - ${APP_HOME}/logs:/opt/energy/logs
+    ports:
+      - "${HTTP_PORT:-8090}:8090"
+    entrypoint: ["java", "-Dinstall.data_dir=/opt/energy/data", "-jar", "/opt/energy/app.jar"]
+    command:
+      - --spring.config.name=thingsboard
+      - --spring.profiles.active=${SPRING_PROFILE:-dev}
+      - --server.port=8090
+    logging: *default-logging
+
+volumes:
+  pgdata:
+    name: energy-pgdata

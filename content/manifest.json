@@ -1,6 +1,6 @@
 {
   "title": "能源管理平台 · 使用手册",
-  "version": "v0.2",
+  "version": "v0.3",
   "updated": "2026-10-20",
   "sections": [
     {
@@ -111,6 +111,16 @@
           "id": "security",
           "title": "安全加固",
           "file": "admin/09-security.md"
+        },
+        {
+          "id": "uninstall",
+          "title": "卸载与重置",
+          "file": "admin/10-uninstall.md"
+        },
+        {
+          "id": "baremetal",
+          "title": "裸机部署",
+          "file": "admin/11-baremetal.md"
         }
       ]
     }
