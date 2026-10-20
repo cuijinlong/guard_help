@@ -26,7 +26,40 @@ command -v docker >/dev/null 2>&1 || die "未安装 docker"
 docker info >/dev/null 2>&1 || die "docker 守护进程未运行（或当前用户无权限）。Linux 上试：sudo usermod -aG docker \$USER && newgrp docker"
 $COMPOSE version >/dev/null 2>&1 || die "未安装 docker compose v2（需要 'docker compose'，不是旧版 docker-compose）"
 
-[[ -f .env ]] || die "缺少 .env。先执行：cp env.example .env && vi .env"
+# 缺少 .env 时自动生成：远程部署解压后直接跑这一条即可，
+# 不需要手工 cp/vi，也不会因为手改路径写错而卡住。
+if [[ ! -f .env ]]; then
+  gen_pass() {
+    if command -v openssl >/dev/null 2>&1; then
+      openssl rand -hex 12
+    else
+      printf '%s%s%s' "$(date +%s)" "$$" "$RANDOM$RANDOM" | shasum | cut -c1-24
+    fi
+  }
+  port_free() {
+    if command -v lsof >/dev/null 2>&1; then
+      ! lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+    else
+      ! (exec 3<>/dev/tcp/127.0.0.1/"$1") >/dev/null 2>&1
+    fi
+  }
+  _hp=8090; while ! port_free "$_hp" && [[ "$_hp" -lt 8200 ]]; do _hp=$((_hp+1)); done
+  _dp=5432; while ! port_free "$_dp" && [[ "$_dp" -lt 5600 ]]; do _dp=$((_dp+1)); done
+  cat > .env <<ENVEOF
+# 由 docker-01-install.sh 自动生成于 $(date '+%Y-%m-%d %H:%M:%S')
+# 要改端口或密码，改完删掉容器重跑本脚本。
+APP_HOME=$(pwd)
+HTTP_PORT=$_hp
+DB_NAME=thingsboard
+DB_USER=postgres
+DB_PASSWORD=$(gen_pass)
+DB_PORT=$_dp
+SERVER_HEAP=2g
+SPRING_PROFILE=dev
+ENVEOF
+  log "未找到 .env，已自动生成（APP_HOME=$(pwd)，端口 ${_hp}/${_dp}，密码随机）"
+fi
+
 # shellcheck disable=SC1091
 set -a; . ./.env; set +a
 
