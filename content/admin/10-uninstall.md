@@ -2,7 +2,9 @@
 
 > 两种模式：**保留数据**（可随时再起）和**彻底删除**（不留痕）。脚本自检五项，全空才算干净。
 >
-> 本页针对 Docker 部署。裸机部署的卸载见[方案 C](/admin/baremetal) 最后一节。
+> 本页只删**本平台**，Docker 本身保留给其他项目用。
+> 要把 Docker 也卸掉，见[Docker 安装与运维](/admin/docker-ops) 第八节。
+> 裸机部署的卸载见[裸机部署](/admin/baremetal) 最后一节。
 
 ## 先确认你的部署目录
 
@@ -211,3 +213,24 @@ docker network rm $(docker network ls -q --filter name=energy)
 ```
 
 Linux 上如果提示卷「in use」，说明还有容器挂着它，先删容器再删卷。
+
+---
+
+## 还要卸载 Docker 本身？
+
+本页的脚本只删本平台的项目资源（容器、卷、网络、镜像），Docker 引擎和其他项目不受影响。
+
+如果这台机器不再需要 Docker：
+
+```bash
+# Ubuntu / Debian
+sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo rm -rf /var/lib/docker /var/lib/containerd
+
+# CentOS / Rocky
+sudo dnf remove -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo rm -rf /var/lib/docker /var/lib/containerd
+```
+
+⚠️ 这会删掉**所有**项目的镜像与卷。完整步骤（含卸载前检查、验证、重装）见
+[Docker 安装与运维](/admin/docker-ops) 第八节。

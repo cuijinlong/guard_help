@@ -259,23 +259,260 @@ docker version
 
 **升级会重启守护进程，容器会重启**。生产环境挑低峰期。
 
-### 完全卸载 Docker
+---
+
+## 八、卸载 Docker
+
+先分清要删的是什么：
+
+| 想做的事 | 用哪 |
+| --- | --- |
+| 删掉本平台、保留 Docker 给别的项目用 | [卸载与重置](/admin/uninstall) 的 `docker-99-uninstall.sh` |
+| Docker 本身也不要了（整机清理 / 重装系统前） | 本节 |
+
+下面的命令会删除**这台机器上所有** Docker 容器、镜像、卷、网络。如果还有别的项目在跑，先看第一小节。
+
+### 1. 卸载前：先看清楚会删什么
+
+**在哪执行：【目标服务器 · 任意目录】**
 
 ```bash
-# Ubuntu
-sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo rm -rf /var/lib/docker /var/lib/containerd
+# 正在运行的容器
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
 
-# CentOS / Rocky
-sudo dnf remove -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+# 全部容器（含已停止的）
+docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+
+# 镜像、卷、占用空间
+docker system df
+docker volume ls
+```
+
+**如果有别的项目在跑，先停掉并备份**：
+
+```bash
+# 备份某个 PostgreSQL 容器的数据
+docker exec <容器名> pg_dump -U postgres <库名> | gzip > ~/backup-$(date +%F).sql.gz
+```
+
+**本平台的数据**在命名卷 `energy-pgdata`（split 模式）或 `energy-allinone-data`（单容器模式）里：
+
+```bash
+docker volume ls --filter name=energy-
+```
+
+要先留一份：
+
+```bash
+# split 模式
+docker compose -f ~/energy-app/docker-compose.yml exec -T postgres \
+  pg_dump -U postgres thingsboard | gzip > ~/thingsboard-$(date +%F).sql.gz
+```
+
+### 2. Ubuntu / Debian 卸载
+
+**在哪执行：【目标服务器 · 任意目录】**
+
+```bash
+# ① 停止并禁用服务
+sudo systemctl stop docker docker.socket containerd 2>/dev/null || true
+sudo systemctl disable docker docker.socket containerd 2>/dev/null || true
+
+# ② 卸载软件包
+sudo apt-get purge -y \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin \
+  docker.io docker-doc docker-compose podman-docker containerd runc 2>/dev/null || true
+
+# ③ 清理自动装上的依赖（不再被任何包使用的）
+sudo apt-get autoremove -y --purge
+
+# ④ 删除数据目录
+sudo rm -rf /var/lib/docker /var/lib/containerd
+sudo rm -rf /etc/docker /etc/containerd
+
+# ⑤ 删除自定义的 apt 源与密钥
+sudo rm -f /etc/apt/sources.list.d/docker.list
+sudo rm -f /etc/apt/keyrings/docker.gpg
+sudo apt-get update
+```
+
+第 ④ 步是真正释放空间的一步 —— 镜像和卷都在 `/var/lib/docker`。**执行前确认第 1 小节的备份已经做完。**
+
+### 3. CentOS / RHEL / Rocky / Alma 卸载
+
+**在哪执行：【目标服务器 · 任意目录】**
+
+```bash
+# ① 停止并禁用服务
+sudo systemctl stop docker docker.socket containerd 2>/dev/null || true
+sudo systemctl disable docker docker.socket containerd 2>/dev/null || true
+
+# ② 卸载软件包
+sudo dnf remove -y \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin \
+  docker docker-client docker-common docker-engine 2>/dev/null || true
+
+# ③ 删除数据目录
+sudo rm -rf /var/lib/docker /var/lib/containerd
+sudo rm -rf /etc/docker /etc/containerd
+
+# ④ 删除 yum/dnf 源
+sudo rm -f /etc/yum.repos.d/docker-ce.repo
+sudo dnf clean all
+```
+
+CentOS 7 把 `dnf` 换成 `yum`。
+
+**如果给挂载目录打过 SELinux 标签**，一并清掉（否则同名目录以后会被错误标记）：
+
+```bash
+sudo semanage fcontext -d "/opt/energy-app(/.*)?" 2>/dev/null || true
+```
+
+### 4. macOS（Docker Desktop）卸载
+
+**在哪执行：【你的 Mac · 任意目录】**
+
+先用界面卸载最稳妥：打开 Docker Desktop → 右上角设置 → Troubleshoot（虫子图标）→ **Uninstall**。
+
+或手动删：
+
+```bash
+# 退出应用
+osascript -e 'quit app "Docker"' 2>/dev/null || true
+sleep 3
+
+# 删应用
+rm -rf /Applications/Docker.app
+
+# 删用户数据（镜像、容器、卷全在这里，会释放大量空间）
+rm -rf ~/Library/Containers/com.docker.docker
+rm -rf ~/Library/Group\ Containers/group.com.docker
+rm -rf ~/.docker
+
+# 删命令行工具（如果装过）
+sudo rm -f /usr/local/bin/docker /usr/local/bin/docker-compose \
+             /usr/local/bin/docker-credential-desktop \
+             /usr/local/bin/kubectl.docker
+```
+
+`~/Library/Containers/com.docker.docker` 里的 `Data/vms/0/data/Docker.raw` 是磁盘镜像文件，常有几十 GB，删掉立刻释放。
+
+### 5. 验证是否卸干净
+
+**在哪执行：【目标服务器 · 任意目录】**
+
+```bash
+# ① 命令应该不存在
+command -v docker || echo "docker 命令已移除"
+
+# ② 服务应该不存在
+systemctl status docker 2>&1 | head -3
+
+# ③ 数据目录应该不存在
+ls -d /var/lib/docker /var/lib/containerd 2>/dev/null || echo "数据目录已删除"
+
+# ④ 残留进程
+ps aux | grep -E "dockerd|containerd" | grep -v grep || echo "无 Docker 进程"
+
+# ⑤ 端口不再监听
+ss -lntp 2>/dev/null | grep -E ":(2375|2376)\b" || echo "Docker API 端口已释放"
+```
+
+Linux 上如果 `docker` 命令还在，说明 PATH 里还有残留二进制：
+
+```bash
+sudo rm -f /usr/bin/docker /usr/bin/dockerd /usr/bin/containerd /usr/local/bin/docker*
+```
+
+### 6. 只想清数据、保留 Docker
+
+不想卸载软件，只想把磁盘清空（比如重装本平台前）：
+
+```bash
+# ⚠️ 删除所有容器、镜像、卷、网络、缓存
+docker system prune -a --volumes -f
+
+# 确认
+docker system df
+```
+
+这比卸载快得多，Docker 本身不用重装。**但 `--volumes` 会删掉所有命名卷**，包括数据库。
+
+只清本平台的：
+
+```bash
+cd ~/energy-app
+bash docker-99-uninstall.sh --purge --yes --images=app
+```
+
+详见[卸载与重置](/admin/uninstall)。
+
+### 7. 卸载后重装
+
+按本文第二节（Ubuntu）或第三节（CentOS）重新装即可。旧的数据目录已经删掉，重装后是全新的空环境。
+
+如果想**保留数据目录重装**（例如只升级 Docker 版本但想留镜像）：
+
+- 卸载时**跳过** `rm -rf /var/lib/docker`
+- 重装后执行 `docker images` 确认镜像还在
+- 版本跨大版本时可能不兼容，官方建议先 `docker save` 备份重要镜像
+
+```bash
+# 导出关键镜像（跨版本升级前）
+docker save energy/allinone:4.4.0 | gzip > ~/allinone-image.tar.gz
+
+# 重装后导入
+gunzip -c ~/allinone-image.tar.gz | docker load
+```
+
+### 8. 卸载常见问题
+
+**`Device or resource busy`（删不掉 `/var/lib/docker`）**
+
+有进程还挂着这些文件：
+
+```bash
+sudo systemctl stop docker docker.socket containerd
+sudo umount /var/lib/docker/* 2>/dev/null || true
+# 找到占用者
+sudo lsof +D /var/lib/docker 2>/dev/null | head
+# 必要时重启后再删
+sudo reboot
+```
+
+**卸载后磁盘空间没释放**
+
+可能是容器日志或镜像层被其他进程持有，或删的是符号链接：
+
+```bash
+sudo du -sh /var/lib/docker 2>/dev/null
+df -h /
+```
+
+重启后再看一次。仍不释放，检查是否 `data-root` 改过（第九节第 6 小节），实际数据在别处：
+
+```bash
+cat /etc/docker/daemon.json 2>/dev/null | grep data-root
+```
+
+**`docker` 命令还在，但服务没了**
+
+PATH 里残留了二进制，见第 5 小节末尾的清理命令。
+
+**重装后容器起不来**
+
+旧数据目录残留导致版本不匹配。彻底删干净再来：
+
+```bash
 sudo rm -rf /var/lib/docker /var/lib/containerd
 ```
 
-⚠️ `rm -rf /var/lib/docker` 会删掉**所有**镜像、容器、卷。确认没有其他项目在用再执行。
-
 ---
 
-## 八、磁盘调优（重点）
+## 九、磁盘调优（重点）
 
 Docker 占满磁盘是这套系统最常见的运维问题。三个来源，按占用从大到小：
 
@@ -446,7 +683,7 @@ sudo restorecon -Rv /data/docker
 
 ---
 
-## 九、常见错误
+## 十、常见错误
 
 ### `Cannot connect to the Docker daemon`
 
@@ -481,7 +718,7 @@ sudo dnf install -y docker-compose-plugin
 
 ### `No space left on device`
 
-按本文第八节清理。先 `docker system df` 看是谁占的。
+按本文第九节清理。先 `docker system df` 看是谁占的。
 
 ### `pull access denied` / 拉取超时
 
@@ -509,7 +746,7 @@ SELinux，见本文第三节「CentOS 的两个坑」。
 
 ---
 
-## 十、与部署的关系
+## 十一、与部署的关系
 
 装好 Docker 后，回到[部署：照着做](/admin/deploy)从第 1 步开始。
 
