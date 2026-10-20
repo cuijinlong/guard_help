@@ -3,6 +3,24 @@
 > 本页是从零到能用的**唯一主线**。全程 5 条命令，按顺序复制执行即可。
 > 部署到另一台服务器、或用单容器模式，在最后一节说明。
 
+## 先决条件：装好 Docker
+
+在开始之前，目标机器上必须有 Docker 20.10+ 和 Compose v2：
+
+```bash
+docker version --format '{{.Server.Version}}'
+docker compose version
+```
+
+两条都不通过，先看[Docker 安装与运维](/admin/docker-ops)：
+
+- [Ubuntu 安装](/admin/docker-ops)（第二节）
+- [CentOS / RHEL / Rocky 安装](/admin/docker-ops)（第三节）
+- 国内网络慢 → 镜像加速（第四节）
+- 非 root 用户 → 加 docker 组（第五节）
+
+装好后回到本页，从第 1 步开始。
+
 ## 全程就这 5 条命令
 
 假设你在**当前这台机器**上部署（最常用）：

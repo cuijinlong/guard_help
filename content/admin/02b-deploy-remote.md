@@ -113,6 +113,17 @@ guard-server-4.4.0.jar  logs  nginx  ngxai-backend  ngxai-dist  scripts
 
 ---
 
+## 服务器要先装 Docker
+
+如果服务器上还没有 Docker：
+
+```bash
+docker version --format '{{.Server.Version}}'
+docker compose version
+```
+
+不通过就按[Docker 安装与运维](/admin/docker-ops)装一遍 —— Ubuntu 看第二节，CentOS / Rocky 看第三节。
+
 ## 第 2 步：建库并初始化
 
 **在哪执行：【服务器 · /opt/energy-deploy】**
@@ -135,12 +146,6 @@ bash docker-01-install.sh
  第 2 步完成：数据库已初始化
 ============================================================
 ```
-
-> 如果服务器没装 Docker：
-> ```bash
-> curl -fsSL https://get.docker.com | sh
-> sudo usermod -aG docker $USER && newgrp docker
-> ```
 
 ---
 

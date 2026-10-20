@@ -152,7 +152,21 @@ curl -s --noproxy '*' -m 3 http://127.0.0.1:8090/ >/dev/null && echo '仍在监�
 
 五条都为空或提示「不存在/已释放」，才算真正干净。
 
-## 五、重置而不卸载（想清空数据重来）
+## 五、清理磁盘（构建缓存）
+
+卸载后磁盘没释放多少，是因为 Docker 的**构建缓存**不会被 `down -v` 碰到，也不会自动回收。
+
+```bash
+docker system df          # 先看占用
+docker builder prune -f   # 只清构建缓存（最安全）
+docker image prune -f     # 再清悬空镜像
+```
+
+⚠️ `docker system prune -a --volumes -f` 会删除未使用的命名卷，数据库可能一并丢失，别顺手用。
+
+完整的清理策略、容器日志轮转、`data-root` 迁移见[Docker 安装与运维](/admin/docker-ops) 第八节。
+
+## 六、重置而不卸载（想清空数据重来）
 
 不删目录，只把数据库清空：
 
@@ -170,7 +184,7 @@ bash docker-02-start.sh --admin-email admin@example.com --admin-pass '新密码'
 
 这比完整卸载快，适合反复验证初始化流程。
 
-## 六、脚本拒绝执行的情况
+## 七、脚本拒绝执行的情况
 
 脚本拒绝删除这些目录，防止 `APP_HOME` 配错造成误删：
 
@@ -180,7 +194,7 @@ bash docker-02-start.sh --admin-email admin@example.com --admin-pass '新密码'
 
 如果 `APP_HOME` 填成了 `/opt`（只写了父目录），先修正 `.env` 再执行。
 
-## 七、残留排查
+## 八、残留排查
 
 极少数情况下 `down -v` 没删干净（比如容器曾被 `docker run` 手工创建）：
 

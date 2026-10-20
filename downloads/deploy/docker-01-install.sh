@@ -139,12 +139,15 @@ port_busy() {
   fi
 }
 
-# 端口占用
-for p in "${HTTP_PORT:-8090}" "${DB_PORT:-5432}"; do
-  if port_busy "$p"; then
-    die "端口 $p 已被占用，先停掉占用进程或改 .env 里的端口"
-  fi
-done
+# 端口占用：只检查 HTTP_PORT。
+#
+# 数据库不需要检查：两种模式下 PostgreSQL 都只在容器网络内可达
+# （compose 里没有 ports 映射，只有 expose），宿主机的 5432 被别的
+# PostgreSQL 占用完全不影响本平台。早期版本误查 DB_PORT，导致开发用的
+# tb-postgres 一开机就报“端口被占用”，实际根本不会冲突。
+if port_busy "${HTTP_PORT:-8090}"; then
+  die "端口 ${HTTP_PORT:-8090} 已被占用。改 .env 里的 HTTP_PORT 换个端口，或停掉占用它的进程"
+fi
 ok "docker / compose / 文件 / 端口 检查通过"
 
 # ---------------- 单容器模式：install 在容器内自动完成 ----------------

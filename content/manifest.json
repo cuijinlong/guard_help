@@ -1,6 +1,6 @@
 {
   "title": "能源管理平台 · 使用手册",
-  "version": "v0.6",
+  "version": "v0.7",
   "updated": "2026-10-20",
   "sections": [
     {
@@ -71,6 +71,11 @@
           "id": "architecture",
           "title": "架构与组件",
           "file": "admin/01-architecture.md"
+        },
+        {
+          "id": "docker-ops",
+          "title": "Docker 安装与运维",
+          "file": "admin/12-docker-ops.md"
         },
         {
           "id": "deploy",

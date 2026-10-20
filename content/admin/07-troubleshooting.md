@@ -260,7 +260,30 @@ const { type, ...payload } = widgetJson;  // type 只用于本地分类
 | `TB_EDQS_ROCKSDB_PATH` | `~/.rocksdb/edqs` | EDQS |
 | CoAP | 5683 | 关闭用 `COAP_ENABLED=false` |
 
-## 10. 排障通用三件套
+## 10. Docker 占满磁盘 / 构建缓存过大
+
+**现象**：安装或构建时报 `No space left on device`，或系统提示磁盘不足。
+
+先看是谁占的：
+
+```bash
+docker system df
+```
+
+三个最常见的来源：**容器日志**（默认不限制）、**构建缓存**（不自动回收）、**悬空镜像**。
+
+最安全的一步清理：
+
+```bash
+docker builder prune -f      # 只清构建缓存，不影响任何运行中的服务
+docker image prune -f        # 清悬空镜像（<none>）
+```
+
+⚠️ **不要**随手用 `docker system prune -a --volumes -f` —— 它会删掉未使用的命名卷，数据库可能一并丢失。
+
+完整的磁盘调优、日志轮转、`data-root` 迁移见[Docker 安装与运维](/admin/docker-ops) 第八节。
+
+## 11. 排障通用三件套
 
 ```bash
 # 1. 端口在不在
