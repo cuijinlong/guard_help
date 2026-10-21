@@ -124,18 +124,50 @@ if [[ -n "$CTOK" ]]; then
 import json,sys
 d=json.load(sys.stdin)
 print('|'.join((i.get('name') or i.get('id') or '') for i in d.get('items',[])))" 2>/dev/null)
+  MFIRST=$(echo "$MENU" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+it=d.get('items',[])
+print((it[0].get('name') or it[0].get('id')) if it else '')" 2>/dev/null)
 
   [[ "${MTOP:-0}" -ge 5 ]] && ok_ "客户菜单已装（顶层 ${MTOP} 项）" || bad_ "客户菜单项过少（${MTOP:-0}）" "检查每项是否写了 visible=true"
-  echo "$MNAMES" | grep -q "能耗查询" && ok_ "菜单含「能耗查询」分组" || bad_ "菜单缺「能耗查询」"
-  echo "$MNAMES" | grep -q "设备运维" && ok_ "菜单含「设备运维」分组" || bad_ "菜单缺「设备运维」"
 
-  # 菜单里的看板入口必须指向本客户自己的看板，不能是租户模板 id
+  # 第一项必须是能耗概览：客户登录直接看到数据，不经过空门户页
+  [[ "$MFIRST" == "能耗概览" ]] \
+    && ok_ "菜单首项是「能耗概览」（客户落地页）" \
+    || bad_ "菜单首项是「${MFIRST}」" "应为能耗概览"
+
+  # 必须有这些分组
+  for g in "能耗查询" "能耗分析" "能耗优化" "综合报表" "设备运维" "组织"; do
+    echo "$MNAMES" | grep -q "$g" && ok_ "菜单含「${g}」" || bad_ "菜单缺「${g}」"
+  done
+
+  # 必须没有这些（客户侧不需要 / 已挪走）
+  for bad_item in "首页" "仪表板" "我的账单模板" "闲时能耗配置" "客户能源档案" "基础配置中心" "验证"; do
+    if echo "$MNAMES" | grep -q "$bad_item"; then
+      bad_ "菜单不该有「${bad_item}」"
+    else
+      ok_ "菜单不含「${bad_item}」（符合预期）"
+    fi
+  done
+
+  # 用能账单必须在能耗分析里，不能是一级菜单
+  INA=$(echo "$MENU" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for it in d.get('items',[]):
+    if (it.get('name') or '')=='能耗分析':
+        print(1 if any((p.get('name') or '')=='用能账单' for p in (it.get('pages') or [])) else 0); break
+else: print(0)" 2>/dev/null)
+  [[ "$INA" == "1" ]] && ok_ "「用能账单」在「能耗分析」分组内" || bad_ "「用能账单」位置不对"
+
+  # 菜单里的看板入口必须都绑定了 dashboardId
   DBAD=$(echo "$MENU" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 bad=0; total=0
 for it in d.get('items',[]):
-    for p in (it.get('pages') or []):
+    for p in (it.get('pages') or []) + [it]:
         if p.get('linkType')=='DASHBOARD':
             total+=1
             if not p.get('dashboardId'): bad+=1
@@ -146,8 +178,11 @@ print(bad, total)" 2>/dev/null)
   else
     bad_ "看板入口异常（${DBAD_N:-?} 个未绑定 / 共 ${DTOT:-0}）"
   fi
-else
-  E2E_SITE=""
+
+  # 客户首页看板必须指向「能耗概览」
+  HOMEID=$(CAPI /api/auth/user | jget "d.get('additionalInfo',{}).get('homeDashboardId','')" 2>/dev/null)
+  [[ -n "$HOMEID" ]] && ok_ "客户首页看板已设置" || bad_ "客户首页看板未设置（登录后落在空门户页）"
+
 fi
 
 # ---------------------------------------------------------------- 2. 设备管理

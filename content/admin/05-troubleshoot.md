@@ -110,7 +110,88 @@ bash scripts/07-init-menu.sh \
 手工删过、或老客户升级上来没有，就要补装。
 
 **注意**：脚本必须用**客户账号**操作。用租户账号建出来的
-`customer_id` 是 NULL，客户永远看不到。
+`customer_id` 是 NULL，直接违反 NOT NULL 约束，菜单根本建不出来。
+
+### 现象 D：右侧大面积「加载部件配置时出现问题。关联的 部件类型可能已被移除。」
+
+**根因**：看板里写的 `typeFullFqn` 前缀与部件的实际归属不一致。
+
+| 部件建在 | 必须用的前缀 |
+| --- | --- |
+| 系统租户 NULL_UUID | `system.` |
+| 某个租户下 | `tenant.` |
+
+本平台的部件全部建在**系统租户**下，所以看板模板必须写
+`system.energy_management.*`。曾经错写成 `tenant.` 导致客户侧所有看板都报错。
+
+**定位**：
+
+```bash
+cd ~/energy-app
+docker compose exec -T postgres psql -U postgres -d thingsboard -tA -c "
+SELECT tenant_id, count(*) FROM widget_type
+WHERE fqn LIKE 'energy_management.%' GROUP BY tenant_id;"
+```
+
+`13814000-1dd2-11b2-8080-808080808080` = 系统级 → 模板必须用 `system.`
+
+**逐个验能不能加载**（把 fqn 换成看板里实际用的）：
+
+```bash
+CTOK=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"customer@126.com","password":"12345678"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+
+curl -s --noproxy '*' -o /dev/null -w 'HTTP %{http_code}\n' \
+  -H "X-Authorization: Bearer $CTOK" \
+  'http://127.0.0.1:8090/api/widgetType?fqn=system.energy_management.analysis_bar'
+```
+
+`200` = 能加载；`400 Invalid fqn` = 前缀格式错；`500` = 前缀对但库里没有。
+
+**修法**：模板已修正。重新部署即可：
+
+```bash
+bash shiyongshouce/downloads/deploy/docker-98-rebuild.sh ... --yes
+```
+
+### 现象 E：客户登录后落在空白的门户页
+
+**根因**：`customer.additionalInfo.homeDashboardId` 没设。
+
+**定位**：
+
+```bash
+docker compose exec -T postgres psql -U postgres -d thingsboard -tA -c "
+SELECT title, additional_info FROM customer;"
+```
+
+没有 `homeDashboardId` 就是没设。
+
+**修法**：
+
+```bash
+bash scripts/07-init-menu.sh \
+  --tenant tenant@126.com --tenant-pass '12345678' \
+  --customer customer@126.com --customer-pass '12345678'
+```
+
+它会同时补 `customerMenuId` 和 `homeDashboardId`。
+
+### 现象 F：租户菜单里没有「能源管理」
+
+**定位**：
+
+```bash
+docker compose exec -T postgres psql -U postgres -d thingsboard -tA -c "
+SELECT name, scope FROM custom_menu ORDER BY scope;"
+```
+
+应有「默认导航（能源管理）」(TENANT) 和「业务导航（能源管理）」(CUSTOMER) 两条。
+
+**修法**：两条都是租户/客户创建时自动装的。缺了只能重建租户/客户，
+或手工在平台里新建菜单。
 
 
 ## 1. 全新部署卡在第一步：setup 接口返回 423
@@ -298,7 +379,7 @@ ls -d application/src/main/data/json guard-server/src/main/data/json 2>/dev/null
 1. 启动参数显式加 `-Dinstall.data_dir=/opt/energy/data`（**推荐，必须做**）；
 2. 代码侧也收紧：候选目录必须含 `json/` 才返回，并继续尝试 `guard-server/src/main/data`。
 
-### 情况 B：租户有 22 个，客户 0 个
+### 情况 B：租户有看板，客户 0 个
 
 **现象**：租户管理员能看到全部看板，客户登录后「仪表板」列表是空的。
 
@@ -323,7 +404,7 @@ curl -s --noproxy '*' -H "X-Authorization: Bearer $TOK" \
 上游的「分配给客户」只写 `assigned_customers` 和 relation，**不改 customer_id** ——
 所以分配了也查不到。
 
-**修法**：建客户时本平台会把 22 个模板**复制一份**到客户名下（已自动）。
+**修法**：建客户时本平台会把租户的全部看板**复制一份**到客户名下（已自动）。
 手工补：
 
 ```bash

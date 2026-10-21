@@ -143,8 +143,9 @@ bash scripts/02-onboard.sh \
 ✓ 设备档案 7 个 / 分时方案 4 套
 ✓ 客户已创建
 ✓ 演示数据：单相园区（7 台表 + 温湿度）、三相园区（4 台表 + 温湿度）
-✓ 仪表板已复制给客户：22 个
-✓ 客户菜单已安装
+✓ 仪表板已复制给客户：20 个
+✓ 客户菜单已安装（13 项）
+✓ 租户菜单已安装（18 项）
 ✓ 全部验证通过
 ```
 
@@ -222,10 +223,15 @@ sed -i 's/^DEPLOY_MODE=.*/DEPLOY_MODE=allinone/' .env
 cd /你的路径/iot-rule-engine
 bash shiyongshouce/downloads/deploy/docker-98-rebuild.sh \
   --admin langmen@126.com --admin-pass 'CJLqh@163' \
-  --tenant "环宇能源集团" --tenant-email tenant@126.com --tenant-pass '12345678' \
-  --customer "星河工业园" --customer-email customer@126.com --customer-pass '12345678' \
+  --tenant tenant@126.com --tenant-pass '12345678' --tenant-title '环宇能源集团' \
+  --customer customer@126.com --customer-pass '12345678' --customer-title '星河工业园' \
   --yes
 ```
+
+> ⚠️ **注意参数名和 `02-onboard.sh` 不一样**：
+> 这里 `--tenant` 是**邮箱**，名称要用 `--tenant-title`；
+> 而 `02-onboard.sh` 的 `--tenant` 是**名称**，邮箱用 `--tenant-email`。
+> 传错会报「未知参数」。
 
 它做 8 件事：卸载 → 重新组装 → 建库 → 启动 → 开租户 → 三步验收。约 6 分钟。
 
@@ -380,8 +386,8 @@ bash scripts/02-onboard.sh ...（参数同上）
 | 电表 | 11 台（一级 2 / 二级 4 / 三级 5） | 客户 → 设备管理 |
 | 水气汽表 | 6 台 | 客户 → 设备管理 |
 | 虚拟表 | 2 台 | 客户 → 手工填报 |
-| 仪表板 | 22 个 | 客户 → 仪表板 |
-| 客户菜单 | 7 个顶层项 | 客户登录后看左侧 |
+| 仪表板 | 40 个（租户 20 + 客户 20） | 客户 → 仪表板 |
+| 客户菜单 | 13 个顶层项 | 客户登录后看左侧 |
 
 ---
 

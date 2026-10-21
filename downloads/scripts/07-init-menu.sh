@@ -109,6 +109,16 @@ if not dash:
     print("  ! 客户名下没有看板 —— 菜单只会有站内页面。先跑 02-onboard.sh 或把看板复制给客户")
 
 # ---- 3. 构造菜单 ----
+#
+# 结构与生产实例的「业务导航（能源管理）」逐项对齐，只保留客户真正要用的。
+# 判断过的垃圾（不要加回来）：
+#   · 「验证·能源流向」     —— 与「能源流向」部件完全相同的测试副本，模板已删
+#   · 「我的账单模板」      —— 「我的账单」的残缺子集（1/4 部件），模板已删
+#   · 「客户能源档案」      —— 租户侧档案视图，客户看不到别人的档案
+#   · 「基础配置中心」      —— 时段方案/费率/倍率，都是租户定的，客户不改
+#   · 「闲时能耗配置」菜单项 —— 入口在「闲时能耗」看板右上角的配置按钮
+#   · 「仪表板」列表        —— TB 的建模入口，客户只需要按用途分好的菜单
+
 def link(name, icon, url=None, dash_id=None):
     it = {"type": "CUSTOM", "name": name, "icon": icon,
           "menuItemType": "LINK", "visible": True}
@@ -121,62 +131,76 @@ def link(name, icon, url=None, dash_id=None):
         it["url"] = url
     return it
 
-def dash_link(title, icon):
+def dash_link(title, icon, menu_name=None):
     did = dash.get(title)
-    return link(title, icon, dash_id=did) if did else None
+    if not did:
+        print(f"  ! 看板「{title}」不存在，菜单项跳过")
+        return None
+    return link(menu_name or title, icon, dash_id=did)
+
+def ai_link(name, icon, path):
+    """ngx-ai 子应用：新标签页 + 带 token（前端已把 /ngxai 排除在 Angular 路由外）"""
+    it = link(name, icon, url=path)
+    it["openInNewTab"] = True
+    it["setAccessToken"] = True
+    return it
 
 def group(name, icon, pages):
     kept = [p for p in pages if p]
     return {"type": "CUSTOM", "name": name, "icon": icon,
             "menuItemType": "SECTION", "visible": True, "pages": kept}
 
-def default_item(mid, pages=None):
-    it = {"type": "DEFAULT", "id": mid, "visible": True}
-    if pages is not None:
-        it["pages"] = pages
-    return it
-
 items = [
-    default_item("home"),
-    # 兜底：全部看板仍可按名字找，客户熟悉后直接从这里进
-    default_item("dashboards", [default_item("dashboard_all")]),
+    # 第一项 = 落地页。客户登录直接看到能耗，不经过空门户页
+    dash_link("能耗概览", "dashboard"),
+
     group("能耗查询", "search", [
         dash_link("实时能耗", "timeline"),
         dash_link("历史能耗", "history"),
+        dash_link("抄表功能", "assignment"),
+    ]),
+
+    group("能耗分析", "analytics", [
+        dash_link("峰谷分析", "stacked_line_chart"),
         dash_link("分项能耗", "donut_large"),
         dash_link("区域能耗", "map"),
-        dash_link("峰谷分析", "stacked_line_chart"),
-        dash_link("电能质量", "bolt"),
+        dash_link("我的账单", "receipt_long", "用能账单"),
+    ]),
+
+    group("综合报表", "description", [
+        dash_link("基础报表", "table_view"),
+        dash_link("手工填报", "edit_note"),
         link("参数报表", "table_chart", url="/param-report"),
     ]),
+
     group("能耗优化", "trending_down", [
-        dash_link("能耗洞察", "insights"),
         dash_link("闲时能耗", "nightlight"),
-        dash_link("节能记录", "energy_savings_leaf"),
-        link("闲时能耗配置", "tune", url="/idle-config"),
+        ai_link("负载预测", "online_prediction", "/ngxai/biz/forecast"),
+        ai_link("用能建议", "lightbulb", "/ngxai/biz/advice"),
+        ai_link("用能质量", "verified", "/ngxai/biz/quality"),
     ]),
+
+    group("告警中心", "notification_important", [
+        link("告警列表", "list_alt", url="/alarm-center"),
+    ]),
+
     group("设备运维", "devices", [
-        link("组织与场站", "location_city", url="/sites"),
-        link("设备分组", "account_tree", url="/device-group"),
         link("设备管理", "devices_other", url="/device-management"),
+        link("设备分组", "account_tree", url="/device-group"),
         link("设备拓扑", "hub", url="/device-topology"),
-        link("告警中心", "notification_important", url="/alarm-center"),
-        link("抄表管理", "assignment", url="/meter-reading"),
-        dash_link("手工填报", "edit_note"),
     ]),
-    group("组织", "corporate_fare", [
-        link("组织与场站", "location_city", url="/sites"),
-        dash_link("客户能源档案", "folder_shared"),
-        dash_link("基础配置中心", "settings"),
-    ]),
-    group("报表与账单", "description", [
-        dash_link("综合能耗", "summarize"),
-        dash_link("盘查报告", "fact_check"),
-        dash_link("我的账单", "receipt_long"),
-        dash_link("我的账单模板", "article"),
-        dash_link("基础报表", "table_view"),
-    ]),
+
+    # 四张常用看板做成一级入口：每天要点，藏进分组反而多一次点击
+    dash_link("综合能耗", "summarize"),
+    dash_link("能源流向", "swap_horiz"),
+    dash_link("电能质量", "bolt"),
+    dash_link("盘查报告", "fact_check"),
+    dash_link("节能记录", "energy_savings_leaf"),
+
+    # 组织就是场站列表，不套分组
+    link("组织", "corporate_fare", url="/sites"),
 ]
+items = [x for x in items if x]
 
 if DRY:
     step("3. 将要写入的菜单（--dry-run，不落库）")
@@ -199,9 +223,9 @@ st, mpage = call("/api/customMenu/infos?pageSize=100&page=0&scope=CUSTOMER", cto
 removed = 0
 if st == 200 and isinstance(mpage, dict):
     for m in mpage.get("data", []):
-        owner = (m.get("customerId") or {}).get("id")
-        # 只处理归属本客户的；租户/系统级菜单不碰
-        if owner != cid:
+        # 按【名字】匹配，不按 customerId —— 菜单的 customer_id 恒为 NULL_UUID，
+        # 拿它和客户 id 比永远不相等，一条都删不掉。
+        if m.get("name") != MENU_NAME:
             continue
         mid = m["id"]["id"]
         code, _ = call(f"/api/customMenu/{mid}?force=true", ctok, "DELETE")
@@ -211,7 +235,15 @@ print(f"  ✓ 删除 {removed} 条")
 
 # ---- 5. 新建 ----
 step("4. 创建并写入配置")
+# ★ customer_id 必须显式传 NULL_UUID，理由有两条：
+#   1. custom_menu.customer_id 是 NOT NULL —— 留空直接
+#      DataIntegrityViolationException，菜单建不出来；
+#   2. 本平台绑定客户靠 customer.customMenuId 指向菜单 id（下一步写），
+#      而不是靠菜单的 customer_id 指向客户。生产实例里所有菜单的
+#      customer_id 都是 NULL_UUID。
+NULL_UUID = "13814000-1dd2-11b2-8080-808080808080"
 st, created = call("/api/customMenu", ctok, "POST", {
+    "customerId": {"id": NULL_UUID, "entityType": "CUSTOMER"},
     "name": MENU_NAME,
     "scope": "CUSTOMER",
     "assigneeType": "ALL",
@@ -230,8 +262,40 @@ if st != 200:
     sys.exit(f"  写入配置失败：HTTP {st} {res}")
 print("  ✓ 配置已写入")
 
-# ---- 6. 用客户身份回读 ----
-step("5. 以客户身份回读")
+# ---- 6. 设首页看板 ----
+#
+# 客户登录后落在 /home，前端读 customer.additionalInfo.homeDashboardId
+# 决定展示哪个看板。不设的话那里是一个空的仪表板门户页。
+step("5. 绑定菜单并设首页看板")
+#
+# ★ 这一步才是「客户能看见菜单」的关键。
+#
+#   客户登录时 findCustomerHierarchyCustomMenu 的查找顺序：
+#     1. 按 customer_id 找默认客户菜单 → 我们建的是 NULL_UUID，命不中
+#     2. 读 customer.customMenuId 按 id 找 → 这一步对上才行
+#     3. 都没有 → 退回「Customer default menu」（TB 原生菜单）
+#
+#   只建菜单不写 customMenuId，客户看到的永远是默认菜单。
+home_id = dash.get("能耗概览")
+st, cur = call(f"/api/customer/{cid}", ttok)
+if st == 200 and isinstance(cur, dict):
+    cur["customMenuId"] = {"id": mid, "entityType": "CUSTOM_MENU"}
+    ai = cur.get("additionalInfo") or {}
+    if home_id:
+        ai["homeDashboardId"] = home_id
+        ai["homeDashboardHideToolbar"] = False
+    cur["additionalInfo"] = ai
+    st2, _ = call("/api/customer", ttok, "POST", cur)
+    if st2 == 200:
+        print(f"  ✓ 客户已绑定菜单 {mid[:8]}…")
+        print("  ✓ 首页看板已设为「能耗概览」" if home_id else "  ! 没有「能耗概览」看板，首页保持默认")
+    else:
+        print(f"  ! 绑定失败 HTTP {st2}（客户会看到默认菜单）")
+else:
+    print(f"  ! 读客户信息失败 HTTP {st}")
+
+# ---- 7. 用客户身份回读 ----
+step("6. 以客户身份回读")
 st, got = call("/api/customMenu", ctok)
 if st != 200 or not isinstance(got, dict):
     sys.exit(f"  回读失败：HTTP {st} {got}")

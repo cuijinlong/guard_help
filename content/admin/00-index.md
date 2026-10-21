@@ -55,8 +55,8 @@ bash scripts/02-onboard.sh \
 cd /你的路径/iot-rule-engine
 bash shiyongshouce/downloads/deploy/docker-98-rebuild.sh \
   --admin langmen@126.com --admin-pass 'CJLqh@163' \
-  --tenant "环宇能源集团" --tenant-email tenant@126.com --tenant-pass '12345678' \
-  --customer "星河工业园" --customer-email customer@126.com --customer-pass '12345678' \
+  --tenant tenant@126.com --tenant-pass '12345678' --tenant-title '环宇能源集团' \
+  --customer customer@126.com --customer-pass '12345678' --customer-title '星河工业园' \
   --yes
 ```
 

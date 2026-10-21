@@ -76,7 +76,7 @@ JAR="$ROOT/guard-server/target/guard-server-4.4.0.jar"
 # 版本自检：模板数必须是 22，否则部署目录装的是旧数据
 TPL="$ROOT/guard-server/src/main/data/json/tenant/dashboards"
 TPL_N=$(ls "$TPL" 2>/dev/null | wc -l | tr -d ' ')
-[[ "$TPL_N" -ge 20 ]] || warn "仓库里仪表板模板只有 ${TPL_N} 个，预期 22 —— 确认改动已落盘"
+[[ "$TPL_N" -ge 20 ]] || warn "仓库里仪表板模板只有 ${TPL_N} 个，预期 ≥20 —— 确认改动已落盘"
 
 T0=$(date +%s)
 elapsed() { printf '%ds' $(( $(date +%s) - T0 )); }
@@ -164,7 +164,7 @@ else
 fi
 
 N=$(ls "$APP_HOME/data/json/tenant/dashboards" 2>/dev/null | wc -l | tr -d ' ')
-[[ "$N" -ge 20 ]] || die "部署目录的仪表板模板只有 ${N} 个，预期 22 —— 换文件没生效"
+[[ "$N" -ge 20 ]] || die "部署目录的仪表板模板只有 ${N} 个，预期 ≥20 —— 换文件没生效"
 ok "仪表板模板 ${N} 个"
 
 # ---------------------------------------------------------------- 3. 建库
