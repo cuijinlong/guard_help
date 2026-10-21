@@ -1,6 +1,117 @@
-# 故障排查
+# ⑤ 常见问题
 
-> 按现象索引。每一条都是本项目真实踩过的坑，给出定位命令、根因和修法。
+> 按现象索引。每一条都是真实踩过的坑，给出**现象 → 定位命令 → 修法**。
+>
+> 先看这张表，能解决 80% 的问题：
+
+| 现象 | 跳到 |
+| --- | --- |
+| 登录提示「用户名或密码错误」 | [第 0 节](#0-登录不进去) |
+| 客户左侧菜单是 TB 原生的（设备/资产/实体视图） | [第 0 节](#0-登录不进去) |
+| 客户看不到任何仪表板 | 第 5 节 |
+| 报表有数但峰谷全是「平」 | 第 13 节 |
+| 设备上报返回 404 | 第 14 节 |
+| 磁盘满 | 第 10 节 |
+| 服务起不来 | 第 9 节 |
+
+## 0. 登录不进去
+
+### 现象 A：提示「用户名或密码错误」（HTTP 401）
+
+**先确认账号密码确实是什么。** 常见原因是重装平台时密码被覆盖 ——
+`docker-98-rebuild.sh` 重装会重建库，用的是**它参数里的密码**，
+不是上一次的。
+
+**定位**：
+
+```bash
+for pair in "langmen@126.com:CJLqh@163" "tenant@126.com:12345678" "customer@126.com:12345678"; do
+  user=${pair%%:*}; pass=${pair#*:}
+  code=$(curl -s --noproxy '*' -m 8 -o /dev/null -w '%{http_code}' \
+    -X POST http://127.0.0.1:8090/api/auth/login \
+    -H 'Content-Type: application/json' \
+    -d "{\"username\":\"$user\",\"password\":\"$pass\"}")
+  printf "%-24s %s\n" "$user" "$code"
+done
+```
+
+`200` = 密码对；`401` = 密码错。
+
+**修法一：用对的密码登录**（就是上面 200 的那个）。
+
+**修法二：改密码**（知道旧密码时）：
+
+```bash
+TOK=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"旧密码"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+
+curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/changePassword \
+  -H "X-Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d '{"currentPassword":"旧密码","newPassword":"新密码"}'
+```
+
+**修法三：忘了密码，直接重置**
+
+```bash
+# 生成一个新的 BCrypt 哈希（用容器里的工具，不用装额外软件）
+cd ~/energy-app
+docker compose exec -T energy-server sh -c \
+  'echo -n "新密码" | sha256sum'   # 先确认能进容器
+
+# 更直接：改数据库（BCrypt 哈希需要用工具生成）
+docker compose exec -T postgres psql -U postgres -d thingsboard -c "
+UPDATE user_credentials SET password = crypt('新密码', gen_salt('bf'))
+WHERE user_id = (SELECT id FROM tb_user WHERE email='tenant@126.com');"
+```
+
+> 如果 `crypt` 函数不存在，装扩展：
+> `CREATE EXTENSION IF NOT EXISTS pgcrypto;`
+>
+> 重置完立刻用新密码登录验证。
+
+### 现象 B：能登录，但页面白屏 / 转圈
+
+**定位**（看浏览器控制台，或直接查资源）：
+
+```bash
+# 首页能不能拿到
+curl -s --noproxy '*' -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/
+
+# 主 JS 能不能拿到
+CH=$(curl -s --noproxy '*' http://127.0.0.1:8090/ | grep -o 'main-[A-Z0-9]*\.js')
+curl -s --noproxy '*' -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8090/$CH"
+```
+
+两个都 `200` 但页面白 → 前端构建产物有问题，重新构建：
+
+```bash
+cd /你的路径/iot-rule-engine/ui-ngx
+node --max_old_space_size=8192 ./node_modules/@angular/cli/bin/ng build --configuration production
+```
+
+然后重新打包部署（见[② 平台部署](/admin/deploy)）。
+
+### 现象 C：客户登录后左侧是 TB 原生菜单
+
+不是设备/资产/实体视图那套，而是应该有「能耗查询 / 能耗优化 / 设备运维 / 组织」。
+
+**修法**：
+
+```bash
+cd ~/energy-app
+bash scripts/07-init-menu.sh \
+  --tenant tenant@126.com --tenant-pass '12345678' \
+  --customer customer@126.com --customer-pass '12345678'
+```
+
+**根因**：客户菜单是「每个客户一份」的自定义菜单，建客户时自动装。
+手工删过、或老客户升级上来没有，就要补装。
+
+**注意**：脚本必须用**客户账号**操作。用租户账号建出来的
+`customer_id` 是 NULL，客户永远看不到。
+
 
 ## 1. 全新部署卡在第一步：setup 接口返回 423
 
@@ -161,7 +272,9 @@ p.setProfileData(profileData);
 
 修完后新租户会有 4 个计量器具档案，客户创建时演示设备正常产出 3 台。
 
-## 5. 新租户仪表板 0 个
+## 5. 仪表板 0 个
+
+### 情况 A：租户自己也是 0 个
 
 **现象**
 
@@ -184,6 +297,41 @@ ls -d application/src/main/data/json guard-server/src/main/data/json 2>/dev/null
 
 1. 启动参数显式加 `-Dinstall.data_dir=/opt/energy/data`（**推荐，必须做**）；
 2. 代码侧也收紧：候选目录必须含 `json/` 才返回，并继续尝试 `guard-server/src/main/data`。
+
+### 情况 B：租户有 22 个，客户 0 个
+
+**现象**：租户管理员能看到全部看板，客户登录后「仪表板」列表是空的。
+
+**定位**：
+
+```bash
+TOK=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+
+CID=$(curl -s --noproxy '*' -H "X-Authorization: Bearer $TOK" \
+  'http://127.0.0.1:8090/api/customers?pageSize=5&page=0' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id']['id'])")
+
+curl -s --noproxy '*' -H "X-Authorization: Bearer $TOK" \
+  "http://127.0.0.1:8090/api/customer/$CID/dashboards?pageSize=100&page=0" \
+  | python3 -c "import json,sys; print('客户可见:', json.load(sys.stdin).get('totalElements',0))"
+```
+
+**根因**：客户看板的查询条件是 `dashboard.customer_id = 该客户`。
+上游的「分配给客户」只写 `assigned_customers` 和 relation，**不改 customer_id** ——
+所以分配了也查不到。
+
+**修法**：建客户时本平台会把 22 个模板**复制一份**到客户名下（已自动）。
+手工补：
+
+```bash
+cd ~/energy-app
+bash scripts/02-onboard.sh ...（参数同上，会重建客户并复制看板）
+```
+
+或者只删客户再重建（见[③ 数据初始化](/admin/init)第七节）。
 
 ## 6. 01-install.sh 报 psql: command not found
 
@@ -281,7 +429,7 @@ docker image prune -f        # 清悬空镜像（<none>）
 
 ⚠️ **不要**随手用 `docker system prune -a --volumes -f` —— 它会删掉未使用的命名卷，数据库可能一并丢失。
 
-完整的磁盘调优、日志轮转、`data-root` 迁移见[Docker 安装与运维](/admin/docker-ops) 第八节。
+完整的磁盘调优、日志轮转、`data-root` 迁移见[① Docker](/admin/docker) 第二、三节。
 
 ## 11. 平时该盯什么
 

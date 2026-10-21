@@ -86,7 +86,7 @@ curl -s --noproxy '*' -H "X-Authorization: Bearer $TOK" \
 ```
 
 平台已经给每个客户的新设备生成了 `rtu-config.csv`（含每台表的 token 与点位映射），
-在客户数据导入目录里。见[新客户上线](/admin/customer-data)。
+在客户数据导入目录里。见[新客户上线](/admin/init)。
 
 ---
 

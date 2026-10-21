@@ -1,6 +1,6 @@
 {
   "title": "能源管理平台 · 使用手册",
-  "version": "v1.2",
+  "version": "v2.0",
   "updated": "2026-10-21",
   "sections": [
     {
@@ -45,7 +45,7 @@
     {
       "id": "admin",
       "title": "平台运维手册",
-      "desc": "面向平台方：部署、开租户、备份、监控、排障、升级",
+      "desc": "面向平台方：装 Docker、部署平台、初始化数据、接设备、排故障",
       "icon": "server",
       "items": [
         {
@@ -54,64 +54,29 @@
           "file": "admin/00-index.md"
         },
         {
-          "id": "docker-ops",
-          "title": "Docker 安装与运维",
-          "file": "admin/12-docker-ops.md"
+          "id": "docker",
+          "title": "① Docker",
+          "file": "admin/01-docker.md"
         },
         {
           "id": "deploy",
-          "title": "部署：照着做",
+          "title": "② 平台部署",
           "file": "admin/02-deploy.md"
         },
         {
-          "id": "deploy-modes",
-          "title": "单容器 or 分容器",
-          "file": "admin/02c-deploy-modes.md"
-        },
-        {
-          "id": "deploy-remote",
-          "title": "部署到服务器",
-          "file": "admin/02b-deploy-remote.md"
-        },
-        {
-          "id": "tenant",
-          "title": "开租户与开客户",
-          "file": "admin/04-tenant-onboarding.md"
-        },
-        {
-          "id": "customer-data",
-          "title": "新客户上线：按流程做",
-          "file": "admin/13-customer-data.md"
-        },
-        {
-          "id": "verify-e2e",
-          "title": "全链路验收",
-          "file": "admin/14-verify-e2e.md"
+          "id": "init",
+          "title": "③ 数据初始化",
+          "file": "admin/03-init.md"
         },
         {
           "id": "device-access",
-          "title": "设备接入（RTU）",
-          "file": "admin/15-device-access.md"
-        },
-        {
-          "id": "menus",
-          "title": "左侧菜单",
-          "file": "admin/16-menus.md"
+          "title": "④ 设备接入",
+          "file": "admin/04-device-access.md"
         },
         {
           "id": "troubleshoot",
-          "title": "故障排查",
-          "file": "admin/07-troubleshooting.md"
-        },
-        {
-          "id": "uninstall",
-          "title": "卸载与重置",
-          "file": "admin/10-uninstall.md"
-        },
-        {
-          "id": "baremetal",
-          "title": "裸机部署",
-          "file": "admin/11-baremetal.md"
+          "title": "⑤ 常见问题",
+          "file": "admin/05-troubleshoot.md"
         }
       ],
       "description": "给平台方的：怎么部署、开租户、导入数据、排障"
