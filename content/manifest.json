@@ -1,7 +1,7 @@
 {
   "title": "能源管理平台 · 使用手册",
-  "version": "v1.0",
-  "updated": "2026-10-20",
+  "version": "v1.1",
+  "updated": "2026-10-21",
   "sections": [
     {
       "id": "user",
@@ -82,6 +82,16 @@
           "id": "customer-data",
           "title": "新客户上线：按流程做",
           "file": "admin/13-customer-data.md"
+        },
+        {
+          "id": "verify-e2e",
+          "title": "全链路验收",
+          "file": "admin/14-verify-e2e.md"
+        },
+        {
+          "id": "device-access",
+          "title": "设备接入（RTU）",
+          "file": "admin/15-device-access.md"
         },
         {
           "id": "troubleshoot",

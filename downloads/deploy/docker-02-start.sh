@@ -132,6 +132,44 @@ fi
 ME=$(ncurl -m 20 -H "X-Authorization: Bearer $TOKEN" "$BASE/api/auth/user")
 echo "$ME" | grep -q '"authority":"SYS_ADMIN"' || die "登录成功但不是 SYS_ADMIN，返回：$ME"
 
+# 设备接入通道。
+#
+# 不能用「/api/v1/xxx/telemetry 返回什么」来判断 —— 端点没装配是 404，
+# 端点装了但 token 不对也是 404，两者分不出来。直接看装配条件：
+#   DeviceApiController 要求 service.type=monolith 且 transport.http.enabled=true
+SVC_TYPE=$($COMPOSE $PROFILE_ARGS exec -T energy-server \
+  sh -c 'printf "%s" "${SERVICE_TYPE:-}"' 2>/dev/null | tr -d '\r\n')
+HTTP_ON=$($COMPOSE $PROFILE_ARGS exec -T energy-server \
+  sh -c 'printf "%s" "${HTTP_ENABLED:-}"' 2>/dev/null | tr -d '\r\n')
+
+if [[ "$SVC_TYPE" == "monolith" && "$HTTP_ON" == "true" ]]; then
+  ok "设备接入通道已开放（HTTP + MQTT）"
+else
+  cat <<MSG >&2
+  ✗ 设备接入通道未开放：SERVICE_TYPE=${SVC_TYPE:-空} HTTP_ENABLED=${HTTP_ON:-空}
+
+    平台自己的接口全正常，但 RTU / 网关会全部上报失败，界面上看不出来。
+    需要 .env 与 docker-compose.yml 同时满足：
+      SERVICE_TYPE=monolith
+      HTTP_ENABLED=true
+      MQTT_ENABLED=true
+
+    排查：docker compose logs energy-server | grep -i transport
+
+MSG
+  warn "继续往下走，但在修好之前设备上报不通"
+fi
+
+# MQTT 端口：容器在跑不代表端口映射成功
+MQTT_P="${MQTT_PORT:-1883}"
+if command -v lsof >/dev/null 2>&1; then
+  if lsof -nP -iTCP:"$MQTT_P" -sTCP:LISTEN >/dev/null 2>&1; then
+    ok "MQTT 端口 ${MQTT_P} 正在监听"
+  else
+    warn "MQTT 端口 ${MQTT_P} 未监听 —— RTU 会连不上。看 docker compose ps 的端口映射"
+  fi
+fi
+
 cat <<DONE
 
 ============================================================
@@ -167,5 +205,21 @@ cat <<DONE
     --ai http://127.0.0.1:${PORT}
 
   预期最后一行：通过 22 / 失败 0
+
+------------------------------------------------------------
+ 设备接入（RTU / 网关上报）
+------------------------------------------------------------
+
+  MQTT    ${MQTT_P}
+          主题：v1/devices/me/telemetry
+          用户名：设备的 Access Token（不是账号密码）
+          密码：留空
+
+  HTTP    http://本机IP:${PORT}/api/v1/{AccessToken}/telemetry
+          Content-Type: application/json
+          {"energy":2.88,"power_total":2.88,"voltage_a":220.5}
+
+  每台设备的 Access Token 在平台里查：
+    设备 → 点开某台 → 复制访问令牌
 
 DONE

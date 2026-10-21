@@ -168,9 +168,9 @@ docker image prune -f     # 再清悬空镜像
 
 完整的清理策略、容器日志轮转、`data-root` 迁移见[Docker 安装与运维](/admin/docker-ops) 第八节。
 
-## 六、重置而不卸载（想清空数据重来）
+## 六、重置数据但不删目录
 
-不删目录，只把数据库清空：
+适合「库脏了，想从干净库重来」，但**不换版本**。
 
 **在哪执行：【部署机 · 部署目录】**
 
@@ -178,13 +178,28 @@ docker image prune -f     # 再清悬空镜像
 cd ~/energy-app
 
 docker compose down -v          # 删容器和数据卷，保留目录与 jar
-rm -f .env                      # 让下一步重新生成密码与端口
+rm -f .env                      # 下一步会重新生成密码与端口
 
-bash docker-01-install.sh       # 重新建库（会自动生成新 .env）
-bash docker-02-start.sh --admin-email admin@example.com --admin-pass '新密码'
+bash docker-01-install.sh       # 重新建库（.env 缺失时自动生成）
+bash docker-02-start.sh --admin-email admin@your.com --admin-pass '新密码'
 ```
 
-这比完整卸载快，适合反复验证初始化流程。
+> ⚠️ **这一节不会让你升级到新版本。**
+> 它保留目录里的 `guard-server-4.4.0.jar` 和 `data/` 原样 —— 如果它们是旧版，
+> 重新建库后跑的还是旧功能：能源字典、厂商型号、新仪表板照样没有。
+>
+> 想换成新版本，走[部署手册的「更新到新版本」](02-deploy.md)，
+> 那里的路 A 会先卸载、再从仓库重新生成部署目录。
+
+**怎么判断自己需不需要换版本**：
+
+```bash
+cd ~/energy-app
+ls data/json/tenant/dashboards/ | wc -l
+```
+
+- 输出 `22` → 目录已是新版，本节流程够用
+- 输出 `6` 或更少 → 目录是旧版，必须先换文件，否则重置多少次都一样
 
 ## 七、脚本拒绝执行的情况
 

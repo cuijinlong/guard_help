@@ -87,6 +87,13 @@ if [[ -f .env ]]; then
     fi
   fi
 
+  # 老版本的 .env 没有 MQTT_PORT（那时设备通道是关的）。
+  # 现在 RTU 要通过它上报，缺了就补默认值，否则 compose 会拿空值当端口。
+  if ! grep -qE '^MQTT_PORT=' .env; then
+    printf 'MQTT_PORT=1883\n' >> .env
+    log "旧 .env 缺 MQTT_PORT，已补 1883"
+  fi
+
   # 密码为空时补一个随机值，避免 compose 因空密码拒绝启动
   if ! grep -qE '^DB_PASSWORD=.+$' .env; then
     _p=$(openssl rand -hex 12 2>/dev/null || printf '%s%s' "$(date +%s)" "$RANDOM")
@@ -147,6 +154,22 @@ port_busy() {
 # tb-postgres 一开机就报“端口被占用”，实际根本不会冲突。
 if port_busy "${HTTP_PORT:-8090}"; then
   die "端口 ${HTTP_PORT:-8090} 已被占用。改 .env 里的 HTTP_PORT 换个端口，或停掉占用它的进程"
+fi
+
+# MQTT 端口必须检查：它会映射到宿主机，被 mosquitto 之类占用时容器起不来。
+# 老版本 .env 里没有这一项，缺省用 1883。
+MQTT_P="${MQTT_PORT:-1883}"
+if port_busy "$MQTT_P"; then
+  cat <<MSG >&2
+  ✗ 端口 $MQTT_P 已被占用 —— 这是 RTU / 网关上报用的 MQTT 端口。
+
+  两个选择：
+    1. 换端口：编辑 .env，把 MQTT_PORT 改成别的（如 18830），
+       然后所有设备的连接地址也要跟着改。
+    2. 停掉占用它的进程：lsof -nP -iTCP:$MQTT_P -sTCP:LISTEN
+
+MSG
+  die "MQTT 端口冲突"
 fi
 ok "docker / compose / 文件 / 端口 检查通过"
 

@@ -102,8 +102,14 @@ services:
         condition: service_healthy
     environment:
       <<: *db-env
-      HTTP_ENABLED: "false"
-      MQTT_ENABLED: "false"
+      # RTU / 网关要能上报，就必须让本进程监听设备侧协议。
+      # service.type 不设成 monolith，下面的 ENABLED 全部无效 —— 端点由
+      # @ConditionalOnExpression("'${service.type}'=='monolith' && ...") 装配，
+      # 缺了它 /api/v1/{token}/telemetry 直接 404（实测 2026-10-20）。
+      SERVICE_TYPE: monolith
+      HTTP_ENABLED: "true"
+      MQTT_ENABLED: "true"
+      MQTT_BIND_PORT: "${MQTT_PORT:-1883}"
       COAP_ENABLED: "false"
       LWM2M_ENABLED: "false"
       COAP_SERVER_ENABLED: "false"
@@ -113,9 +119,12 @@ services:
       - ${APP_HOME}/guard-server-4.4.0.jar:/opt/energy/app.jar:ro
       - ${APP_HOME}/data:/opt/energy/data:ro
       - ${APP_HOME}/logs:/opt/energy/logs
-    # 不对宿主暴露端口：所有访问都经 gateway。排障用 docker compose exec。
+    # 8090 不映射到宿主：Web 访问一律经 gateway。
+    # 1883 必须映射：RTU / 物联网网关需要直连 MQTT，走不了 nginx。
     expose:
       - "8090"
+    ports:
+      - "${MQTT_PORT:-1883}:${MQTT_PORT:-1883}"
     entrypoint: ["java", "-Dinstall.data_dir=/opt/energy/data", "-jar", "/opt/energy/app.jar"]
     command:
       - --spring.config.name=thingsboard
@@ -205,8 +214,10 @@ services:
       SPRING_PROFILE: ${SPRING_PROFILE:-dev}
       TB_API_USERNAME: ${TB_API_USERNAME:-tenant@thingsboard.org}
       TB_API_PASSWORD: ${TB_API_PASSWORD:-tenant}
+      MQTT_PORT: ${MQTT_PORT:-1883}
     ports:
       - "${HTTP_PORT:-8090}:80"
+      - "${MQTT_PORT:-1883}:${MQTT_PORT:-1883}"
     volumes:
       # PostgreSQL 数据、SQLite、日志都在这里；升级镜像不丢数据
       - allinone-data:/var/lib/energy
