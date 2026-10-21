@@ -162,6 +162,59 @@ has "含「负荷率」派生指标"   "$CFROWS" '负荷率'   '同上'
 has "含「碳排放」派生指标"   "$CFROWS" '碳排放'   '同上'
 
 # ================================================================
+sec "C2. 主数据层级与费率模板"
+
+# 层级边界：字典 / 时段方案 / 费率模板必须是租户级（customer_id 为空）。
+# 沉到客户级会让读取侧拿到「不确定是哪一份」，报表 key 对不上。
+LEAK=$(DASH_DB "SELECT type || ':' || count(*) FROM asset
+                 WHERE type IN ('energy_type_library','tou_scheme','rate_template')
+                   AND customer_id <> '13814000-1dd2-11b2-8080-808080808080'
+                 GROUP BY type;" | tr -d '\r')
+if [[ -z "$LEAK" ]]; then
+  ok "租户级主数据未混入客户级（字典 / 时段方案 / 费率模板）"
+else
+  bad "租户级主数据混入了客户级：$LEAK" \
+      '客户不要自建字典/时段方案/费率模板；应引租户级的那份 + override 调价'
+fi
+
+TPL_TYPE_N=$(DASH_DB "SELECT count(*) FROM asset WHERE type='rate_template'
+                        AND customer_id='13814000-1dd2-11b2-8080-808080808080';" | tr -d ' ')
+ge "费率模板数（租户级）" "${TPL_TYPE_N:-0}" "4" \
+   '客户能源建档的费率下拉会为空、一键初始化直接失败：确认 EnergyLibraryInstaller.createRateTemplates 跑过'
+
+TPL_ENERGIES=$(DASH_DB "SELECT DISTINCT ak.str_v FROM asset a
+                          JOIN attribute_kv ak ON ak.entity_id = a.id
+                          JOIN key_dictionary k ON k.key_id = ak.attribute_key
+                         WHERE a.type='rate_template' AND k.key='energy';" | tr -d '\r')
+n=$(printf '%s\n' "$TPL_ENERGIES" | grep -c . 2>/dev/null || echo 0)
+eq "模板覆盖的能源品种数" "${n:-0}" "4" \
+   '缺某个品种的模板 → 该品种无法开通（能源建档里选了也没模板可选）；确认 createRateTemplates 跑过'
+
+TPL_TOU=$(DASH_DB "SELECT count(*) FROM relation r
+                     JOIN asset a ON a.id = r.from_id
+                    WHERE a.type='rate_template' AND r.relation_type='uses';" | tr -d ' ')
+ge "电价模板关联的时段方案" "${TPL_TOU:-0}" "4" \
+   '账单会退化为「按季节猜方案」：确认 createRateTemplates 的 linkTouSchemes 跑过'
+
+# 闲时能耗链路：重算 → idle_exceed → 计算字段 → 告警。
+# 这条链最容易「看起来都在、实际不通」：直写 DAO 的话计算字段永远缺参数。
+IDLE_TS=$(DASH_DB "SELECT count(*) FROM ts_kv kv JOIN key_dictionary k ON k.key_id=kv.key
+                    WHERE k.key='idle_exceed';" | tr -d ' ')
+ge "idle_exceed 时序点" "${IDLE_TS:-0}" "1" \
+   '空闲时段没配阈值或没跑过重算：在「场站 → 空闲时段」配一次，或点「历史重算」'
+
+IDLE_CFG=$(DASH_DB "SELECT count(*) FROM attribute_kv ak
+                      JOIN key_dictionary k ON k.key_id=ak.attribute_key
+                      JOIN asset a ON a.id=ak.entity_id
+                     WHERE k.key='idleConfig' AND a.type='场站';" | tr -d ' ')
+ge "配了闲时阈值的场站" "${IDLE_CFG:-0}" "1" \
+   '没有 idleConfig：闲时超标判定拿不到阈值，等于这条功能没开'
+
+IDLE_ALARM=$(DASH_DB "SELECT count(*) FROM alarm WHERE type='闲时能耗超标';" | tr -d ' ')
+ge "闲时能耗超标告警（历史累计）" "${IDLE_ALARM:-0}" "1" \
+   '计算字段没被触发：确认 persistDaily 走的是 telemetrySubscriptionService（直写 DAO 不会触发）'
+
+# ================================================================
 sec "D. 看板模板"
 TPL_N=$(DASH_DB "SELECT count(*) FROM dashboard WHERE customer_id IS NULL;" | tr -d ' ')
 eq "看板模板数" "${TPL_N:-0}" "20" \

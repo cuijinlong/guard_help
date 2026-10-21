@@ -124,6 +124,15 @@ def count_tou_schemes(_repo) -> int:
     return len(re.findall(r'createTouScheme\(tenantId,', body.group(0)))
 
 
+def count_rate_templates(_repo) -> int:
+    """费率模板数：createRateTemplate(tenantId, ...) 的调用次数（不含 linkTouSchemes 等）"""
+    src = _read(JAVA_INSTALL / 'EnergyLibraryInstaller.java')
+    body = re.search(r'private void createRateTemplates\(.*?\n    \}', src, re.S)
+    if not body:
+        raise RuntimeError('EnergyLibraryInstaller: 找不到 createRateTemplates')
+    return len(re.findall(r'createRateTemplate\(tenantId,', body.group(0)))
+
+
 def count_dashboards(_repo) -> int:
     return len(list(DASHBOARDS.glob('*.json')))
 
@@ -206,6 +215,9 @@ CHECKS = [
     Check('tou', '分时时段方案', count_tou_schemes, [
         ('03-init.md', r'\| 分时时段方案 \| 建租户时自动 \| (\d+) 套'),
         ('03-init.md', r'## 五、分时时段方案（(\d+) 套）'),
+    ]),
+    Check('rate_templates', '费率模板', count_rate_templates, [
+        ('03-init.md', r'\| 费率模板 \| 建租户时自动 \| (\d+) 个'),
     ]),
     Check('dashboards', '看板模板', count_dashboards, [
         ('02-deploy.md', r'wc -l\s+# 必须是 (\d+)'),
