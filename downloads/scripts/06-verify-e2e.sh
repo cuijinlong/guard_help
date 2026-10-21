@@ -116,6 +116,36 @@ if [[ -n "$CTOK" ]]; then
   # 越权：客户不能读租户级端点
   CODE=$(ncurl -o /dev/null -w '%{http_code}' -H "X-Authorization: Bearer $CTOK" "$BASE/api/tenant/devices?pageSize=1&page=0")
   [[ "$CODE" == "403" ]] && ok_ "客户访问租户端点仍被拒（隔离有效）" || bad_ "客户越权访问租户端点（HTTP ${CODE}）"
+
+  # 客户菜单：必须是能源管理主题，不是 TB 原生的「实体/资产」分类
+  MENU=$(CAPI /api/customMenu)
+  MTOP=$(echo "$MENU" | jget "len(d.get('items',[]))")
+  MNAMES=$(echo "$MENU" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print('|'.join((i.get('name') or i.get('id') or '') for i in d.get('items',[])))" 2>/dev/null)
+
+  [[ "${MTOP:-0}" -ge 5 ]] && ok_ "客户菜单已装（顶层 ${MTOP} 项）" || bad_ "客户菜单项过少（${MTOP:-0}）" "检查每项是否写了 visible=true"
+  echo "$MNAMES" | grep -q "能耗查询" && ok_ "菜单含「能耗查询」分组" || bad_ "菜单缺「能耗查询」"
+  echo "$MNAMES" | grep -q "设备运维" && ok_ "菜单含「设备运维」分组" || bad_ "菜单缺「设备运维」"
+
+  # 菜单里的看板入口必须指向本客户自己的看板，不能是租户模板 id
+  DBAD=$(echo "$MENU" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+bad=0; total=0
+for it in d.get('items',[]):
+    for p in (it.get('pages') or []):
+        if p.get('linkType')=='DASHBOARD':
+            total+=1
+            if not p.get('dashboardId'): bad+=1
+print(bad, total)" 2>/dev/null)
+  DBAD_N=$(echo "$DBAD" | cut -d' ' -f1); DTOT=$(echo "$DBAD" | cut -d' ' -f2)
+  if [[ "${DBAD_N:-1}" == "0" && "${DTOT:-0}" -ge 5 ]]; then
+    ok_ "菜单里的看板入口均已绑定（${DTOT} 个）"
+  else
+    bad_ "看板入口异常（${DBAD_N:-?} 个未绑定 / 共 ${DTOT:-0}）"
+  fi
 else
   E2E_SITE=""
 fi

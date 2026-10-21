@@ -1,6 +1,6 @@
 {
   "title": "能源管理平台 · 使用手册",
-  "version": "v1.1",
+  "version": "v1.2",
   "updated": "2026-10-21",
   "sections": [
     {
@@ -92,6 +92,11 @@
           "id": "device-access",
           "title": "设备接入（RTU）",
           "file": "admin/15-device-access.md"
+        },
+        {
+          "id": "menus",
+          "title": "左侧菜单",
+          "file": "admin/16-menus.md"
         },
         {
           "id": "troubleshoot",

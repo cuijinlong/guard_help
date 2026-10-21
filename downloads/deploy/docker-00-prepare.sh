@@ -128,6 +128,7 @@ cp "$HERE/../scripts/02-onboard.sh"      "$STAGE/scripts/"
 cp "$HERE/../scripts/03-verify.sh"       "$STAGE/scripts/"
 cp "$HERE/../scripts/04-verify-data.sh"  "$STAGE/scripts/"
 cp "$HERE/../scripts/06-verify-e2e.sh"    "$STAGE/scripts/"
+cp "$HERE/../scripts/07-init-menu.sh"     "$STAGE/scripts/"
 cp "$HERE/../scripts/05-import-customer-data.py" "$STAGE/scripts/"
 # 客户基础数据的空白模板：客户拿这三张表填，再交给导入脚本
 mkdir -p "$STAGE/templates"
