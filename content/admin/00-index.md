@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | [① Docker](/admin/docker) | 安装、调优、日常清理、卸载 Docker | 机器上还没有 Docker |
 | [② 平台部署](/admin/deploy) | 4 条命令装完平台；卸载也在这页 | 部署平台、升级、重装 |
-| [③ 数据初始化](/admin/init) | 用户、字典、字段、菜单、演示数据；验和补 | 装完要确认数据齐不齐 |
+| [③ 数据初始化](/admin/init) | 用户、字典、档案、规则、菜单、演示数据；自检、清理、验和补 | 装完要确认数据齐不齐 |
 
 ## 接入现场（客户要连设备）
 
@@ -39,7 +39,7 @@ cd ~/energy-app
 bash docker-01-install.sh
 bash docker-02-start.sh --admin-email langmen@126.com --admin-pass 'CJLqh@163'
 
-# 3. 初始化数据（用户/字典/菜单/演示数据一次到位）
+# 3. 初始化数据（用户 / 字典 / 档案 / 规则 / 菜单 / 演示数据一次到位）
 bash scripts/02-onboard.sh \
   --base http://127.0.0.1:8090 \
   --admin langmen@126.com --admin-pass 'CJLqh@163' \
@@ -67,6 +67,27 @@ cd ~/energy-app
 bash docker-99-uninstall.sh --purge --yes --images=none
 docker builder prune -f        # 再清构建缓存
 ```
+
+### 卸载后从头再来（一条命令）
+
+上面的 `docker-98-rebuild.sh` **自己会先卸载再装**，不需要手工分两步。
+想连数据卷一起清干净、从零验一遍初始化数据，直接跑：
+
+```bash
+cd /你的路径/iot-rule-engine
+bash shiyongshouce/downloads/deploy/docker-98-rebuild.sh \
+  --admin langmen@126.com --admin-pass 'CJLqh@163' \
+  --tenant tenant@126.com   --tenant-pass '12345678' --tenant-title '环宇能源集团' \
+  --customer customer@126.com --customer-pass '12345678' --customer-title '星河工业园' \
+  --yes
+```
+
+跑完会打印一行「验收：全部通过」。然后登录 → **平台自检**，
+确认初始化项全绿（见[③ 数据初始化](/admin/init)「一之三」）。
+
+> 注意两个脚本的参数名不一样，别混：
+> `docker-98-rebuild.sh` 的 `--tenant` / `--customer` 是**登录邮箱**，名称用 `--tenant-title` / `--customer-title`；
+> `scripts/02-onboard.sh` 的 `--tenant` / `--customer` 是**名称**，邮箱用 `--tenant-email` / `--customer-email`。
 
 ---
 
