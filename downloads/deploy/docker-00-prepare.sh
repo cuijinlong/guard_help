@@ -135,12 +135,20 @@ cp "$HERE/docker-compose.yml"        "$STAGE/"
 cp "$HERE/docker-01-install.sh"      "$STAGE/"
 cp "$HERE/docker-02-start.sh"        "$STAGE/"
 cp "$HERE/docker-99-uninstall.sh"    "$STAGE/"
-cp "$HERE/../scripts/02-onboard.sh"      "$STAGE/scripts/"
-cp "$HERE/../scripts/03-verify.sh"       "$STAGE/scripts/"
-cp "$HERE/../scripts/04-verify-data.sh"  "$STAGE/scripts/"
-cp "$HERE/../scripts/06-verify-e2e.sh"    "$STAGE/scripts/"
-cp "$HERE/../scripts/07-init-menu.sh"     "$STAGE/scripts/"
-cp "$HERE/../scripts/05-import-customer-data.py" "$STAGE/scripts/"
+# 运维脚本全量拷贝 —— 不写死文件名。
+# 教训：早先这里是逐个 cp 的清单，新增 08-verify-release.sh 时忘了加，
+# 结果「重装一次脚本就没了」，而手册已经让用户去跑它。
+# 通配符保证以后新增脚本自动进部署目录，不会再漏。
+# 只拷 02 起的运维脚本：01-install.sh 是「不起 Docker、直连数据库」的裸机路径，
+# 放进 Docker 部署目录只会让人误以为要跑它。
+# 用 0[2-9]-* 而不是逐个写文件名 —— 以后加 09、10 会自动带上。
+cp "$HERE/../scripts/"0[2-9]-* "$STAGE/scripts/" 2>/dev/null || die "scripts/ 下没有 02-* 起的脚本"
+
+# 自检：脚本数与仓库一致，防止某次改动只加了文件没被拷进来
+REPO_SCRIPTS=$(ls "$HERE/../scripts/"0[2-9]-* 2>/dev/null | wc -l | tr -d ' ')
+STAGE_SCRIPTS=$(ls "$STAGE/scripts/"0[2-9]-* 2>/dev/null | wc -l | tr -d ' ')
+[[ "$REPO_SCRIPTS" -eq "$STAGE_SCRIPTS" ]] \
+  || die "脚本拷贝不全：仓库 ${REPO_SCRIPTS} 个，部署目录 ${STAGE_SCRIPTS} 个"
 # 客户基础数据的空白模板：客户拿这三张表填，再交给导入脚本
 mkdir -p "$STAGE/templates"
 cp "$HERE/../templates/"*.csv "$STAGE/templates/" 2>/dev/null || true
