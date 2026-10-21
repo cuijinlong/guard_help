@@ -73,10 +73,20 @@ JAR="$ROOT/guard-server/target/guard-server-4.4.0.jar"
 [[ -f "$JAR" ]] || die "找不到 jar：$JAR
      先构建：cd $ROOT/guard-server && mvn package -DskipTests"
 
-# 版本自检：模板数必须是 22，否则部署目录装的是旧数据
+# 版本自检：模板数，防止部署目录装的是旧数据。
+# 具体下限由 check-docs.py 从代码算出来，这里只做存在性兜底。
 TPL="$ROOT/guard-server/src/main/data/json/tenant/dashboards"
 TPL_N=$(ls "$TPL" 2>/dev/null | wc -l | tr -d ' ')
-[[ "$TPL_N" -ge 20 ]] || warn "仓库里仪表板模板只有 ${TPL_N} 个，预期 ≥20 —— 确认改动已落盘"
+[[ "$TPL_N" -ge 1 ]] || die "仓库里没有仪表板模板：$TPL"
+
+# 手册与代码一致性：重装后你会照手册验收，手册数字不对就是白验一遍。
+# 不一致只警告不中断 —— 重装本身不该被文档问题挡住，但你要知道。
+if [[ -x "$ROOT/shiyongshouce/check-docs.py" ]]; then
+  if ! DOC_OUT="$("$ROOT/shiyongshouce/check-docs.py" 2>&1)"; then
+    warn "手册与代码不一致（不影响本次重装，但验收时别照手册的数字）："
+    echo "$DOC_OUT" | sed -n '/✗/,$p' | sed 's/^/     /'
+  fi
+fi
 
 T0=$(date +%s)
 elapsed() { printf '%ds' $(( $(date +%s) - T0 )); }

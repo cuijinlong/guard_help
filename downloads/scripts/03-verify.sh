@@ -95,6 +95,11 @@ if [[ -n "$TOK" ]]; then
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d['items']) if isinstance(d.get('items'), list) else 'bad')" 2>/dev/null || echo bad)
   [[ "$N" != "bad" ]]; chk $? "自定义菜单接口可用（${N} 项，空则走内置导航）"
 
+  # 平台自检接口：初始化是否完整，一次请求拿全（9 项租户级 / 8 项客户级）
+  N=$(TAPI '/api/energy/self-check' \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('summary',{}).get('healthy','bad'))" 2>/dev/null || echo bad)
+  [[ "$N" != "bad" ]]; chk $? "平台自检接口可用（healthy=${N}）"
+
   # 审计报告版本接口（本轮新增）
   CODE=$(ncurl -o /dev/null -w '%{http_code}' -H "X-Authorization: Bearer $TOK" -m 20 "$BASE/api/energy/audit-report/versions")
   [[ "$CODE" == "200" ]]; chk $? "盘查报告版本接口可用（HTTP ${CODE}）"

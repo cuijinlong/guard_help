@@ -179,7 +179,7 @@ bash scripts/07-init-menu.sh \
 
 它会同时补 `customerMenuId` 和 `homeDashboardId`。
 
-### 现象 F：租户菜单里没有「能源管理」
+### 现象 F：运营配置（Platform）里没有能源配置项
 
 **定位**：
 
@@ -189,9 +189,66 @@ SELECT name, scope FROM custom_menu ORDER BY scope;"
 ```
 
 应有「默认导航（能源管理）」(TENANT) 和「业务导航（能源管理）」(CUSTOMER) 两条。
+租户那条的 `length(config) > 100` 才算真装了 —— 平台自带的 `Tenant default menu`
+是 `{"items":[]}`（12 字节），用它计数会误判。
 
-**修法**：两条都是租户/客户创建时自动装的。缺了只能重建租户/客户，
-或手工在平台里新建菜单。
+**修法**：两条都是租户/客户创建时自动装的。缺了就点**平台自检 → 一键修复初始化**，
+不用重建租户（10–30 秒，幂等）。命令行等价：
+
+```bash
+curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOK" \
+  http://127.0.0.1:8090/api/energy/repair-init
+```
+
+
+### 现象 G：租户菜单只剩几项，TB 原生菜单像是被删了
+
+**现象**：左侧只剩 首页 和少数几项，实体、客户与用户、资源、安全这些
+TOGGLE 型菜单整块消失（正常情况下应该是 11 项）。
+
+**先确认数据没坏**：
+
+```bash
+TOK=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+
+curl -s --noproxy '*' -H "X-Authorization: Bearer $TOK" \
+  http://127.0.0.1:8090/api/customMenu \
+  | python3 -c "import json,sys; print('顶层项数:', len(json.load(sys.stdin)['items']))"
+```
+
+- 输出 **11** → 数据完好，是**前端**渲染问题：旧版前端遇到「toggle 型顶层项但没有 pages」会整项丢弃。换新前端即恢复，**不用重装、不用重跑初始化**。
+- 输出 **小于 11** → 菜单确实是旧版装的，点**平台自检 → 一键修复初始化**重装。
+
+详见[③ 数据初始化](/admin/init)「一之五」。
+
+
+### 现象 H：看板里图表全空，控制台刷 404（`00000000-…` 开头的 id）
+
+**现象**：Network 里出现
+
+```
+GET /api/relations?fromId=00000000-0000-0000-0000-0000000005a1&fromType=ASSET...  → 404
+GET /api/asset/00000000-0000-0000-0000-00000000d101                              → 404
+```
+
+**原因**：看板模板里的实体引用是占位符，复制给客户时应替换成真实 id。
+旧版本替换函数判断写错，**从未真正执行**，占位符原样留在客户看板里。
+
+**确认**：
+
+```bash
+docker compose exec -T postgres psql -U postgres -d thingsboard -tAc \
+  "SELECT count(*) FROM dashboard WHERE configuration LIKE '%00000000-0000-0000-0000-00000000%';"
+```
+
+大于 0 就是。
+
+**修法**：这是数据里的旧副本，只能重新复制 ——
+重装平台（`docker-98-rebuild.sh`）或在仪表板页把客户看板重新复制一份。
+新版后端已修，重装后该计数应为 0。
 
 
 ## 1. 全新部署卡在第一步：setup 接口返回 423

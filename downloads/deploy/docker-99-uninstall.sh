@@ -6,6 +6,7 @@
 #   bash docker-99-uninstall.sh                    只停容器，保留数据（可随时再起）
 #   bash docker-99-uninstall.sh --purge            删容器 + 卷 + 网络 + 目录（数据全丢）
 #   bash docker-99-uninstall.sh --purge --yes      同上，不再询问
+#   bash docker-99-uninstall.sh --purge --dry-run  只列出会删什么，不真删（推荐先跑）
 #
 # 镜像清理是独立开关，默认【保留】镜像：
 #   bash docker-99-uninstall.sh --purge --yes --images=app      只删自建镜像（推荐）
@@ -23,6 +24,7 @@ cd "$(dirname "$0")"
 COMPOSE="docker compose"
 PURGE="false"
 YES="false"
+DRY="false"
 IMAGES="none"
 
 log()  { printf '\033[36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -34,9 +36,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --purge)      PURGE="true"; shift ;;
     --yes|-y)     YES="true"; shift ;;
+    --dry-run)    DRY="true"; shift ;;
     --images=*)   IMAGES="${1#*=}"; shift ;;
     --purge-images) IMAGES="all"; shift ;;   # 兼容旧参数
-    -h|--help)    sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help)    sed -n '2,24p' "$0"; exit 0 ;;
     *) die "未知参数：$1" ;;
   esac
 done
@@ -79,6 +82,37 @@ case "$IMAGES" in
   app)  echo "   · 镜像：删除自建镜像 energy/ngxai-backend、energy/allinone" ;;
   all)  echo "   · 镜像：删除自建镜像 + postgres:16-alpine、nginx:1.27-alpine、eclipse-temurin:25-jre" ;;
 esac
+
+# 先把"会删什么"算清楚（dry-run 与真删共用，避免两处逻辑漂移）
+VOL_LIST=$(docker volume ls --format '{{.Name}}' | grep -E '^energy(-|$)' || true)
+NET_LIST=$(docker network ls --format '{{.Name}}' | grep -E '^energy_' || true)
+CTR_LIST=$(docker ps -a --filter "name=energy-" --format '{{.Names}}' 2>/dev/null | grep -E '^energy' | sort || true)
+
+# 其它 TB 实例（不归本脚本管）—— dry-run 里也要提示，
+# 否则用户删完才发现机器上还躺着一个 1.6GB 的旧实例。
+LEGACY=$(docker ps -a --format '{{.Names}}' | grep -Ei '^tb-' || true)
+
+if [[ "$DRY" == "true" ]]; then
+  echo
+  log "dry-run：下面这些会被删除（本次不执行）"
+  echo "  数据卷："
+  [[ -n "$VOL_LIST" ]] && echo "$VOL_LIST" | sed 's/^/     /' || echo "     （无）"
+  echo "  容器："
+  [[ -n "$CTR_LIST" ]] && echo "$CTR_LIST" | sed 's/^/     /' || echo "     （无）"
+  echo "  网络："
+  [[ -n "$NET_LIST" ]] && echo "$NET_LIST" | sed 's/^/     /' || echo "     （无）"
+  echo "  目录：${APP_HOME}"
+  echo "  镜像：$IMAGES"
+  if [[ -n "$LEGACY" ]]; then
+    echo
+    warn "另有其它 ThingsBoard 实例，本脚本不会动它们："
+    echo "$LEGACY" | sed 's/^/       /'
+    echo "     需要清理请单独处理（先 docker inspect 看清挂载再删）。"
+  fi
+  echo
+  echo "  确认无误后去掉 --dry-run，加 --yes 执行。"
+  exit 0
+fi
 
 if [[ "$YES" != "true" ]]; then
   echo
@@ -168,4 +202,17 @@ if [[ "$FAIL" == "0" ]]; then
   ok "卸载完成，无残留"
 else
   warn "以上列出的项目需要手工处理，或重启 Docker Desktop 后重试"
+fi
+
+# ---------------------------------------------------------------- 5. 其它 ThingsBoard 实例
+# 本脚本只管 energy-*。机器上可能有别的 TB 实例（镜像名 postgres:16、容器名 tb-postgres 之类），
+# 那些是独立部署，删不删由你决定 —— 脚本不猜，只提示。
+if [[ -n "$LEGACY" ]]; then
+  echo
+  warn "检测到其它 ThingsBoard 实例（不归本脚本管，未做任何处理）："
+  echo "$LEGACY" | sed 's/^/      /'
+  echo "     它们的卷与容器需要单独清理。先看清楚再删："
+  echo "       docker inspect <容器名> --format '{{json .Mounts}}'"
+  echo "     确认无用后："
+  echo "       docker rm -f <容器名> && docker volume rm <卷名>"
 fi

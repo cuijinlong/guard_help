@@ -60,13 +60,30 @@ bash shiyongshouce/downloads/deploy/docker-98-rebuild.sh \
   --yes
 ```
 
-### 彻底卸载
+### 重装后先跑验收（最重要的一步）
 
 ```bash
 cd ~/energy-app
-bash docker-99-uninstall.sh --purge --yes --images=none
-docker builder prune -f        # 再清构建缓存
+bash scripts/08-verify-release.sh \
+  --tenant tenant@126.com --tenant-pass '12345678' \
+  --customer customer@126.com --customer-pass '12345678'
 ```
+
+期望 `通过 38 项`。失败项会直接给出修法，多数可以点「平台自检 → 一键修复初始化」解决。
+
+详见[③ 数据初始化](/admin/init)的「第 0 条」。
+
+### 彻底卸载（删数据卷）
+
+先看会删什么，再删：
+
+```bash
+cd ~/energy-app
+bash docker-99-uninstall.sh --purge --dry-run    # 只列清单
+bash docker-99-uninstall.sh --purge --yes        # 真删（含数据卷）
+```
+
+详见[② 平台部署](/admin/deploy)的「卸载平台」。
 
 ### 卸载后从头再来（一条命令）
 
@@ -85,9 +102,50 @@ bash shiyongshouce/downloads/deploy/docker-98-rebuild.sh \
 跑完会打印一行「验收：全部通过」。然后登录 → **平台自检**，
 确认初始化项全绿（见[③ 数据初始化](/admin/init)「一之三」）。
 
+卸完 Disk 没释放多少？构建缓存不会被 `down -v` 碰到：
+
+```bash
+docker system df
+docker builder prune -f
+docker image prune -f
+```
+
 > 注意两个脚本的参数名不一样，别混：
 > `docker-98-rebuild.sh` 的 `--tenant` / `--customer` 是**登录邮箱**，名称用 `--tenant-title` / `--customer-title`；
 > `scripts/02-onboard.sh` 的 `--tenant` / `--customer` 是**名称**，邮箱用 `--tenant-email` / `--customer-email`。
+
+---
+
+## 手册怎么维护（改代码的人看）
+
+手册里的数字（菜单几项、档案几个、指标几条）是**手写**的，代码在持续改。
+改了代码忘了改手册，下次照手册部署就会「看不到文档承诺的东西」——
+不报错，但验收时对不上，比功能 bug 更难查。
+
+所以有一个自动检查：
+
+```bash
+cd shiyongshouce
+./check-docs.py          # 代码事实 vs 手册数字，不一致退出码 1
+./check-docs.py -v       # 额外打印每项在手册里的原文
+```
+
+它检查 10 项：资产档案、设备档案、告警+派生指标、能源品种、电能一级指标、
+电能二级 key、分时方案、看板模板、租户菜单、客户菜单。
+
+**同一个数字在手册里出现多处**（初始化清单 / 部署完成状态表 / 章节标题），
+脚本要求全部一致 —— 只改一处会被抓出来。
+
+已接入三个环节，不需要你记着跑：
+
+| 环节 | 行为 |
+| --- | --- |
+| `./sync.sh` | 不一致直接中止同步（**强制**） |
+| `docker-00-prepare.sh` | 不一致只警告，继续安装 |
+| `docker-98-rebuild.sh` | 不一致只警告，继续重装 |
+
+为什么后两个不强制：重装是奔着修系统去的，不该被文档问题挡住。
+但警告会明确告诉你「别照手册的数字验收」。
 
 ---
 

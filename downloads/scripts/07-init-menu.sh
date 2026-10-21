@@ -180,14 +180,15 @@ items = [
         ai_link("用能质量", "verified", "/ngxai/biz/quality"),
     ]),
 
-    group("告警中心", "notification_important", [
-        link("告警列表", "list_alt", url="/alarm-center"),
-    ]),
+    # 告警只有「看发生了什么」这一件事，不再套一层分组（规则在场站详情页配）
+    link("告警中心", "notification_important", url="/alarm-center"),
 
     group("设备运维", "devices", [
         link("设备管理", "devices_other", url="/device-management"),
         link("设备分组", "account_tree", url="/device-group"),
         link("设备拓扑", "hub", url="/device-topology"),
+        # 报表空白 / 设备没数据时，这是第一个该点的地方
+        link("平台自检", "checklist", url="/self-check"),
     ]),
 
     # 四张常用看板做成一级入口：每天要点，藏进分组反而多一次点击

@@ -217,7 +217,10 @@ curl -s --noproxy '*' -w '\nHTTP %{http_code}\n' \
 **字段名必须与「能源参数字典」完全一致**，差一个字就存不进对应的参数位，
 报表展开到那一项就是空白。
 
-### 电表（46 个标准参数）
+> 查 key 最快的路径：租户 → **运营配置 → 品种指标**。
+> 选品种 → 看到该品种的设备类型 + 全部标准 key，点一下复制。
+
+### 电表（26 项标准参数）
 
 最常用的十几个：
 
@@ -229,7 +232,9 @@ curl -s --noproxy '*' -w '\nHTTP %{http_code}\n' \
 | `power_total` | 总有功功率 | kW | AVG |
 | `power_a/b/c` | 分相有功功率 | kW | AVG |
 | `voltage_a/b/c` | 分相电压 | V | AVG |
+| `voltage_avg` | 平均相电压（三相汇总） | V | AVG |
 | `current_a/b/c` | 分相电流 | A | AVG |
+| `current_avg` | 平均相电流（三相汇总） | A | AVG |
 | `power_factor_total` | 总功率因数 | — | AVG |
 | `energy_peak` / `energy_flat` / `energy_valley` / `energy_deep` | 分时电量 | kWh | SUM |
 | `frequency` | 频率 | Hz | AVG |
@@ -237,7 +242,7 @@ curl -s --noproxy '*' -w '\nHTTP %{http_code}\n' \
 | `load_rate` | 负载率 | % | AVG |
 | `voltage_unbalance` | 电压不平衡度 | % | AVG |
 
-完整 46 项在「能源参数字典」页面里看，或看[设备接入：上报哪些字段](/admin/device-access)。
+完整 26 项在**运营配置 → 品种指标**页面里看（可点 key 复制）。
 
 ### 水 / 燃气 / 蒸汽（各 3 个）
 
@@ -303,12 +308,20 @@ energy_reading  表上显示的总数    33705.42  33706.77  33707.75   ← 只�
 单相表只有 A 相。写了 `voltage_b: 0` 会让「相电压」报表把 0 当成真实读数，
 最小值永远贴着零。
 
-**只写 A 相和 total：**
+**只写 A 相和汇总项：**
 
 ```json
 {"energy":1.2,"energy_reading":33706.6,"power_a":1.2,"power_total":1.2,
- "voltage_a":220.5,"current_a":5.9,"power_factor_a":0.92,"power_factor_total":0.92}
+ "voltage_a":220.5,"voltage_avg":220.5,
+ "current_a":5.9,"current_avg":5.9,
+ "power_factor_a":0.92,"power_factor_total":0.92}
 ```
+
+> 单相表的 `voltage_avg` / `current_avg` 就等于 A 相的值 —— 写上，
+> 三相汇总口径的报表才能把单相表一起算进去。
+
+**判断哪些键要配**：租户 → 运营配置 → **品种指标** →
+选「单相电能表」，灰显并标「单相不适用」的那些就是不用配的（B 相、C 相全部）。
 
 ---
 
@@ -396,7 +409,7 @@ curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOK" \
 | --- | --- | --- | --- |
 | 采集 | RTU + Access Token + 通道端口 | 客户 → 设备管理 → 选设备 → 最新遥测 | 页面一行数据都没有 |
 | 分析 | 遥测键名匹配字典 | 能耗查询 / 峰谷分析 / 分项能耗 | 有数据但报表空白或全算「平」 |
-| 评估 | 设备档案上的告警规则 | 告警中心 | 数据正常但从不产生告警 |
+| 评估 | 设备档案上的 4 条告警规则 | 告警中心 | 数据正常但从不产生告警 |
 | 预测 | AI 服务（`ngx-ai`） | 能耗优化 → 负载预测 | 页面打不开或提示服务不可用 |
 
 ### 1. 采集：先让一台表出数
@@ -424,7 +437,7 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/v1/DEVICE_TOKEN/telemetr
 
 ### 3. 评估：告警规则是「继承来的」
 
-电表档案上预装了 3 条告警（电压越限 / 功率因数偏低 / 三相不平衡度超限），
+电表档案上预装了 4 条告警（电压越限 / 功率因数偏低 / 三相不平衡度超限 / 闲时能耗超标），
 **新接入的设备只要选了该档案就自动带**，不需要逐台配。
 
 验证：发一条越限数据
@@ -437,6 +450,19 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/v1/DEVICE_TOKEN/telemetr
 
 等 10–30 秒，告警中心应出现「电压越限」「功率因数偏低」。
 再发一条正常值（`220` / `0.95`），告警应自动清除。
+
+**闲时能耗超标**这一条不靠遥测阈值，而是读服务端的日结算结果：
+
+```bash
+# 模拟"今天超标"（真实场景由闲时能耗模块每天自动写）
+curl -s --noproxy '*' -X POST \
+  -H "X-Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d '{"idle_exceed":1}' \
+  "http://127.0.0.1:8090/api/plugins/telemetry/DEVICE/$DEV/timeseries/SERVER_SCOPE"
+```
+
+等 10 秒出现「闲时能耗超标」MINOR；发 `0` 转「已清除」。
+阈值在「组织与场站 → 场站 → 闲时能耗」里配。
 
 > 告警没出现，先看设备档案是不是「单相电能表 / 电能表」——
 > 选成「默认」档案就没有这套规则。租户 → 设备档案 → 计算字段可核对。

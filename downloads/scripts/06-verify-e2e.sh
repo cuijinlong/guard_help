@@ -11,7 +11,7 @@
 #   1 组织管理      租户 / 客户 / 用户 / 客户可写权限
 #   2 设备管理      设备树（一级→二级→三级）、分组、拓扑
 #   3 数据上报      HTTP 通道、MQTT 通道
-#   4 标准指标化    46 个电能参数键与字典对齐
+#   4 标准指标化    电能指标键与字典对齐（26 项一级指标 / 48 个二级 key）
 #   5 计算字段      接口可用 + 字段落库
 #   6 规则链        Root 链存在且可读
 #   7 报警          设备属性/遥测触发的报警可查
@@ -309,12 +309,12 @@ fi
 # ---------------------------------------------------------------- 4. 标准指标化
 C "4. 标准指标化存储（字典对齐）"
 
-# 电表上报的键必须在字典 46 项之内
+# 电表上报的键必须在字典之内
 KEYS=$(TAPI "/api/plugins/telemetry/DEVICE/$RD_ID/values/timeseries?keys=energy,energy_reading,power_total,voltage_a,current_a,power_factor_total" 2>/dev/null)
 NK=$(echo "$KEYS" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null)
 [[ "${NK:-0}" -ge 5 ]] && ok_ "核心电能参数键齐全（${NK} 个）" || bad_ "核心参数键缺失（${NK} 个）"
 
-# 字典：电能 46 项参数
+# 字典：电能 26 项一级指标，二级 key 合计 48 个（13 个单值项 + 6 组多相指标）
 NP=$(TAPI '/api/energy/metric-params' | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
@@ -326,7 +326,9 @@ for k in d.get('kinds',[]):
         print(n); break
 else:
     print(0)" 2>/dev/null)
-[[ "${NP:-0}" -ge 40 ]] && ok_ "电能参数字典 ${NP} 项" || bad_ "电能参数字典项数不足（${NP:-0}）"
+# 26 项一级指标展开成 48 个二级 key。低于 46 说明字典是旧版本
+# （相电压/相电流缺 _avg 汇总项），跑「平台自检 → 一键修复初始化」补。
+[[ "${NP:-0}" -ge 46 ]] && ok_ "电能指标字典 ${NP} 个子项 key" || bad_ "电能指标字典子项不足（${NP:-0}），跑一键修复初始化"
 
 # 分时方案
 NTOU=$(TAPI '/api/tenant/assets?pageSize=200&page=0' | python3 -c "
@@ -341,8 +343,10 @@ CODE=$(ncurl -o /tmp/e2e_cf.json -w '%{http_code}' -H "X-Authorization: Bearer $
 [[ "$CODE" == "200" ]] && ok_ "计算字段接口可用" || bad_ "计算字段接口异常（HTTP ${CODE}）"
 
 NCF=$(jget "d.get('totalElements',0)" < /tmp/e2e_cf.json)
-# 0 个是合法的初始状态（客户自己建），但接口必须能读
-[[ -n "$NCF" ]] && ok_ "计算字段可枚举（当前 ${NCF} 个）" || bad_ "计算字段响应结构异常"
+# 设备档案上应预装 11 条（单相 5 + 三相 6：电压/功率因数/闲时超标 + 负荷率/碳排放）
+# 客户自己建的字段也计入，所以只判下限；0 说明初始化没跑完。
+[[ "${NCF:-0}" -ge 10 ]] && ok_ "告警与派生指标 ${NCF} 条" \
+  || bad_ "计算字段只有 ${NCF:-0} 条（期望 ≥10），跑「平台自检 → 一键修复初始化」"
 
 # ---------------------------------------------------------------- 6. 规则链
 C "6. 规则链"

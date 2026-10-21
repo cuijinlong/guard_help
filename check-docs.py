@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""
+手册一致性检查：代码/资源里的事实 vs 手册里写的数字。
+
+## 为什么需要它
+
+手册里的数字（菜单几项、档案几个、指标几条）是**手写**的，
+而代码在持续改。改了代码忘了改手册，下次照手册部署就会：
+  - 看不到手册承诺的菜单项，以为是部署失败
+  - 按手册的指标数量对不上，以为数据没初始化全
+  - 在已删除的页面路径上找功能
+
+这类问题不报错、不影响运行，但会让运维照着文档做却得不到预期结果 ——
+比功能 bug 更难排查，因为「文档说该有」。
+
+## 检查什么
+
+只检查**能从代码精确算出来**的项。算不出来的（比如某句话描述得对不对）
+不在这里管，靠人工评审。
+
+## 用法
+
+    ./check-docs.py            # 检查，有问题退出码 1
+    ./check-docs.py -v         # 额外打印每项的来源
+
+建议在提交前跑，或者接进 CI。
+
+## 怎么加新检查
+
+在 CHECKS 列表里加一项：
+    Check('键', '手册里的人类可读名', lambda repo: 实际值, '手册文件', r'正则')
+正则的第 1 个捕获组必须是数字。
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent          # shiyongshouce/
+REPO = ROOT.parent                              # 仓库根
+GS = REPO / 'guard-server' / 'src' / 'main'
+JAVA_INSTALL = GS / 'java' / 'com' / 'guard' / 'server' / 'service' / 'install'
+RES_ENERGY = GS / 'resources' / 'data' / 'json' / 'system' / 'energy'
+DASHBOARDS = GS / 'data' / 'json' / 'tenant' / 'dashboards'
+DOCS = ROOT / 'content' / 'admin'
+
+
+# ----------------------------------------------------------------------
+# 各项事实的提取函数
+# ----------------------------------------------------------------------
+
+def _read(p: Path) -> str:
+    return p.read_text(encoding='utf-8')
+
+
+def count_asset_profiles(_repo) -> int:
+    """资产档案数：AssetProfileInstaller.ASSET_PROFILES 里 put(...) 的条数"""
+    src = _read(JAVA_INSTALL / 'AssetProfileInstaller.java')
+    # 只数 static 块里的 put("名字", "说明")
+    m = re.search(r'ASSET_PROFILES\s*=\s*new LinkedHashMap<>\(\)\s*\{\{(.*?)\n    \}\}', src, re.S)
+    if not m:
+        raise RuntimeError('AssetProfileInstaller: 找不到 ASSET_PROFILES 定义')
+    return len(re.findall(r'^\s*put\("', m.group(1), re.M))
+
+
+def count_device_profiles(_repo) -> int:
+    doc = json.loads(_read(RES_ENERGY / 'meter_types.json'))
+    return len(doc.get('profiles', []))
+
+
+def count_rules(_repo) -> int:
+    """
+    告警 + 派生指标总数。
+
+    单相 = 除「不平衡度」外的全部；三相 = 全部。
+    判定方式：installForProfile 里 `if (!singlePhase) { created += ensureXxx }`
+    包住的那些，只对三相生效。
+    """
+    src = _read(JAVA_INSTALL / 'DeviceRuleInstaller.java')
+    body = re.search(r'private int installForProfile\(.*?\n    \}', src, re.S)
+    if not body:
+        raise RuntimeError('DeviceRuleInstaller: 找不到 installForProfile')
+    text = body.group(0)
+    all_calls = len(re.findall(r'created \+= ensure\w+\(', text))
+    # if (!singlePhase) { ... } 里的调用只对三相生效
+    tri_only = 0
+    for guard in re.findall(r'if\s*\(!singlePhase\)\s*\{(.*?)\}', text, re.S):
+        tri_only += len(re.findall(r'created \+= ensure\w+\(', guard))
+    single = all_calls - tri_only
+    return single + all_calls      # 单相 + 三相
+
+
+def count_energy_kinds(_repo) -> int:
+    doc = json.loads(_read(RES_ENERGY / 'energy_library.json'))
+    return len(doc.get('kinds', []))
+
+
+def _elec_params():
+    doc = json.loads(_read(RES_ENERGY / 'energy_library.json'))
+    for k in doc.get('kinds', []):
+        if k.get('code') == 'elec':
+            return k.get('params', [])
+    raise RuntimeError('energy_library.json: 找不到 elec 品种')
+
+
+def count_elec_params(_repo) -> int:
+    """电能一级指标数"""
+    return len(_elec_params())
+
+
+def count_elec_keys(_repo) -> int:
+    """电能二级 key 总数"""
+    return sum(len(p.get('children', [])) for p in _elec_params())
+
+
+def count_tou_schemes(_repo) -> int:
+    """分时方案数：createTouScheme(tenantId, ...) 的调用次数"""
+    src = _read(JAVA_INSTALL / 'EnergyLibraryInstaller.java')
+    body = re.search(r'private void createTouSchemes\(.*?\n    \}', src, re.S)
+    if not body:
+        raise RuntimeError('EnergyLibraryInstaller: 找不到 createTouSchemes')
+    return len(re.findall(r'createTouScheme\(tenantId,', body.group(0)))
+
+
+def count_dashboards(_repo) -> int:
+    return len(list(DASHBOARDS.glob('*.json')))
+
+
+def count_tenant_menu(_repo) -> int:
+    """
+    租户菜单顶层项数 = items.add(...) 的次数。
+    DEFAULT 引用是循环里批量加的，按数组元素个数算。
+    """
+    src = _read(JAVA_INSTALL / 'EnergyMenuInstaller.java')
+    body = re.search(r'private List<MenuItem> tenantItems\(.*?\n    \}', src, re.S)
+    if not body:
+        raise RuntimeError('EnergyMenuInstaller: 找不到 tenantItems')
+    text = body.group(0)
+    # for (String id : new String[]{ ... }) 里的元素
+    m = re.search(r'new String\[\]\s*\{(.*?)\}', text, re.S)
+    loop = len(re.findall(r'"\w+"', m.group(1))) if m else 0
+    # 直接 add 的项：先把整个 for 循环剔除，否则循环体里的 items.add 会被重复计数
+    outside = re.sub(r'for\s*\(String id\s*:\s*new String\[\]\s*\{.*?\}\)\s*\{.*?\}',
+                     '', text, flags=re.S)
+    direct = len(re.findall(r'^\s*items\.add\(', outside, re.M))
+    return direct + loop
+
+
+def count_customer_menu(_repo) -> int:
+    src = _read(JAVA_INSTALL / 'EnergyMenuInstaller.java')
+    body = re.search(r'private List<MenuItem> customerItems\(.*?\n    \}', src, re.S)
+    if not body:
+        raise RuntimeError('EnergyMenuInstaller: 找不到 customerItems')
+    return len(re.findall(r'^\s*items\.add\(', body.group(0), re.M))
+
+
+# ----------------------------------------------------------------------
+# 检查项：代码事实 ↔ 手册声明
+# ----------------------------------------------------------------------
+
+class Check:
+    """
+    一项事实。
+
+    `targets` 是 [(手册文件, 正则), ...] —— 手册里同一个数字常常出现在多处
+    （初始化清单、部署完成状态表、章节标题）。只检查其中一处，改了别处照样不一致，
+    所以这里要求**所有位置都必须匹配且数值相同**。
+    """
+
+    def __init__(self, key, label, fn, targets):
+        self.key = key
+        self.label = label
+        self.fn = fn
+        self.targets = targets    # [(file, regex), ...]，正则第 1 组是数字
+
+
+CHECKS = [
+    Check('asset_profiles', '资产档案', count_asset_profiles, [
+        ('03-init.md', r'\| 资产档案 \| 建租户时自动 \| (\d+) 个'),
+        ('03-init.md', r'- 资产档案（(\d+) 个）'),
+        ('02-deploy.md', r'\| 资产档案 \| (\d+) 个 \|'),
+        ('02-deploy.md', r'资产档案 (\d+) 个 / 设备档案'),
+    ]),
+    Check('device_profiles', '设备档案', count_device_profiles, [
+        ('03-init.md', r'\| 设备档案 \| 建租户时自动 \| (\d+) 个'),
+        ('03-init.md', r'## 四、设备档案（(\d+) 个）'),
+        ('02-deploy.md', r'\| 设备档案 \| (\d+) 个 \|'),
+        ('02-deploy.md', r'/ 设备档案 (\d+) 个'),
+    ]),
+    Check('rules', '告警 + 派生指标', count_rules, [
+        ('03-init.md', r'\| 告警规则 \+ 派生指标 \| 建租户时自动 \| (\d+) 条'),
+        ('03-init.md', r'- 设备档案上的告警规则 \+ 派生指标（(\d+) 条）'),
+        ('02-deploy.md', r'\| 告警 / 派生指标 \| (\d+) 条 \|'),
+    ]),
+    Check('kinds', '能源品种', count_energy_kinds, [
+        ('03-init.md', r'\| 能源参数字典 \| 建租户时自动 \| (\d+) 品种'),
+    ]),
+    Check('elec_params', '电能一级指标', count_elec_params, [
+        ('03-init.md', r'\| 电能 \| `elec` \| kWh \| (\d+) 项一级指标'),
+    ]),
+    Check('elec_keys', '电能二级 key', count_elec_keys, [
+        ('03-init.md', r'\d+ 项一级指标（(\d+) 个二级 key）'),
+    ]),
+    Check('tou', '分时时段方案', count_tou_schemes, [
+        ('03-init.md', r'\| 分时时段方案 \| 建租户时自动 \| (\d+) 套'),
+        ('03-init.md', r'## 五、分时时段方案（(\d+) 套）'),
+    ]),
+    Check('dashboards', '看板模板', count_dashboards, [
+        ('02-deploy.md', r'wc -l\s+# 必须是 (\d+)'),
+    ]),
+    Check('tenant_menu', '租户菜单', count_tenant_menu, [
+        ('03-init.md', r'\| 租户菜单 \| 建租户时自动 \| (\d+) 个顶层项'),
+        ('02-deploy.md', r'\| 租户菜单 \| (\d+) 个顶层项 \|'),
+    ]),
+    Check('customer_menu', '客户菜单', count_customer_menu, [
+        ('03-init.md', r'\| 客户菜单 \| 建客户时自动 \| (\d+) 个顶层项'),
+        ('02-deploy.md', r'\| 客户菜单 \| (\d+) 个顶层项 \|'),
+    ]),
+]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description='手册与代码一致性检查')
+    ap.add_argument('-v', '--verbose', action='store_true', help='打印每项的来源与匹配文本')
+    args = ap.parse_args()
+
+    rows = []
+    failed = 0
+
+    for c in CHECKS:
+        try:
+            actual = c.fn(REPO)
+        except Exception as e:                      # 提取失败也算失败，但要能看出原因
+            rows.append((c.label, '提取失败', str(e)[:28], 'ERR'))
+            failed += 1
+            continue
+
+        declared_values = []
+        problem = None
+
+        for fname, pattern in c.targets:
+            doc_path = DOCS / fname
+            if not doc_path.exists():
+                problem = f'{fname} 不存在'
+                break
+            m = re.search(pattern, _read(doc_path))
+            if not m:
+                problem = f'{fname} 找不到该表述'
+                break
+            declared_values.append(int(m.group(1)))
+            if args.verbose:
+                print(f'    {c.label}: 代码={actual} 手册={m.group(1)}  ← {m.group(0)[:64]}')
+
+        if problem:
+            rows.append((c.label, actual, problem, 'MISS'))
+            failed += 1
+            continue
+
+        # 手册内部自相矛盾（同一数字多处不一致）也算失败
+        if len(set(declared_values)) > 1:
+            rows.append((c.label, actual, '/'.join(map(str, declared_values)), 'DIFF'))
+            failed += 1
+            continue
+
+        declared = declared_values[0]
+        ok = declared == actual
+        if not ok:
+            failed += 1
+        rows.append((c.label, actual, declared, 'OK' if ok else 'DIFF'))
+
+    # 输出对齐表（中文按 2 列宽处理）
+    def width(s):
+        return sum(2 if ord(ch) > 0x2E80 else 1 for ch in str(s))
+
+    def pad(s, n):
+        return str(s) + ' ' * max(0, n - width(s))
+
+    head = ('检查项', '代码', '手册', '状态')
+    w = [max(width(r[i]) for r in rows + [head]) for i in range(4)]
+
+    print()
+    print('手册一致性检查')
+    print('-' * (sum(w) + 8))
+    print('  '.join(pad(h, w[i]) for i, h in enumerate(head)))
+    print('-' * (sum(w) + 8))
+    for r in rows:
+        print('  '.join(pad(v, w[i]) for i, v in enumerate(r)))
+    print('-' * (sum(w) + 8))
+
+    if failed:
+        print(f'\n✗ {failed} 项不一致 —— 改代码后要同步手册：')
+        for r in rows:
+            if r[3] != 'OK':
+                print(f'  · {r[0]}：代码 {r[1]}，手册 {r[2]}')
+        print('\n  改完跑 ./sync.sh 推送到 guard_help。')
+        return 1
+
+    print(f'\n✓ 全部一致（{len(CHECKS)} 项）')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

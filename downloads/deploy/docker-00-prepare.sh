@@ -67,6 +67,17 @@ ok "jar：$(du -h "$JAR" | cut -f1)"
 ok "json：$(du -sh "$DATA_SRC/json" | cut -f1)"
 ok "sql：${SQL_N} 个文件"
 
+# 手册与代码一致性：这次组装会把模板/字典拷进部署目录，
+# 手册若还写着旧数字，装完验收时会拿错标准。不一致只提醒，不中断。
+if [[ -x "$ROOT/shiyongshouce/check-docs.py" ]]; then
+  if DOC_OUT="$("$ROOT/shiyongshouce/check-docs.py" 2>&1)"; then
+    ok "$(echo "$DOC_OUT" | grep '全部一致' | sed 's/^✓ //')"
+  else
+    warn "手册与代码不一致（不影响安装，但别照手册的数字验收）："
+    echo "$DOC_OUT" | sed -n '/✗/,$p' | sed 's/^/     /'
+  fi
+fi
+
 # ---------------- 2. 组装目录 ----------------
 STAGE="$TARGET"
 if [[ "$PACK" == "true" ]]; then

@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+#
+# 能源管理平台 · 发布内容验收（把"这一版应该是什么样"变成断言）
+#
+# 与另几个脚本的分工：
+#   03-verify.sh          接口可用 + 权限正确            —— 结构
+#   04-verify-data.sh     库里数据彼此自洽               —— 数据
+#   06-verify-e2e.sh      客户建数据 → 报表出数          —— 业务闭环
+#   08-verify-release.sh  这一版改的每一项是否真的落地    —— 发布内容  ← 本脚本
+#
+# 为什么需要它：
+#   重装后"看起来能登录"不等于"这一版的功能都在"。菜单少几项、看板标题没改、
+#   字典缺键这类问题都不报错，但会让你在验收时反复怀疑是自己配错了。
+#   这个脚本把每一版的改动点变成可执行断言：跑一遍，哪项没到位直接告诉你
+#   缺什么、怎么修，不用一条条沟通。
+#
+# 用法（在部署目录内，与 scripts/ 同级）：
+#   bash scripts/08-verify-release.sh \
+#     --tenant tenant@example.com --tenant-pass '...' \
+#     --customer customer@example.com --customer-pass '...'
+#
+# 可选：
+#   --base URL        默认 http://127.0.0.1:8090
+#   --skip-ui         跳过前端产物检查（镜像里没带 UI 时用）
+#   --quiet           只输出失败项
+#
+# 退出码：0 = 全部通过，1 = 有失败项
+#
+set -uo pipefail
+
+cd "$(dirname "$0")/.."
+
+BASE="http://127.0.0.1:8090"
+TENANT="" ; TENANT_PASS=""
+CUST=""   ; CUST_PASS=""
+SKIP_UI="false"
+QUIET="false"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)          BASE="$2"; shift 2 ;;
+    --tenant)        TENANT="$2"; shift 2 ;;
+    --tenant-pass)   TENANT_PASS="$2"; shift 2 ;;
+    --customer)      CUST="$2"; shift 2 ;;
+    --customer-pass) CUST_PASS="$2"; shift 2 ;;
+    --skip-ui)       SKIP_UI="true"; shift ;;
+    --quiet|-q)      QUIET="true"; shift ;;
+    -h|--help)       sed -n '2,30p' "$0"; exit 0 ;;
+    *) echo "未知参数：$1" >&2; exit 2 ;;
+  esac
+done
+
+[[ -n "$TENANT" && -n "$TENANT_PASS" ]] || { echo "必须提供 --tenant 与 --tenant-pass" >&2; exit 2; }
+
+PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
+
+ok()   { PASS=$((PASS+1)); [[ "$QUIET" == "true" ]] || printf '\033[32m  ✓\033[0m %s\n' "$*"; }
+bad()  { FAIL=$((FAIL+1)); FAILED_ITEMS+=("$1"); printf '\033[31m  ✗\033[0m %s\n' "$*"; printf '      → 修法：%s\n' "$2"; }
+sec()  { [[ "$QUIET" == "true" ]] || { printf '\n\033[36m%s\033[0m\n' "$*"; }; }
+
+# 断言：相等
+eq() {  # eq <说明> <实际> <期望> <修法>
+  if [[ "$2" == "$3" ]]; then ok "$1（$2）"; else bad "$1：实际 $2，期望 $3" "$4"; fi
+}
+# 断言：大于等于
+ge() {  # ge <说明> <实际> <下限> <修法>
+  if [[ "${2:-0}" -ge "$3" ]] 2>/dev/null; then ok "$1（${2}）"; else bad "$1：实际 ${2:-0}，至少 $3" "$4"; fi
+}
+# 断言：包含
+has() {  # has <说明> <文本> <关键字> <修法>
+  if [[ "$2" == *"$3"* ]]; then ok "$1"; else bad "$1：缺少「$3」" "$4"; fi
+}
+# 断言：不包含
+hasnt() {  # hasnt <说明> <文本> <关键字> <修法>
+  if [[ "$2" != *"$3"* ]]; then ok "$1"; else bad "$1：不该有「$3」" "$4"; fi
+}
+
+# jget '<语句>'：变量 d 已就绪，语句里自己 print。
+# 支持多行 —— 之前用 print($1) 包一层，多行/赋值语句会语法错，导致断言全判 0。
+jget() {
+  python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+$1" 2>/dev/null
+}
+
+# 直接查库：有几类事实走 API 拿不到（如 ALARM 类型的计算字段），
+# 或走 API 会被当前账号权限过滤。自检接口内部也是查库，这里与它同源。
+DASH_DB() {
+  docker compose exec -T postgres psql -U postgres -d thingsboard -tA -F'|' -c "$1" 2>/dev/null
+}
+
+echo "============================================================"
+echo " 发布内容验收 · ${BASE}"
+echo " 时间 $(date '+%Y-%m-%d %H:%M:%S')"
+echo "============================================================"
+
+# ---------------------------------------------------------------- 登录
+TOK=$(curl -s --noproxy '*' -m 15 -X POST "$BASE/api/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$TENANT\",\"password\":\"$TENANT_PASS\"}" | jget "print(d.get('token',''))")
+[[ -n "$TOK" ]] || { echo "租户账号登录失败：$TENANT" >&2; exit 1; }
+
+CTOK=""
+if [[ -n "$CUST" && -n "$CUST_PASS" ]]; then
+  CTOK=$(curl -s --noproxy '*' -m 15 -X POST "$BASE/api/auth/login" \
+    -H 'Content-Type: application/json' \
+    -d "{\"username\":\"$CUST\",\"password\":\"$CUST_PASS\"}" | jget "print(d.get('token',''))")
+  [[ -n "$CTOK" ]] || echo "  ! 客户账号登录失败，将跳过客户侧检查：$CUST"
+fi
+
+TAPI() { curl -s --noproxy '*' -m 40 -H "X-Authorization: Bearer $TOK" "$BASE$1"; }
+CAPI() { curl -s --noproxy '*' -m 40 -H "X-Authorization: Bearer $CTOK" "$BASE$1"; }
+
+# ================================================================
+sec "A. 初始化完整性（9 项自检）"
+SC=$(TAPI '/api/energy/self-check')
+SUMMARY=$(echo "$SC" | jget "print(json.dumps(d.get('summary',{})))" 2>/dev/null)
+if [[ -n "$SUMMARY" ]]; then
+  eq "自检 missing 项"  "$(echo "$SC" | jget "print(d['summary']['missing'])")"  "0" \
+     '点「平台自检 → 一键修复初始化」补装；仍失败看 /api/energy/self-check 的具体项'
+  eq "自检 partial 项"  "$(echo "$SC" | jget "print(d['summary']['partial'])")"  "0" \
+     '同上；partial 通常是个别档案/规则没建全'
+else
+  bad "平台自检接口不可用" "确认后端已升级到含 EnergySelfCheckController 的版本"
+fi
+
+# ================================================================
+sec "B. 参数字典（两级指标）"
+MP=$(TAPI '/api/energy/metric-params')
+ELEC=$(echo "$MP" | jget "
+k = [x for x in d.get('kinds', []) if x.get('code') == 'elec']
+print(json.dumps(k[0]) if k else '{}')")
+L1=$(echo "$ELEC" | jget "print(len(d.get('params',[])))" 2>/dev/null)
+L2=$(echo "$ELEC" | jget "print(sum(len(p.get('children',[])) for p in d.get('params',[])))" 2>/dev/null)
+eq "电能一级指标" "${L1:-0}" "26" \
+   '跑「平台自检 → 一键修复初始化」（会调 upgradeDictionaryParams 补新指标）；仍不对说明资源文件没更新'
+eq "电能二级 key" "${L2:-0}" "48" \
+   '同上。低于 48 通常是缺 voltage_avg / current_avg 两个汇总项'
+has "相电压含平均项"  "$ELEC" '"voltage_avg"' '字典升级没跑到：确认后端版本，或重建租户'
+has "相电流含平均项"  "$ELEC" '"current_avg"' '同上'
+eq "能源品种数" "$(echo "$MP" | jget "print(len(d.get('kinds',[])))")" "4" \
+   '字典缺品种：重建租户或一键修复'
+
+# ================================================================
+sec "C. 计算字段（告警 + 派生指标）"
+# 走 SQL 而不是 /api/calculatedFields：那个接口只返回 SIMPLE，
+# ALARM 类型的 7 条不出现 —— 拿它计数会误判成「只装了 4 条」。
+# 自检的 SQL 与这里同源（都数 calculated_field 表）。
+CFROWS=$(DASH_DB "SELECT dp.name || ' / ' || cf.type || ' / ' || cf.name
+                    FROM calculated_field cf
+                    JOIN device_profile dp ON dp.id = cf.entity_id
+                   ORDER BY dp.name, cf.type;" | tr -d '\r')
+NCF=$(printf '%s\n' "$CFROWS" | grep -c . 2>/dev/null || echo 0)
+ge "计算字段条数" "${NCF:-0}" "11" \
+   '设备档案上的 11 条规则没装全：跑一键修复初始化；日志搜 "[energy]" 看有哪条 warn'
+has "含「闲时能耗超标」规则" "$CFROWS" '闲时能耗超标' \
+   '该规则读 idle_exceed，阈值在场站「空闲时段」配；缺失说明 DeviceRuleInstaller 没跑'
+has "含「电压越限」规则"     "$CFROWS" '电压越限' '同上'
+has "含「不平衡度」规则"     "$CFROWS" '电压不平衡度超限' '同上（仅三相表有）'
+has "含「负荷率」派生指标"   "$CFROWS" '负荷率'   '同上'
+has "含「碳排放」派生指标"   "$CFROWS" '碳排放'   '同上'
+
+# ================================================================
+sec "D. 看板模板"
+TPL_N=$(DASH_DB "SELECT count(*) FROM dashboard WHERE customer_id IS NULL;" | tr -d ' ')
+eq "看板模板数" "${TPL_N:-0}" "20" \
+   '模板没导全：重跑 docker-01-install.sh，或确认 deploy 目录 data/json/tenant/dashboards 是 20 个文件'
+
+TITLES=$(DASH_DB "SELECT title FROM dashboard WHERE customer_id IS NULL;" | tr -d '\r')
+has  "「峰谷时段」已改名" "$TITLES" '峰谷时段' \
+     '看板还叫「基础配置中心」：跑一键修复初始化（会调 repairConfigCenterDashboard 改名）'
+hasnt "无旧名「基础配置中心」" "$TITLES" '基础配置中心' \
+     '同上'
+
+# 客户副本不应残留占位符
+PH=$(DASH_DB "SELECT count(*) FROM dashboard WHERE customer_id <> '13814000-1dd2-11b2-8080-808080808080' AND configuration LIKE '%00000000-0000-0000-0000-00000000%';" | tr -d ' ')
+eq "客户看板残留占位符" "${PH:-0}" "0" \
+   '跑一键修复初始化（repairCustomerDashboards 就地重写）；或重建客户'
+
+# 峰谷时段 6 个部件不能重叠
+OVERLAP=$(DASH_DB "SELECT configuration FROM dashboard WHERE customer_id IS NULL AND title='峰谷时段' LIMIT 1;" | python3 -c "
+import json,sys
+raw=sys.stdin.read().strip()
+if not raw: print('no-board'); raise SystemExit
+d=json.loads(raw)
+if isinstance(d,str): d=json.loads(d)
+ws=(d.get('configuration') or d).get('widgets') or {}
+rows=[w.get('row') for w in ws.values()]
+print('overlap' if len(rows)!=len(set(rows)) else 'ok')" 2>/dev/null)
+if [[ "$OVERLAP" == "ok" ]]; then
+  ok "峰谷时段部件不重叠"
+elif [[ "$OVERLAP" == "no-board" ]]; then
+  ok "峰谷时段模板不存在（跳过重叠检查）"
+else
+  bad "峰谷时段 6 个部件仍叠在相同 row" \
+      '跑一键修复初始化（repairConfigCenterDashboard 按 sizeY 重排）'
+fi
+
+# ================================================================
+sec "E. 租户菜单"
+TM=$(TAPI '/api/customMenu')
+TM_N=$(echo "$TM" | jget "print(len(d.get('items') or []))" 2>/dev/null)
+eq "租户顶层项" "${TM_N:-0}" "11" \
+   '菜单是旧结构：跑一键修复初始化（会重装租户菜单）'
+TM_STR=$(echo "$TM" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(' '.join((i.get('name') or i.get('id') or '')+'|'+str(i.get('type') or '') for i in (d.get('items') or [])))" 2>/dev/null)
+has  "「AI 分析」在菜单里" "$TM_STR" 'AI 分析' \
+     '模型训练平台没改名/没装：跑一键修复初始化'
+hasnt "无 IoT Hub"            "$TM_STR" 'iot_hub'             '菜单是旧版：一键修复初始化'
+hasnt "无 AI Solution Creator" "$TM_STR" 'ai_solution_creator' '同上'
+hasnt "无集成中心"             "$TM_STR" 'integrations_center' '同上'
+hasnt "无 Edge 管理"           "$TM_STR" 'edge_management'      '同上'
+hasnt "无 Trendz 分析"         "$TM_STR" 'trendz_analytics'     '同上'
+
+# 一级菜单中文化：查语言包键
+LOC=$(curl -s --noproxy '*' -m 20 "$BASE/assets/locale/locale.constant-zh_CN.json")
+has "「运营配置」中文名已补" "$LOC" '运营配置' 'locale 里缺 admin.platform：前端产物没更新，重打镜像'
+has "「监控」中文名已补"     "$LOC" '监控'     '缺 monitor.monitor：同上'
+has "「品种指标」菜单名已补" "$LOC" '品种指标' '缺 energy.menu.energy-dict：同上'
+
+# ================================================================
+sec "F. 客户菜单"
+if [[ -n "$CTOK" ]]; then
+  CM=$(CAPI '/api/customMenu')
+  CM_N=$(echo "$CM" | jget "print(len(d.get('items') or []))" 2>/dev/null)
+  eq "客户顶层项" "${CM_N:-0}" "13" \
+     '客户菜单是旧结构：跑一键修复初始化（会重装全部客户菜单）'
+  CM_DETAIL=$(echo "$CM" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for i in (d.get('items') or []):
+    nm=i.get('name') or i.get('id')
+    pages=[p.get('name') or p.get('id') for p in (i.get('pages') or [])]
+    print(nm+':'+'/'.join(pages))" 2>/dev/null)
+  has "告警中心为一级链接（无子项）" "$CM_DETAIL" '告警中心:' \
+      '告警中心还挂着「告警列表/告警规则」子项：一键修复初始化'
+  has "设备运维含平台自检" "$CM_DETAIL" '平台自检' \
+      '客户菜单缺自检入口：一键修复初始化'
+  # 菜单 label 是「用能账单」，它指向的看板标题才是「我的账单」
+  has "能耗分析含用能账单" "$CM_DETAIL" '用能账单' \
+      '「用能账单」没在能耗分析下：一键修复初始化'
+else
+  ok "跳过客户侧检查（未提供客户账号或登录失败）"
+fi
+
+# ================================================================
+if [[ "$SKIP_UI" != "true" ]]; then
+  sec "G. 前端产物"
+  INDEX=$(curl -s --noproxy '*' -m 20 "$BASE/")
+  MAIN=$(echo "$INDEX" | grep -o 'main-[A-Z0-9]*\.js' | head -1)
+  if [[ -n "$MAIN" ]]; then
+    ok "首页引用 ${MAIN}"
+  else
+    bad "首页找不到 main-*.js" "后端没带 UI 产物，或 gateway 路由不对"
+  fi
+
+  # 页面可达性：SPA 对未知路径也返回 index.html，所以 200 只能证明「服务在」，
+  # 证明不了「路由已注册」。真正的证据是构建产物里的组件特征串 ——
+  # Angular 把组件类名、样式类名都留在 lazy chunk 里，搜得到就是打进包了。
+  # chunk 文件名带 hash、每次构建都变，所以先抓 home-pages 那个懒加载块。
+  # chunk 不在 index.html 里（懒加载），但 main.js 的模块映射表列了全部 chunk 名。
+  # 早先只抓 index.html + 前 5 个 chunk，漏掉 home-pages 那块，才误报「产物是旧的」。
+  MAINJS=$(curl -s --noproxy '*' -m 30 "$BASE/$MAIN" 2>/dev/null)
+  CHUNKS=$(printf '%s' "$MAINJS" | grep -oE 'chunk-[A-Z0-9]+\.js' | sort -u)
+  POOL="$MAINJS"
+  HIT_ALL="true"
+  for c in $CHUNKS; do
+    BODY=$(curl -s --noproxy '*' -m 30 "$BASE/$c" 2>/dev/null)
+    POOL+="$BODY"
+  done
+  for pair in \
+    "tb-ic-default-hours|空闲时段：默认工作时段已并入排班页" \
+    "tb-rate-layers|费率方案：三层来源说明条" \
+    "tb-cfg-hint-warn|场站配置：暂不参与计算的橙色提示" \
+    "tb-energy-dict|品种指标页" \
+    "tb-self-check|平台自检页" ; do
+    key="${pair%%|*}"; desc="${pair##*|}"
+    has "$desc" "$POOL" "$key" \
+        '前端产物是旧的：重跑 npm run build:prod，替换 ui-ngx jar 后重建后端镜像'
+  done
+
+  # 后端已删除的类不应还出现在包里
+  if curl -s --noproxy '*' -m 15 -o /dev/null -w '%{http_code}' \
+       "$BASE/api/energy/alarm-rules" | grep -q '^\(404\|500\)$'; then
+    ok "场站告警规则接口已下线"
+  fi
+fi
+
+# ================================================================
+echo
+echo "============================================================"
+printf '  通过 %d 项' "$PASS"
+[[ "$FAIL" -gt 0 ]] && printf '，失败 %d 项' "$FAIL"
+echo
+if [[ "$FAIL" -gt 0 ]]; then
+  echo
+  echo "  失败明细："
+  for it in "${FAILED_ITEMS[@]}"; do echo "    · $it"; done
+  echo
+  echo "  多数问题可用「平台自检 → 一键修复初始化」解决（幂等，不动业务数据）。"
+  echo "  入口：登录后左侧「运营配置 → 平台自检」。"
+  echo "============================================================"
+  exit 1
+fi
+echo "  这一版的功能点全部到位。"
+echo "============================================================"
+exit 0
