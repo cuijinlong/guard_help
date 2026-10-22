@@ -141,12 +141,19 @@ cp "$HERE/docker-99-uninstall.sh"    "$STAGE/"
 # 通配符保证以后新增脚本自动进部署目录，不会再漏。
 # 只拷 02 起的运维脚本：01-install.sh 是「不起 Docker、直连数据库」的裸机路径，
 # 放进 Docker 部署目录只会让人误以为要跑它。
-# 用 0[2-9]-* 而不是逐个写文件名 —— 以后加 09、10 会自动带上。
-cp "$HERE/../scripts/"0[2-9]-* "$STAGE/scripts/" 2>/dev/null || die "scripts/ 下没有 02-* 起的脚本"
+# 用 0[2-9]-* 加 [1-9][0-9]-* 而不是逐个写文件名，新增脚本自动带上。
+# ★ 只写 0[2-9]-* 会漏掉 10 及以后 —— 10-cleanup-customer.sh 就踩过：
+#   手册让它跑，但打包根本没拷进部署目录。
+#
+# ★ 这条规则在 docker-97-preflight.sh 第 3 节有一份镜像（它按同样的通配符比对
+#   部署目录）。改这里必须同步改那边，否则自检会误报「缺脚本」——
+#   本脚本第一版就踩过：preflight 用 `*` 全比，重装后报「缺 01-install.sh」。
+cp "$HERE/../scripts/"0[2-9]-* "$HERE/../scripts/"[1-9][0-9]-* "$STAGE/scripts/" 2>/dev/null \
+  || die "scripts/ 下没有 02-* 起的脚本"
 
 # 自检：脚本数与仓库一致，防止某次改动只加了文件没被拷进来
-REPO_SCRIPTS=$(ls "$HERE/../scripts/"0[2-9]-* 2>/dev/null | wc -l | tr -d ' ')
-STAGE_SCRIPTS=$(ls "$STAGE/scripts/"0[2-9]-* 2>/dev/null | wc -l | tr -d ' ')
+REPO_SCRIPTS=$(ls "$HERE/../scripts/"0[2-9]-* "$HERE/../scripts/"[1-9][0-9]-* 2>/dev/null | wc -l | tr -d ' ')
+STAGE_SCRIPTS=$(ls "$STAGE/scripts/"0[2-9]-* "$STAGE/scripts/"[1-9][0-9]-* 2>/dev/null | wc -l | tr -d ' ')
 [[ "$REPO_SCRIPTS" -eq "$STAGE_SCRIPTS" ]] \
   || die "脚本拷贝不全：仓库 ${REPO_SCRIPTS} 个，部署目录 ${STAGE_SCRIPTS} 个"
 # 客户基础数据的空白模板：客户拿这三张表填，再交给导入脚本

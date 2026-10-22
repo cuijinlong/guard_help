@@ -137,22 +137,251 @@ bash scripts/02-onboard.sh \
 **预计输出**：
 
 ```
-✓ 租户已创建
-✓ 能源参数字典：4 品种 / 26 项电能指标
-✓ 资产档案 14 个 / 设备档案 7 个
-✓ 告警与派生指标 11 条（挂在电表档案上）
-✓ 厂商 17 个 / 设备型号 9 个
-✓ 分时方案 4 套
+✓ 以系统管理员身份操作
+! 租户已存在，跳过创建            ← 首次部署是「租户已创建」
+! 租户管理员已存在，复用该账号
+✓ 已切换为租户管理员身份
 ✓ 客户已创建
-✓ 演示数据：单相园区（7 台表 + 温湿度）、三相园区（4 台表 + 温湿度）
-✓ 仪表板已复制给客户：20 个
-✓ 客户菜单已安装（13 项）
-✓ 租户菜单已安装（11 项）
+✓ 客户管理员已创建并激活（可用该邮箱登录）
+✓ 能源参数字典：1 个
+✓ 四个维度根齐全
+✓ 系统部件：726 个
+✓ 能耗管理部件：32 个
+✓ 演示数据：2 个场站 / 12 个分项
+✓ 演示设备：21 台
+✓ 演示拓扑：2 张（每个场站一张）
+✓ 客户菜单已安装
+✓ 仪表板已分配给客户：20 个
 ✓ 全部验证通过
 ```
 
-**这一步就把所有初始化做完了** —— 用户、字典、字段、菜单、演示数据、看板，一次到位。
+**这一步就把所有初始化做完了** —— 用户、字典、字段、菜单、演示数据、拓扑、看板，一次到位。
+
+除了上面逐项打印的，这一步还会建好以下内容（数量由代码里的常量决定，
+脚本不逐条比对，但 `scripts/08-verify-release.sh` 会验）：
+
+> 资产档案 14 个 / 设备档案 7 个、告警与派生指标 11 条（挂在电表档案上）、
+> 厂商 17 个 / 设备型号 9 个、分时时段方案 4 套。
+
 明细见[③ 数据初始化](/admin/init)。
+
+> **脚本会自己核对结果，不是「调完接口就说成功」。**
+> 上面 11 项验证全部实测；任何一项不对都会以非 0 退出并指明缺什么。
+> 这是「平台上线的底座」这条定位的硬要求 —— 创建成功但页面空着，比直接报错更难查。
+
+#### 如果 install 报「No qualifying bean」
+
+```
+Error creating bean with name 'energyBootstrapInstaller':
+No qualifying bean of type 'com.guard.server.service.energy.IdleEnergyService'
+```
+
+**这不是数据库问题，是 install 程序的装配范围问题。**
+
+install 用的是 `ThingsboardInstallApplication`，它的 `@ComponentScan` 只扫建库需要的包。
+如果业务服务里新加了对 `service.energy` 的注入却忘了同步扫描范围，
+Spring 在建库之前就起不来，日志表现为「建库失败」。
+
+修复（2026-10-22 已修，记在这里供排查参考）：
+`ThingsboardInstallApplication` 的 `@ComponentScan` 必须包含
+`com.guard.server.service.energy`；同时 `IdleEnergyService` 对
+`TelemetrySubscriptionService` 的依赖必须是 `@Autowired(required = false)` ——
+后者是运行时组件，install 阶段不存在。
+
+> **判断口径**：install 报 bean 找不到 → 看那个 bean 所在的包在不在
+> `@ComponentScan` 里；如果是「bean 在但依赖为 null」→ 把运行时依赖改成可选。
+
+#### 一键开通一个客户（只给一个账号，带演示数据）
+
+**这是最常见的日常动作**：平台已上线，来了一家合作企业，
+只想给他一个账号，他登录就能用。
+
+```bash
+cd ~/energy-app
+bash scripts/09-onboard-customer.sh \
+  --email customer2@company.com \
+  --password 'Cust@123456'
+```
+
+就这两个参数。**客户名不传时从邮箱前缀推导**（`customer2@company.com` → `customer2`），
+也可以用 `--name '某某公司'` 指定。
+
+租户管理员凭据自动从 `DEPLOY-CREDENTIALS.txt` 读（重装时生成），不用再填。
+
+**它会做什么**：
+
+| 步 | 动作 |
+| --- | --- |
+| 1 | 建客户 + 建客户管理员账号 + 激活（密码就是 `--password`） |
+| 2 | 确保演示数据（2 场站 / 12 分项 / 21 台设备 / 近 7 天逐小时遥测） |
+| 3 | 装客户菜单 13 项（第一项是落地页）+ 复制 20 个看板 |
+| 4 | 逐项验证，任何一样缺失就报错 |
+
+**输出**（真实样例）：
+
+```
+步骤 1/3　建客户与账号（复用 02-onboard.sh）
+  ✓ 场站：2
+  ✓ 分项（分类）：12
+  ✓ 设备：21
+  ✓ 拓扑图：2
+  ✓ 客户看板：20
+  ✓ 客户菜单项：13
+  ✓ 落地页（菜单第一项是 home）
+
+  客户已开通
+ 登录地址   http://127.0.0.1:8090
+ 账号       demo2@test.com
+ 密码       Demo@123456
+ 客户 ID    d26cf2b0-ce10-11f1-830e-2bd5ff07be79
+```
+
+同时打印**数据落表清单**与**查询 SQL**，并把交付信息写到
+`ONBOARDED-<客户ID>.txt`（权限 600，反复入驻时回查用）。
+
+**几条要点**：
+
+- **幂等**：同一个邮箱重复执行会复用客户与账号，不会建第二份演示数据
+- **不写死任何密码**：凭据从部署目录的 `DEPLOY-CREDENTIALS.txt` 读
+- **密码至少 8 位**（TB 的默认要求）
+- **演示数据可随时清空**：客户「平台自检」或 `DELETE /api/energy/demo-data?customerId=<id>`，
+  只删 `additionalInfo.demo=true` 的实体，客户自建的不受影响
+
+> 客户拿到账号登录后：直接落在「能耗概览」，左侧 13 项菜单全部有数据。
+> 他可以在「组织与场站」改场站、在「设备分组」挂设备、在「设备拓扑」看图，
+> 现场装好 RTU 填上令牌就能采数 —— 不需要平台方再介入。
+
+> 数据落在哪些表、怎么查，见
+> [运维常用 SQL → 14.16 一个客户的数据落在哪些表](/admin/troubleshoot#_14-16-一个客户的数据落在哪些表-入驻后自查)。
+
+#### 清理一个客户（不合作了 / 建错了）
+
+试用客户谈不成、或者测试建错了要重来，就把这个客户**连带它的全部数据**删掉。
+
+```bash
+cd ~/energy-app
+bash scripts/10-cleanup-customer.sh --email customer2@company.com --dry-run   # 先看要删什么
+bash scripts/10-cleanup-customer.sh --email customer2@company.com             # 确认后执行
+```
+
+**定位客户**三选一：`--id <uuid>` / `--name '完整客户名'` / `--email <账号邮箱>`。
+`--email` 先按「客户名 = 邮箱前缀」匹配，匹配不到会用用户表反查，所以自定义客户名也能找到。
+
+**它会做什么**：
+
+| 步 | 动作 |
+| --- | --- |
+| 1 | 定位客户，盘点名下数据（场站 / 分项 / 拓扑 / 设备 / 看板 / 用户 / 遥测点数） |
+| 2 | 预检：待删设备是否真的都属于这个客户（不通过就中止） |
+| 3 | 拍快照：记录「目标以外世界」的实体数与 id 指纹 |
+| 4 | 删客户（级联删资产 / 设备 / 用户 / 看板 / 关系 / 属性） |
+| 5 | 清遥测（`ts_kv`，按**删前记下的设备 id** 精确匹配） |
+| 6 | 清该客户的菜单（按删前记下的 id，且确认无其他客户引用） |
+| 7 | 复查一：目标是否清零 |
+| 8 | 复查二：**其他客户与租户级数据是否一字节没动** |
+
+**输出**（真实样例）：
+
+```
+  ✓ 预检：21 台设备全部属于「清理测试C」
+  ✓ 预检：客户名下实体租户归属一致
+============================================================
+  即将删除：「清理测试C」
+============================================================
+ 客户 ID    700b5f50-ce13-11f1-830e-2bd5ff07be79
+ 场站 2   分项 12   拓扑图 2   资产合计 29
+ 设备       21
+ 看板副本   20
+ 用户       1
+ 遥测数据   130082 个数据点（一并删除）
+------------------------------------------------------------
+ 影响面     仅此客户。其他客户 131 个实体（含租户级）已拍快照，
+            删后逐项校验，不一致会报错退出。
+------------------------------------------------------------
+  ✓ 已删除 130082 个数据点（删前计数 130082）
+  ✓ 已彻底清理（客户 / 资产 / 设备 / 看板 / 用户 全为 0）
+  ✓ 遥测：目标以外 129651 → 129651 点（本次删了 130082 点，未波及他人）
+  ✓ 遥测：目标设备已无残留（0 点）
+  ✓ 隔离校验通过：其他客户 131 个实体与租户级数据均未受影响
+```
+
+**为什么多了一个「隔离校验」**
+
+删客户是**高危操作**。只靠「代码看起来只删这一个客户」不够，脚本会给出证据：
+删除前给「目标以外的所有实体」拍一个指纹（实体数 + 全库 id 的 md5），
+删完必须逐位相同；遥测则要求「目标以外的点数只增不减」。
+任何一项不符 → **退出码 2** 并打印差异，明确提示立即恢复备份。
+
+**实测确认**（删一个 29 资产 / 21 设备的客户）：
+
+```
+全库资产   98 → 69   减少 29 = 该客户的资产数
+全库设备   42 → 21   减少 21
+全库看板   60 → 40   减少 20
+全库客户    2 → 1
+星河工业园 29 资产 / 21 设备 / 20 看板 / 1 用户 / 129302 点   ← 一个数都没动
+```
+
+**几条要点**：
+
+- **删了就没了**：平台没有客户级回收站。删前建议先备份
+- **默认要输入 `yes` 确认**；脚本化调用加 `--yes`
+- **只想清演示数据、保留客户和账号**：用
+  `DELETE /api/energy/demo-data?customerId=<id>`，它只删 `additionalInfo.demo=true` 的实体
+- **遥测默认一并删除**。要留着做分析就加 `--keep-telemetry`
+  （注意：保留的遥测会变成设备表里查不到的孤儿数据）
+- **不会碰的**：租户、租户管理员、其他客户、租户级主数据（字典 / 费率模板 / 分时方案）、
+  TB 内置的三个默认菜单模板、TB 自身的系统监控指标
+- **设备删了但遥测没删是 TB 的原生行为** —— `ts_kv` 按 `entity_id` 存在分区表里，
+  不随设备级联。不清理会一直占盘，这正是脚本要在删客户**之前**记设备 id 的原因
+
+**清理后怎么复核**：
+
+```sql
+-- 换成刚删掉的客户 id，下面每条都应该是 0
+SELECT (SELECT count(*) FROM customer  WHERE id = '<客户id>')
+     + (SELECT count(*) FROM asset     WHERE customer_id = '<客户id>')
+     + (SELECT count(*) FROM device    WHERE customer_id = '<客户id>')
+     + (SELECT count(*) FROM dashboard WHERE customer_id = '<客户id>')
+     + (SELECT count(*) FROM tb_user   WHERE customer_id = '<客户id>');
+
+-- 有没有留下悬空的菜单引用（应为 0）
+SELECT count(*) FROM customer c
+WHERE c.custom_menu_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM custom_menu cm WHERE cm.id = c.custom_menu_id);
+
+-- 其他客户还在不在（数量应与删除前一致）
+SELECT title FROM customer ORDER BY created_time;
+```
+
+> 排查这类问题的方法论（为什么不能用总量等式校验、TB 系统指标为什么会出现在 `ts_kv` 里），
+> 见知识库 `05-踩坑清单.md` 第十节「客户清理与隔离校验」。
+
+#### 再入驻一个客户（不重装、不影响老客户）
+
+租户已经建好了，只是要再加一个客户。**不要传 `--tenant`**：
+
+```bash
+cd ~/energy-app
+bash scripts/02-onboard.sh \
+  --base http://127.0.0.1:8090 \
+  --admin langmen@126.com --admin-pass 'CJLqh@163' \
+  --tenant-email tenant@126.com --tenant-pass '12345678' \
+  --customer "第二客户" \
+  --customer-email customer2@126.com --customer-pass '12345678'
+```
+
+**为什么用系统管理员还要传 `--tenant-email`**：
+
+TB 的 `CustomerController` 只允许 `TENANT_ADMIN` / `CUSTOMER_USER` 建客户，
+系统管理员（`SYS_ADMIN`）不属于任何租户，直接建会被 **403** 拒绝。
+脚本拿到这两个参数后会**切换成租户管理员身份**再继续 ——
+这也正是真实 SaaS 的入驻分权：平台方只开通租户，租户内的客户由租户自己维护。
+
+不传的后果是脚本直接报错并提示补参数，不会留下半套数据。
+
+**重跑是安全的**：租户 / 客户 / 账号已存在时都会跳过创建并复用，
+不会重复建演示数据，也不会影响已有客户。
 
 ---
 
@@ -237,6 +466,28 @@ bash shiyongshouce/downloads/deploy/docker-98-rebuild.sh \
 
 它做 9 件事：卸载 → 重新组装 → 建库 → 启动 → 开租户 → 四步验收。约 7 分钟。
 
+#### 改完后端，先跑自检（30 秒）
+
+`docker-97-preflight.sh` 检查「源码 / 部署 jar / 脚本 / 运行服务 / 手册」五处是否一致：
+
+```bash
+bash shiyongshouce/downloads/deploy/docker-97-preflight.sh
+# 期望末行：产物一致，可以开始验收。
+```
+
+它防的是本次真实踩过的坑：**改了源码没 `cp` jar，测的是旧代码，白查半天**。
+自检不过就不要往下验收 —— 那是在验旧版本。
+
+检查项：
+
+| 项 | 不一致说明什么 |
+| --- | --- |
+| 部署目录完整性 | 组装脚本没跑全 |
+| jar 一致性（比 md5） | 忘了 `cp target/guard-server-4.4.0.jar` |
+| 脚本一致性 | 改了 `downloads/scripts/` 没同步到 `~/energy-app/scripts/` |
+| 服务健康 | 容器没起 / 端口不对 |
+| 手册一致性 | 没跑 `check-docs.py` / `sync.sh` |
+
 四步验收是**依次跑四个脚本**，任何一步有失败项都会在结尾汇总：
 
 | 步 | 脚本 | 验什么 |
@@ -263,6 +514,51 @@ bash shiyongshouce/downloads/deploy/docker-98-rebuild.sh \
 cd ~/energy-app
 docker compose --profile split up -d
 ```
+
+---
+
+## 脚本一览（谁负责什么）
+
+**仓库里**：`shiyongshouce/downloads/`
+
+| 脚本 | 干什么 | 在哪跑 |
+| --- | --- | --- |
+| `deploy/docker-00-prepare.sh` | 组装部署目录（拷 jar / 脚本 / 模板） | 仓库根 |
+| `deploy/docker-01-install.sh` | 建库 | `~/energy-app` |
+| `deploy/docker-02-start.sh` | 启动全栈 + 建管理员 | `~/energy-app` |
+| `deploy/docker-97-preflight.sh` | **一致性自检**（jar / 脚本 / 服务 / 手册） | 任意 |
+| `deploy/docker-98-rebuild.sh` | **一键重装**（推荐） | 仓库根 |
+| `deploy/docker-99-uninstall.sh` | 卸载（`--purge` 连卷一起删） | `~/energy-app` |
+| `scripts/01-install.sh` | install 的容器内入口 | 被 01 调用 |
+| `scripts/02-onboard.sh` | 租户 + 客户入驻 | `~/energy-app` |
+| `scripts/03-verify.sh` | 结构验收 | `~/energy-app` |
+| `scripts/04-verify-data.sh` | 数据验收 | `~/energy-app` |
+| `scripts/05-import-customer-data.py` | 客户台账导入 | `~/energy-app` |
+| `scripts/06-verify-e2e.sh` | 全链路验收（53 项） | `~/energy-app` |
+| `scripts/07-init-menu.sh` | 菜单重建 | `~/energy-app` |
+| `scripts/08-verify-release.sh` | 发布内容验收（56 项） | `~/energy-app` |
+| `scripts/09-onboard-customer.sh` | **一键开通一个客户**（带演示数据） | `~/energy-app` |
+| `scripts/10-cleanup-customer.sh` | **清理一个客户**（连带遥测，含隔离校验） | `~/energy-app` |
+
+> `docker-00` 与 `docker-97` / `docker-98` **只在仓库里**，不要从部署目录找 ——
+> 它们要读仓库源码。
+
+**部署目录 `~/energy-app` 该有哪些**（少一个就是组装不完整）：
+
+```
+docker-compose.yml  docker-01-install.sh  docker-02-start.sh  docker-99-uninstall.sh
+scripts/01..10-*.sh  scripts/05-import-customer-data.py
+```
+
+**改脚本的铁律**：
+
+```
+shiyongshouce/downloads/scripts/*.sh   ← 唯一真相，只改这里
+        ↓ cp（或跑 docker-00-prepare.sh）
+~/energy-app/scripts/*.sh              ← 运行副本，不直接改
+```
+
+改完不同步 = 手册说能过、实际跑的是旧脚本。`docker-97-preflight.sh` 第 3 节会查这个。
 
 ---
 

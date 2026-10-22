@@ -298,14 +298,39 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
     tail = src[src.find('## 14. 运维常用 SQL'):]
     blocks = re.findall(r'```sql\n(.*?)```', tail, re.S)
 
+    # 取一个真实客户 id，用来**验证带占位符的 SQL**。
+    #
+    # ★ 为什么要这一步（2026-10-22）：原先含 `<客户id>` 的 SQL 一律跳过，
+    #   于是「看起来能跑、实际报错」的 SQL 永远不会被发现。
+    #   实测就抓到一条：`WHERE t.key = 'energy'` —— ts_kv.key 是整数 key id，
+    #   直接比字符串报 invalid input syntax for type integer。
+    #   现在把占位符替换成真实 id 再跑，语法/列名/类型错误一律暴露。
+    sample_cid = ''
+    try:
+        r = subprocess.run(
+            ['docker', 'exec', 'energy-postgres', 'psql', '-U', 'postgres', '-d', 'thingsboard',
+             '-tAc', 'SELECT id FROM customer ORDER BY created_time LIMIT 1'],
+            capture_output=True, text=True, timeout=20)
+        sample_cid = (r.stdout or '').strip()
+    except Exception:
+        pass
+
+    # 不能安全替换的占位符（需要用户自己拿的令牌之类）仍然跳过
+    UNSAFE = re.compile(r'_TOKEN|你的|xxx')
+
     ran = 0
     errors: list[str] = []
     for i, sql in enumerate(blocks, 1):
-        # 含占位符的（给运维自己填的）不跑
-        if re.search(r'<[^>]*id>|_TOKEN|你的|xxx', sql):
+        if UNSAFE.search(sql):
             continue
+        body = sql
+        if re.search(r'<[^>]*id>', body):
+            if not sample_cid:
+                continue          # 库里没客户，无从替换
+            # 把 <客户id> / <CID> / <xxx id> 统一换成真实客户 id
+            body = re.sub(r'<[^>]*id>', sample_cid, body)
         with tempfile.NamedTemporaryFile('w', suffix='.sql', delete=False, encoding='utf-8') as f:
-            f.write(sql)
+            f.write(body)
             path = f.name
         try:
             r = subprocess.run(
@@ -317,7 +342,8 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
         ran += 1
         if r.returncode != 0:
             first = next((l for l in r.stderr.splitlines() if 'ERROR' in l), r.stderr[:80])
-            errors.append(f'第 {i} 条 SQL 失败：{first.strip()[:90]}')
+            tag = '（占位符已替换为真实客户 id）' if body != sql else ''
+            errors.append(f'第 {i} 条 SQL 失败{tag}：{first.strip()[:90]}')
     return ran, len(blocks), errors
 
 
@@ -398,7 +424,8 @@ def main() -> int:
             for e in sql_errors:
                 print(f'    · {e}')
         else:
-            print(f'\n✓ 运维 SQL 全部可执行（{sql_ran}/{sql_total} 条，含占位符的已跳过）')
+            print(f'\n✓ 运维 SQL 全部可执行（{sql_ran}/{sql_total} 条；'
+                  f'带 <客户id> 占位符的已替换成真实 id 验证）')
 
     if failed:
         print(f'\n✗ {failed} 项不一致 —— 改代码后要同步手册：')

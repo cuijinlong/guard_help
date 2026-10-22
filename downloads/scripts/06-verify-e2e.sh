@@ -180,8 +180,25 @@ print(bad, total)" 2>/dev/null)
   fi
 
   # 客户首页看板必须指向「能耗概览」
+  #
+  # ★ 前端有两级来源（见 home-links-routing.module.ts 的 resolveHomeDashboard）：
+  #     1) user.additionalInfo.homeDashboardId（个人偏好）
+  #     2) 菜单里 id === "home" 的项的 dashboardId（平台下发）
+  #     都没命中才兜底到空门户页。
+  #   只查 ① 会误报：本平台走的是菜单路径 —— 实测 2026-10-22，
+  #   客户实体上的 homeDashboardId 早就设好了，但 e2e 查的是 user 的，报「未设置」。
   HOMEID=$(CAPI /api/auth/user | jget "d.get('additionalInfo',{}).get('homeDashboardId','')" 2>/dev/null)
-  [[ -n "$HOMEID" ]] && ok_ "客户首页看板已设置" || bad_ "客户首页看板未设置（登录后落在空门户页）"
+  if [[ -z "$HOMEID" ]]; then
+    HOMEID=$(CAPI /api/customMenu | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for it in (d.get('items') or []):
+    if it.get('id') == 'home':
+        print(it.get('dashboardId') or '')
+        break" 2>/dev/null)
+  fi
+  [[ -n "$HOMEID" ]] && ok_ "客户首页看板已设置" \
+    || bad_ "客户首页看板未设置（登录后落在空门户页）：菜单第一项必须是 id=home 的 HomeMenuItem"
 
 fi
 
@@ -342,11 +359,18 @@ C "5. 计算字段"
 CODE=$(ncurl -o /tmp/e2e_cf.json -w '%{http_code}' -H "X-Authorization: Bearer $TOK" "$BASE/api/calculatedFields?pageSize=50&page=0")
 [[ "$CODE" == "200" ]] && ok_ "计算字段接口可用" || bad_ "计算字段接口异常（HTTP ${CODE}）"
 
-NCF=$(jget "d.get('totalElements',0)" < /tmp/e2e_cf.json)
+# ★ 必须分两次查：/api/calculatedFields 不带 types 时**只返回 SIMPLE**。
+#   实测 2026-10-22：单查一次得 4 条（负荷率/碳排放 × 2 个档案），
+#   漏掉 7 条 ALARM（电压越限/功率因数/闲时超标），于是验收误报「只有 4 条」。
+NCF_SIMPLE=$(jget "d.get('totalElements',0)" < /tmp/e2e_cf.json)
+NCF_ALARM=$(TAPI '/api/calculatedFields?pageSize=50&page=0&types=ALARM' | python3 -c "
+import json,sys
+print(json.load(sys.stdin).get('totalElements',0))" 2>/dev/null || echo 0)
+NCF=$(( ${NCF_SIMPLE:-0} + ${NCF_ALARM:-0} ))
 # 设备档案上应预装 11 条（单相 5 + 三相 6：电压/功率因数/闲时超标 + 负荷率/碳排放）
 # 客户自己建的字段也计入，所以只判下限；0 说明初始化没跑完。
-[[ "${NCF:-0}" -ge 10 ]] && ok_ "告警与派生指标 ${NCF} 条" \
-  || bad_ "计算字段只有 ${NCF:-0} 条（期望 ≥10），跑「平台自检 → 一键修复初始化」"
+[[ "${NCF:-0}" -ge 10 ]] && ok_ "告警与派生指标 ${NCF} 条（派生 ${NCF_SIMPLE} + 告警 ${NCF_ALARM}）" \
+  || bad_ "计算字段只有 ${NCF:-0} 条（派生 ${NCF_SIMPLE} + 告警 ${NCF_ALARM}，期望 ≥10），跑「平台自检 → 一键修复初始化」"
 
 # ---------------------------------------------------------------- 6. 规则链
 C "6. 规则链"

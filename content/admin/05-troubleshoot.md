@@ -1121,19 +1121,156 @@ ORDER BY cm.scope, cm.name;
 客户菜单 `业务导航（能源管理）` 13 项且绑定到客户。
 客户菜单项数若为 0，说明配置没写进去（客户登录会看到默认菜单，不是能源菜单）。
 
-### 14.16 删数据前的确认（危险操作）
+### 14.16 一个客户的数据落在哪些表（入驻后自查）
+
+给客户开通后，用客户 ID 就能把这套数据全部串起来。
+
+| 表 | 里面是什么 | 关键列 |
+| --- | --- | --- |
+| `customer` | 客户主体 | `title` = 客户名，`custom_menu_id` → 菜单 |
+| `tb_user` | 客户管理员账号 | `authority = 'CUSTOMER_USER'`，`customer_id` |
+| `user_credentials` | 密码哈希 | `user_id` + bcrypt |
+| `asset` | 场站 / 分项 / 维度根 / 拓扑图 | `type`：`场站` `分项` `energy_item_library` `topology` |
+| `device` | 设备（普通 + 虚拟） | `additional_info->>'deviceVirtual'` = real / virtual |
+| `device_credentials` | 每台设备一个接入令牌 | `credentials_id`（发给现场装 RTU） |
+| `relation` | 实体关系 | `relation_type = 'Contains'`（拓扑连线写的就是它） |
+| `attribute_kv` | 设备/资产属性 | `attribute_type = 2`（SERVER_SCOPE） |
+| `ts_kv` | 遥测（**按月分区**） | `entity_id` + `key` + `ts` + `dbl_v` |
+| `dashboard` | 看板副本 | `customer_id` = 该客户（**不是** `assigned_customers`） |
+| `custom_menu` | 客户菜单 13 项 | 归属走 `customer.custom_menu_id`（菜单的 `customer_id` 恒为 NULL_UUID） |
+| `entity_group` / `group_permission` | 场站级用户授权（可选） | 只有授过场站权限的客户才非空 |
+
+**一、客户总览（一行看全）**
+
+```sql
+SELECT c.title AS 客户,
+       (SELECT count(*) FROM asset  WHERE customer_id = c.id AND type='场站')     AS 场站,
+       (SELECT count(*) FROM asset  WHERE customer_id = c.id AND type='分项')     AS 分项,
+       (SELECT count(*) FROM device WHERE customer_id = c.id)                     AS 设备,
+       (SELECT count(*) FROM asset  WHERE customer_id = c.id AND type='topology') AS 拓扑,
+       (SELECT count(*) FROM dashboard WHERE customer_id = c.id)                  AS 看板,
+       (SELECT count(*) FROM tb_user WHERE customer_id = c.id)                    AS 用户
+FROM customer c ORDER BY c.created_time;
+```
+
+**期望**（演示数据）：场站 2 / 分项 12 / 设备 21 / 拓扑 2 / 看板 20 / 用户 1。
+
+**二、设备清单（含虚拟标记与所属场站）**
+
+```sql
+SELECT d.name AS 技术名, d.label AS 显示名, d.type AS 档案,
+       d.additional_info::jsonb->>'deviceVirtual' AS 虚拟,
+       left(d.additional_info::jsonb->>'siteId', 8) AS 场站
+FROM device d WHERE d.customer_id = '<客户id>'
+ORDER BY d.name;
+```
+
+> `name` 带「·客户名」后缀（租户内唯一约束），`label` 是干净显示名。
+> 界面读 `label`。
+
+**三、设备接入令牌（现场装 RTU 用）**
+
+```sql
+SELECT d.name, dc.credentials_id AS 令牌, dc.credentials_type
+FROM device d JOIN device_credentials dc ON dc.device_id = d.id
+WHERE d.customer_id = '<客户id>'
+ORDER BY d.name;
+```
+
+**四、遥测数据量与时间范围**
+
+```sql
+-- ts_kv 按月分区，父表 0 字节 —— 必须查分区（这里查的就是分区，PG 会自动并）
+SELECT count(*) AS 数据点,
+       to_timestamp(min(ts)/1000) AS 最早,
+       to_timestamp(max(ts)/1000) AS 最新
+FROM ts_kv
+WHERE entity_id IN (SELECT id FROM device WHERE customer_id = '<客户id>');
+```
+
+**五、抽查最近上报（判断 RTU 是否真在传数）**
+
+```sql
+-- ★ ts_kv.key 是**整数**（key id），不是键名字符串。
+--   必须 join key_dictionary 才能按 'energy' 过滤 —— 直接写 t.key='energy'
+--   会报 invalid input syntax for type integer（实测 2026-10-22）。
+SELECT to_timestamp(t.ts/1000) AS 时间, d.label AS 设备, k.key AS 键, t.dbl_v AS 值
+FROM ts_kv t
+JOIN device d ON d.id = t.entity_id
+JOIN key_dictionary k ON k.key_id = t.key
+WHERE d.customer_id = '<客户id>'
+  AND k.key = 'energy'
+  AND t.ts > (extract(epoch from now()) - 86400) * 1000
+ORDER BY t.ts DESC LIMIT 20;
+```
+
+**六、拓扑图与它挂的场站**
+
+```sql
+SELECT a.name AS 技术名, a.label AS 显示名,
+       a.additional_info::jsonb->>'siteId' AS 场站id,
+       a.additional_info::jsonb->>'viewType' AS 视图
+FROM asset a WHERE a.customer_id = '<客户id>' AND a.type = 'topology';
+```
+
+**七、客户菜单项数**
+
+```sql
+SELECT cm.name AS 菜单名,
+       jsonb_array_length(cm.config::jsonb->'items') AS 菜单项数,
+       (cm.config::jsonb->'items'->0->>'id') AS 第一项id,
+       (cm.config::jsonb->'items'->0->>'type') AS 第一项类型
+FROM customer c JOIN custom_menu cm ON cm.id = c.custom_menu_id
+WHERE c.id = '<客户id>';
+```
+
+> 第一项必须是 `id = 'home'` / `type = 'HOME'` —— 否则客户登录会落在空门户页。
+
+**八、复制给客户的看板**
+
+```sql
+SELECT title FROM dashboard WHERE customer_id = '<客户id>' ORDER BY title;
+```
+
+### 14.17 删数据前的确认（危险操作）
 
 ```sql
 -- 1. 先看清楚要删什么（以客户为例）
 SELECT id, title FROM customer WHERE title = '星河工业园';
 
--- 2. 该客户名下的资产 / 设备数量（删客户不会自动删这些）
+-- 2. 该客户名下有多少东西（删客户会把这些**全部删掉**）
 SELECT '资产' AS 类型, count(*) FROM asset  WHERE customer_id = '<客户id>'
 UNION ALL
-SELECT '设备',        count(*) FROM device WHERE customer_id = '<客户id>';
+SELECT '设备',        count(*) FROM device WHERE customer_id = '<客户id>'
+UNION ALL
+SELECT '看板',        count(*) FROM dashboard WHERE customer_id = '<客户id>'
+UNION ALL
+SELECT '用户',        count(*) FROM tb_user WHERE customer_id = '<客户id>';
 
--- 3. 删客户后这些实体会变成「无主」，需要单独清理
+-- 3. 遥测数据量大，先看量再决定
+SELECT count(*) FROM ts_kv WHERE entity_id IN (
+    SELECT id FROM device WHERE customer_id = '<客户id>');
 ```
 
-> TB 删除客户只把资产的 `customer_id` 置空，**不删资产**。
-> 重装/重建客户时如果看到一堆「无主」资产，就是这个原因。
+> **删客户 = 级联硬删，不是置空。**
+>
+> 实测 + 代码双重确认（`CustomerServiceImpl#deleteCustomer`，2026-10-22）：
+> 删客户会依次删掉该客户的
+> 看板 / 实体视图 / 资产 / 设备 / Edge / Agent / 用户 /
+> 调度事件 / 报表 / 报表模板 / 实体组 / 角色，
+> 最后才删客户本身。
+>
+> 代码依据：
+> ```java
+> dashboardService.deleteDashboardsByTenantIdAndCustomerId(...);
+> assetService.deleteAssetsByTenantIdAndCustomerId(...);
+> deviceService.deleteDevicesByTenantIdAndCustomerId(...);
+> userService.deleteCustomerUsers(...);
+> ```
+>
+> **所以「删掉重建」是安全的清理手段**：不会留下无主资产。
+> 唯一不删的是 `ts_kv` 里的历史遥测（按 device id 存，设备删了数据仍在），
+> 需要单独按时间分区清理。
+>
+> 反过来说：**误删客户 = 客户的所有演示数据和自建架构一起没了**，
+> 删之前务必先备份（`backups/backup-db.sh`）。

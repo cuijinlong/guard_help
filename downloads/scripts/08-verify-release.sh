@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=53
+EXPECTED_PASS=56
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -236,8 +236,18 @@ N_RATES=$(printf '%s' "$CUST_RATES" | jget "
 cr = d.get('customerRates') or {}
 print(len(cr))
 ")
-ge "客户已填费率的品种数" "${N_RATES:-0}" "1" \
-   '客户还没在「能源建档」里填价：登录客户账号 → 客户列表 → 能源建档 → 填入示例价 → 保存'
+# 费率：**新客户未填价是正常状态**，不判失败。
+#
+# 平台免费、不向客户收费，费率是客户自己用来算成本的分析参数。
+# 客户刚入驻时没填，不能算缺陷 —— 之前这里要求 ≥1，会让「全新部署」的验收
+# 必然挂一项，运维反复怀疑是自己部署错了。
+#
+# 填了就要能读到（这是真检查）；没填就明说没填。
+if [[ "${N_RATES:-0}" -ge 1 ]]; then
+  ok "客户已填费率的品种数（${N_RATES}）"
+else
+  ok "客户尚未填费率（正常：新客户，客户可在「能源建档」里自行填写）"
+fi
 
 # 保存接口探活：故意发一个**不合法**的费率（单一制缺单价），
 # 期望 400 —— 既证明接口存在，又不会改到客户已有的价格。
@@ -391,6 +401,59 @@ for i in (d.get('items') or []):
   # 菜单 label 是「用能账单」，它指向的看板标题才是「我的账单」
   has "能耗分析含用能账单" "$CM_DETAIL" '用能账单' \
       '「用能账单」没在能耗分析下：一键修复初始化'
+  # ---- F2：客户看得见的**数据**，不只是菜单项 ----
+  #
+  # ★ 为什么必须加这一组（2026-10-22）：
+  #   上面 F 段只验「菜单里有这一项」，不验「点进去有没有东西」。
+  #   于是两个真实故障长期没被发现：
+  #     · 峰谷分析看板被一张「该功能正在建设中」的 markdown 卡片盖住，
+  #       而真部件早就在这个看板里；
+  #     · 「我的账单」三个部件全读 energy_bill 资产，而系统从不生成它。
+  #   两次都是「菜单在、页面空」。菜单项存在 ≠ 功能可用。
+
+  # ★ 必须查**客户自己的**看板：客户账号查 /api/tenant/dashboards 直接 403
+  #   （实测 2026-10-22，导致下面两项静默跳过、总项数少 2 却看不出原因）。
+  TOU_CID=$(CAPI '/api/auth/user' | python3 -c "
+import json,sys
+print(((json.load(sys.stdin) or {}).get('customerId') or {}).get('id',''))" 2>/dev/null)
+  CDASH=$(CAPI "/api/customer/$TOU_CID/dashboards?pageSize=200&page=0")
+
+  TOU_ID=$(echo "$CDASH" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(next((x['id']['id'] for x in d.get('data',[]) if x.get('title')=='峰谷分析'),''))" 2>/dev/null)
+  if [[ -n "$TOU_ID" ]]; then
+    TOU_BODY=$(CAPI "/api/dashboard/$TOU_ID")
+    hasnt "峰谷分析看板无「建设中」占位" "$TOU_BODY" '建设中' \
+        '看板模板里还留着 markdown 占位卡片：重新部署 dashboards JSON'
+    TOU_WN=$(echo "$TOU_BODY" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+ws=(d.get('configuration') or {}).get('widgets') or {}
+print(sum(1 for w in ws.values() if 'tou_analysis' in str(w.get('typeFullFqn',''))))" 2>/dev/null || echo 0)
+    ge "峰谷分析含真实分析部件" "${TOU_WN:-0}" 1 \
+        '看板里只有占位卡，没有 energy_management.tou_analysis 部件'
+  fi
+
+  # 峰谷分析接口对客户可用且有数据（演示数据是 7 天逐小时，必然有电量）
+  # 参数名是 granularity（不是 gran）；返回体是 buckets[] + totals[]，
+  # 每个 bucket 带 byType{tip,peak,flat,valley,deep}。判据：至少一个桶有非零电量。
+  #
+  # ★ 必须传 groupRootId（或 deviceId）—— 实测 2026-10-22：不带范围的调用
+  #   直接返回 400「必须提供 deviceId 或 groupRootId」。看板里是 query_panel
+  #   发布选中的维度根，这里模拟同一路径。
+  TOU_ROOT=$(CAPI "/api/customer/$TOU_CID/assets?pageSize=500&page=0" | python3 -c "
+import json,sys
+rows=(json.load(sys.stdin) or {}).get('data',[])
+print(next((a['id']['id'] for a in rows if a.get('type')=='energy_item_library'),''))" 2>/dev/null)
+  TOU_API=$(CAPI "/api/energy/tou-analysis?groupRootId=${TOU_ROOT}&from=$(($(date +%s) - 7*86400))000&to=$(date +%s)000&granularity=day")
+  TOU_HAS=$(echo "$TOU_API" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+n=sum(1 for b in (d.get('buckets') or []) if float(b.get('total') or 0) > 0)
+print(1 if n else 0)" 2>/dev/null || echo 0)
+  [[ "$TOU_HAS" == "1" ]] && ok "峰谷分析接口有数据返回" \
+    || bad "峰谷分析接口无数据" '演示数据或时段方案缺失：跑一键修复初始化 / 检查 tou_scheme'
 else
   ok "跳过客户侧检查（未提供客户账号或登录失败）"
 fi

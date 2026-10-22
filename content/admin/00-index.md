@@ -69,7 +69,7 @@ bash scripts/08-verify-release.sh \
   --customer customer@126.com --customer-pass '12345678'
 ```
 
-期望 `通过 53 项`。失败项会直接给出修法，多数可以点「平台自检 → 一键修复初始化」解决。
+期望 `通过 56 项`。失败项会直接给出修法，多数可以点「平台自检 → 一键修复初始化」解决。
 
 详见[③ 数据初始化](/admin/init)的「第 0 条」。
 
@@ -113,6 +113,43 @@ docker image prune -f
 > 注意两个脚本的参数名不一样，别混：
 > `docker-98-rebuild.sh` 的 `--tenant` / `--customer` 是**登录邮箱**，名称用 `--tenant-title` / `--customer-title`；
 > `scripts/02-onboard.sh` 的 `--tenant` / `--customer` 是**名称**，邮箱用 `--tenant-email` / `--customer-email`。
+
+**一键开通一个客户**（最简单，带演示数据）：
+
+```bash
+cd ~/energy-app
+bash scripts/09-onboard-customer.sh --email customer2@company.com --password 'Cust@123456'
+```
+
+只给邮箱和密码，客户名自动从邮箱前缀推导。租户凭据自动读取。
+
+**再入驻一个客户**（租户已有，不重装，需要自己控制租户参数）：去掉 `--tenant`，但**必须带 `--tenant-email` / `--tenant-pass`**。
+系统管理员不能直接建客户（TB 会 403），脚本会用它切换成租户管理员再继续：
+
+```bash
+cd ~/energy-app
+bash scripts/02-onboard.sh \
+  --base http://127.0.0.1:8090 \
+  --admin langmen@126.com --admin-pass 'CJLqh@163' \
+  --tenant-email tenant@126.com --tenant-pass '12345678' \
+  --customer "第二客户" \
+  --customer-email customer2@126.com --customer-pass '12345678'
+```
+
+重跑安全：已存在的租户 / 客户 / 账号会跳过并复用，不影响已有客户。
+详见[② 部署 → 再入驻一个客户](/admin/deploy)。
+
+**清理一个客户**（不合作了 / 建错了）：
+
+```bash
+cd ~/energy-app
+bash scripts/10-cleanup-customer.sh --email customer2@company.com --dry-run   # 先看要删什么
+bash scripts/10-cleanup-customer.sh --email customer2@company.com             # 确认后执行
+```
+
+连带客户名下的资产 / 设备 / 看板 / 账号 / **遥测数据**一并清掉。
+删前会拍快照，删后校验**其他客户与租户级数据一字节没动**，不通过就退出码 2 报错。
+删了不可恢复，没有客户级回收站。详见[② 部署 → 清理一个客户](/admin/deploy)。
 
 ---
 
