@@ -71,6 +71,76 @@ WHERE user_id = (SELECT id FROM tb_user WHERE email='tenant@126.com');"
 >
 > 重置完立刻用新密码登录验证。
 
+### 现象 A2：客户账号建好了，但激活链接点开是 `:80` / 打不开
+
+**现象**：租户在「客户与用户 → 用户 → 新增」建了客户账号，选「显示激活链接」，
+拿到的地址是 `http://127.0.0.1:80/api/noauth/activate?...` 或 `http://localhost:8080/...`，
+客户点开 404 / 连接被拒。
+
+**根因**（两层，都被修了）：
+
+1. **nginx 没传 `X-Forwarded-Port`**。后端 `MiscUtils.getPort()` 的判断顺序是：
+   ```
+   ① 有 x-forwarded-port → 用它
+   ② 否则只要有 x-forwarded-proto → http 硬编码 80，https 硬编码 443
+   ③ 都没有 → request.getServerPort()
+   ```
+   nginx 必然要传 `X-Forwarded-Proto`（https 下取真实协议），于是掉进 ②，
+   端口被强制写成 80。**只改 Host 头不管用**，必须显式传 `X-Forwarded-Port`。
+
+2. `admin_settings.general.baseUrl` 还是 TB 出厂默认 `http://localhost:8080`。
+   默认 `prohibitDifferentUrl=false` 时不读它，但一旦被打开或请求上下文为空
+   （定时任务发邮件、报表），就会用它。
+
+**定位**：
+
+```bash
+# 1) 看 nginx 是否传了端口
+grep -n 'X-Forwarded-Port' ~/energy-app/nginx/energy.conf
+
+# 2) 看后端配的对外地址
+docker compose exec -T postgres psql -U postgres -d thingsboard -tAc "
+SELECT json_value FROM admin_settings WHERE key='general';"
+```
+
+**修法**：
+
+```bash
+# 1) 确认 nginx 有这两行（新版本已内置）
+#    map $http_host $forwarded_port { ... }
+#    proxy_set_header X-Forwarded-Port $forwarded_port;
+docker compose restart gateway
+
+# 2) 把对外地址配成真实域名/IP（重跑 02 时加 --public-url 也行）
+docker compose exec -T postgres psql -U postgres -d thingsboard -c "
+UPDATE admin_settings
+SET json_value = jsonb_set(json_value::jsonb,'{baseUrl}',
+    to_jsonb('https://energy.example.com'::text))::text
+WHERE key='general';"
+```
+
+**验证**：
+
+```bash
+# 取一台客户用户的激活链接，看端口/域名对不对
+TOK=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+
+curl -s --noproxy '*' -H "X-Authorization: Bearer $TOK" \
+  "http://127.0.0.1:8090/api/user/<用户id>/activationLink"
+# 期望：http://<真实地址>:<真实端口>/api/noauth/activate?activateToken=...
+```
+
+> **注意 POST 与 GET 的区别**：`GET /api/noauth/activate` 从 **query** 读 token
+> （浏览器打开链接走这条），`POST` 从 **body** 读（设密码时用）。
+> 手工测试时把 token 放错位置会看到 `Incorrect activateToken null`，那不是 bug。
+
+**没有邮件服务器怎么办**：内网离线部署本来就没有 SMTP。
+新增用户时选「显示激活链接」而不是「发送激活邮件」，把链接直接发给客户。
+邮箱配置在「运营配置 → 设置 → 邮件服务器」——**不配也能用**，只是不能自动发信。
+
 ### 现象 B：能登录，但页面白屏 / 转圈
 
 **定位**（看浏览器控制台，或直接查资源）：
@@ -220,7 +290,18 @@ curl -s --noproxy '*' -H "X-Authorization: Bearer $TOK" \
 ```
 
 - 输出 **11** → 数据完好，是**前端**渲染问题：旧版前端遇到「toggle 型顶层项但没有 pages」会整项丢弃。换新前端即恢复，**不用重装、不用重跑初始化**。
-- 输出 **小于 11** → 菜单确实是旧版装的，点**平台自检 → 一键修复初始化**重装。
+- 输出 **小于 11** → 菜单确实是旧版装的（缺落地页或缺运营配置），点**平台自检 → 一键修复初始化**重装。
+
+> **2026-10-22 起：启动不再重建菜单。**
+> 之前每次重启都会删掉租户/客户菜单再按模板重装，导致「改一次菜单，重启就白改」。
+> 现在：
+> - 服务启动 → 菜单已存在就**跳过**（保留你调的顺序、加的项、隐藏的项）
+> - `平台自检 → 一键修复初始化` → 只修**结构损坏**的菜单（缺落地页 / 缺运营配置），
+>   结构完整的**一律不动**
+> - 想彻底恢复成模板：先删掉这条菜单，再跑一次一键修复
+>
+> 代价：以后新增的菜单项不会自动出现在老租户上。需要的话在界面上自己加，
+> 或按上面的办法重建。
 
 详见[③ 数据初始化](/admin/init)「一之五」。
 
@@ -729,6 +810,88 @@ tenant（租户 / 能源服务商）
 **关键约束**：TB 的计算字段参数（`TS_LATEST`）只从本次上报的那批遥测取值，
 不去库里查最新点。直接把值写进 `ts_kv` 不会触发告警，症状是规则一直报
 `Required arguments are missing: exceed`。
+
+### 13.5 自建表：哪些表是我们自己的，不属于 ThingsBoard
+
+**这条必须记住** —— 出问题时先分清「TB 的表」和「我们的表」，
+否则会去翻 TB 文档找一个它根本没有的功能。
+
+```
+                    ┌──────────────────────────────────────┐
+                    │  guard-server（本平台的 Java 服务）    │
+                    └──────────────┬───────────────────────┘
+                                   │
+            ┌──────────────────────┴──────────────────────┐
+            │                                             │
+   ┌────────▼─────────┐                        ┌──────────▼──────────┐
+   │ 走 TB 的 DAO/Service │                     │ 直接 jdbcTemplate    │
+   │ （TB 原生功能）      │                      │ （本平台自建功能）    │
+   └────────┬─────────┘                        └──────────┬──────────┘
+            │                                             │
+   ┌────────▼──────────────────┐          ┌───────────────▼─────────────────┐
+   │ TB 自己的表（TB 负责建）    │          │ 我们自己的表（EnergySchemaInstaller│
+   │                            │          │  在启动时自动建）                 │
+   │ tenant / customer          │          │                                  │
+   │ asset / device             │          │ meter_reading_batch  抄表批次     │
+   │ asset_profile              │          │ meter_reading_record 抄表明细     │
+   │ device_profile             │          │   └─ 按月分区 _YYYY_MM           │
+   │ attribute_kv               │          │ billing              用能账单     │
+   │ relation                   │          │ billing_detail       账单明细     │
+   │ dashboard / custom_menu    │          │ tb_sync_log          同步日志     │
+   │ ts_kv（按月分区）/ ts_kv_latest │      │                                  │
+   │ alarm / audit_log / ...    │          │ 函数 energy_ensure_reading_partition│
+   └────────────────────────────┘          └──────────────────────────────────┘
+```
+
+**自建表清单与用途**
+
+| 表 | 用途 | 谁写 | 谁读 | 分区 |
+| --- | --- | --- | --- | --- |
+| `meter_reading_batch` | 一次「一键抄表」的运行记录（总数 / 正常 / 缺数 / 异常） | `EnergyMeterReadingController` | 抄表功能看板、「抄表批次」页 | 否 |
+| `meter_reading_record` | 每设备每账期一条读数（上期 / 本期 / 用量 / 质量） | 同上 | 抄表台账、手工填报、参数报表 | **是**（按 `reading_time` 月分区） |
+| `billing` | 用能账单（费用快照，`billing_no` 幂等） | 账单生成逻辑 | 「我的账单」看板 | 否 |
+| `billing_detail` | 账单明细（每条费率一行） | 同上 | 同上 | 否 |
+| `tb_sync_log` | 同步日志（遥测键 / 告警规则 / 校验规则 / 排班 / 账单） | 同步逻辑 | 排障时看 | 否 |
+
+**为什么抄表明细要按月分区**：粒度是「每设备每账期一条」，一年下来
+设备数 × 12 行。单表能撑，但查询永远带时间范围（台账按账期、报表按月），
+分区后只扫目标月份，也便于整月归档或删除。
+
+**建表在什么时候发生**
+
+```
+energy-server 启动
+      │
+      ▼
+ApplicationReadyEvent
+      │
+      ▼
+EnergySchemaInstaller.ensureEnergyTables()
+      │
+      ├─ 表在？ ──在──▶ 什么都不做（幂等）
+      │
+      └─ 不在 ──▶ 建表 + 建索引 + 建分区函数 + 建当月及未来两个月分区
+```
+
+日志特征（建了东西才会打 INFO）：
+
+```
+[energy-schema] 能源自建表补齐：新建 5 个对象，分区 [meter_reading_record_2026_10, ...]
+```
+
+**这是一次真实的迁移事故**：这 4 张表的 DDL 早就写在
+`nenghaobao/energy-config/sql/`（01-billing / 02-meter-reading /
+03-tb-sync-log / 04-meter-reading-batch），迁移脚本
+`11-migrate-db.mjs` 用「docker exec psql」把它建在了**开发库**上，
+脚本注释里写了「生产路径：追加进 guard-server 的 upgrade/schema_update.sql」——
+**但这条路径从没执行过**。
+
+结果：开发机（`tb-postgres`）有 36 条批次 / 147 条记录，看起来一切正常；
+新装出来的库 0 张表，抄表与手工填报 **7 个接口全 500**。
+验收脚本也没抓到（只测了带参数能通过的少数几个）。
+
+**教训**：功能上线前，必须在**全新空库**上跑一遍完整流程，
+而不是在「跑了几个月、表早就手工建好」的库上验收。
 
 ---
 
@@ -1274,3 +1437,320 @@ SELECT count(*) FROM ts_kv WHERE entity_id IN (
 >
 > 反过来说：**误删客户 = 客户的所有演示数据和自建架构一起没了**，
 > 删之前务必先备份（`backups/backup-db.sh`）。
+
+### 14.18 自建表健康检查（部署后必查一次）
+
+**先看表在不在** —— 这是「功能报 500」的第一嫌疑：
+
+```sql
+SELECT t AS 表名,
+       CASE WHEN to_regclass('public.'||t) IS NULL THEN '✗ 缺失'
+            ELSE '✓ 存在' END AS 状态
+FROM unnest(ARRAY['meter_reading_batch','meter_reading_record',
+                  'billing','billing_detail','tb_sync_log']) AS t;
+```
+
+**期望 5 行全是「✓ 存在」**。任何一行缺失 → 看服务启动日志：
+
+```bash
+docker compose logs energy-server | grep 'energy-schema'
+```
+
+- 有 `能源自建表补齐：新建 N 个对象` → 已经自动补上了，重查即可
+- 完全没有这行 → 服务没跑建表逻辑（jar 是旧的），或建表抛异常
+- 有 `能源自建表补齐失败` → 后面跟了具体错误，按错误处理
+
+**手动补建**（一般不需要，重启服务即可）：
+
+```bash
+docker compose restart energy-server
+sleep 30 && docker compose logs energy-server | grep energy-schema
+```
+
+**看分区是否够用**（抄表明细按月分区，跨月前必须有下个月的分区）：
+
+```sql
+SELECT c.relname AS 分区名,
+       pg_size_pretty(pg_total_relation_size(c.oid)) AS 大小,
+       (SELECT count(*) FROM pg_class i
+         WHERE i.relname LIKE c.relname || '_%' AND i.relkind = 'i') AS 索引数
+FROM pg_class c
+WHERE c.relname LIKE 'meter_reading_record_%' AND c.relkind = 'r'
+ORDER BY c.relname;
+```
+
+**每个分区都应该有 4 个索引**（batch_id / device_id+reading_time / period /
+period+quality）。索引数为 0 说明分区是手工建的、没继承索引 ——
+数据一多就全表扫。
+
+**分区不连续会怎样**：写入落在没有分区的月份 → 报
+`no partition of relation "meter_reading_record" found for row`。
+服务写入前会调 `energy_ensure_reading_partition()` 自动补，
+所以正常情况下不会遇到；但如果那个函数被删了就会。
+
+**函数在不在**（`Controller` 每次抄表都会调它）：
+
+```sql
+SELECT p.proname AS 函数名,
+       pg_get_function_arguments(p.oid) AS 参数
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public' AND p.proname = 'energy_ensure_reading_partition';
+```
+
+期望 1 行，参数是 `month_start date`。
+
+---
+
+### 14.19 抄表数据怎么查（客户 / 运维都会问）
+
+**最近的抄表批次**（每次「一键抄表」一行）：
+
+```sql
+SELECT id,
+       period                                  AS 账期,
+       trigger_type                            AS 触发方式,
+       status                                  AS 状态,
+       total                                   AS 总数,
+       normal_count                            AS 正常,
+       missing_count                           AS 缺数,
+       abnormal_count                          AS 异常,
+       to_timestamp(started_time/1000)         AS 开始时间,
+       round((coalesce(finished_time, started_time) - started_time)/1000.0, 1) AS 耗时秒
+FROM meter_reading_batch
+ORDER BY started_time DESC
+LIMIT 20;
+```
+
+看什么：
+- `状态` 一直是 `running` 且耗时很久 → 批次卡住了
+- `缺数 + 异常` 占比高 → 设备没上报或表底倒走，去查设备
+
+**某账期每位表计的读数**：
+
+```sql
+SELECT r.device_name              AS 设备,
+       r.meter_no                 AS 表号,
+       r.period                   AS 账期,
+       r.prev_reading             AS 上期,
+       r.curr_reading             AS 本期,
+       r.usage                    AS 用量,
+       r.unit                     AS 单位,
+       r.quality                  AS 质量,
+       r.source                   AS 来源,
+       CASE WHEN r.field_value IS NOT NULL THEN r.field_value END AS 现场补抄值
+FROM meter_reading_record r
+WHERE r.period = to_char(now(), 'YYYY-MM')
+ORDER BY r.device_name;
+```
+
+`quality` 取值：`normal` 正常 / `missing` 无数据 / `abnormal` 倒走或突变。
+`source` 取值：`auto` 系统算 / `field` 现场补抄。
+
+**异常读数清单**（要人工核对的）：
+
+```sql
+SELECT r.period          AS 账期,
+       r.device_name     AS 设备,
+       r.prev_reading    AS 上期,
+       r.curr_reading    AS 本期,
+       r.usage           AS 用量,
+       r.quality         AS 质量,
+       r.note            AS 说明
+FROM meter_reading_record r
+WHERE r.quality <> 'normal'
+ORDER BY r.period DESC, r.device_name
+LIMIT 100;
+```
+
+**用能与原始遥测交叉核对**（判断报表准不准）：
+
+```sql
+-- 逐设备对比：抄表用量 vs 原始遥测合计（同一台表、同一个月）
+WITH m AS (
+    SELECT device_id, coalesce(sum(usage), 0) AS meter_usage
+    FROM meter_reading_record
+    WHERE period = to_char(now(), 'YYYY-MM')
+    GROUP BY device_id
+), t AS (
+    SELECT t.entity_id AS device_id, round(sum(t.dbl_v)::numeric, 2) AS telemetry_usage
+    FROM ts_kv t
+    JOIN key_dictionary k ON k.key_id = t.key
+    WHERE k.key = 'energy'
+      AND t.ts >= extract(epoch from date_trunc('month', now())) * 1000
+      AND t.ts <  extract(epoch from date_trunc('month', now()) + interval '1 month') * 1000
+    GROUP BY t.entity_id
+)
+SELECT d.name                       AS 设备,
+       coalesce(m.meter_usage, 0)   AS 抄表用量,
+       coalesce(t.telemetry_usage, 0) AS 遥测合计,
+       round(coalesce(m.meter_usage,0) - coalesce(t.telemetry_usage,0), 2) AS 差额
+FROM m
+FULL JOIN t ON t.device_id = m.device_id
+LEFT JOIN device d ON d.id = coalesce(m.device_id, t.device_id)
+ORDER BY abs(coalesce(m.meter_usage,0) - coalesce(t.telemetry_usage,0)) DESC
+LIMIT 20;
+```
+
+要查单台设备，把 `WHERE period = ...` 后面加一句
+`AND device_id = '真实设备uuid'` 即可（uuid 从「设备」列表里复制）。
+
+> **两者对不上是正常的**，前提是知道口径：
+> 抄表用量 = **本期表底 − 上期表底**；遥测 `energy` 是**每次上报的增量**。
+> 有补抄（`field_value`）或表底倒走时，两者必然有差。
+> 真正要一致的是「同一口径」的比较 —— 见 06-verify-e2e 的整点过滤说明。
+
+---
+
+### 14.20 手工填报数据怎么查
+
+手工填报的值存在两处，别查错地方：
+
+| 位置 | 存什么 | 用途 |
+| --- | --- | --- |
+| `meter_reading_record.field_value` | 现场补抄的表底值 | 与系统值并列保存，便于对比审计 |
+| `ts_kv`（虚拟设备） | 月度汇总值 | 报表与看板读这里 |
+
+**某场站某年的填报记录**：
+
+```sql
+SELECT r.period           AS 账期,
+       r.device_name      AS 设备,
+       r.field_value      AS 填报值,
+       r.field_status     AS 填报状态,
+       to_timestamp(r.field_time/1000) AS 填报时间,
+       r.field_note       AS 备注
+FROM meter_reading_record r
+WHERE r.customer_id = '<客户id>'
+  AND r.field_value IS NOT NULL
+  AND r.period LIKE to_char(now(), 'YYYY') || '%'
+ORDER BY r.period DESC, r.device_name;
+```
+
+查往年就把 `to_char(now(), 'YYYY')` 换成具体年份字符串（如 `'2025'`）。
+
+**填报了但没进遥测**（虚拟设备应当同步到 `ts_kv`）：
+
+```sql
+-- 找出有填报值、但该设备本月没有遥测点的记录
+SELECT r.period, r.device_name, r.field_value
+FROM meter_reading_record r
+WHERE r.field_value IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM ts_kv t
+    WHERE t.entity_id = r.device_id
+      AND t.ts >= extract(epoch from to_date(r.period || '-01', 'YYYY-MM-DD')) * 1000
+      AND t.ts <  extract(epoch from to_date(r.period || '-01', 'YYYY-MM-DD') + interval '1 month') * 1000
+  )
+ORDER BY r.period DESC;
+```
+
+期望 0 行。有行说明填报值只写进了自建表、没同步到遥测 ——
+看板会显示 0，但台账里明明填了。
+
+---
+
+### 14.21 账单与同步日志
+
+**账单按月汇总**（平台当前免费，一般没有数据，表可以空着）：
+
+```sql
+SELECT period       AS 账期,
+       energy       AS 品种,
+       count(*)     AS 单数,
+       round(sum(amount), 2)   AS 合计金额,
+       round(sum(usage), 2)    AS 合计用量,
+       status       AS 状态
+FROM billing
+GROUP BY period, energy, status
+ORDER BY period DESC, energy;
+```
+
+`status` 取值：`draft` 草稿 / `published` 已发布 / `paid` 已付。
+
+**账单明细**（默认取最新一张账单，按费率拆开）：
+
+```sql
+SELECT d.line_type  AS 行类型,
+       d.name       AS 项目,
+       d.usage      AS 用量,
+       d.price      AS 单价,
+       d.amount     AS 金额
+FROM billing_detail d
+JOIN billing b ON b.id = d.billing_id
+WHERE d.billing_id = (
+        SELECT id FROM billing ORDER BY created_time DESC LIMIT 1
+      )
+ORDER BY d.created_time;
+```
+
+**同步失败记录**（有异常才需要看）：
+
+```sql
+SELECT sync_type        AS 同步类型,
+       source_entity    AS 源类型,
+       source_id        AS "源ID",
+       status           AS 状态,
+       retry_count      AS 重试次数,
+       error_msg        AS 错误,
+       to_timestamp(created_time/1000) AS 时间
+FROM tb_sync_log
+WHERE status <> 'synced'
+ORDER BY created_time DESC
+LIMIT 50;
+```
+
+期望 0 行。有行说明某次同步失败了，`error_msg` 里有原因。
+
+---
+
+### 14.22 一次完整的「部署后自检」SQL（复制即用）
+
+按顺序跑，每段都有明确期望值。
+
+```sql
+-- ① 自建表齐不齐（期望 5 行「✓ 存在」）
+SELECT t AS 表名,
+       CASE WHEN to_regclass('public.'||t) IS NULL THEN '✗ 缺失' ELSE '✓ 存在' END AS 状态
+FROM unnest(ARRAY['meter_reading_batch','meter_reading_record',
+                  'billing','billing_detail','tb_sync_log']) AS t;
+
+-- ② 分区函数在不在（期望 1 行）
+SELECT count(*) AS 分区函数数
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname='public' AND p.proname='energy_ensure_reading_partition';
+-- 期望 1
+
+-- ③ 分区覆盖到哪个月（当前月与下月必须在）
+SELECT c.relname AS 分区
+FROM pg_class c
+WHERE c.relname LIKE 'meter_reading_record_%' AND c.relkind='r'
+ORDER BY c.relname;
+
+-- ④ 租户级主数据在不在（期望 4 / 4 / 16 / 8）
+SELECT '能源品种' AS 项目, count(*) AS 数量 FROM asset
+  WHERE customer_id='13814000-1dd2-11b2-8080-808080808080' AND type='default'
+UNION ALL SELECT '分时方案', count(*) FROM asset
+  WHERE customer_id='13814000-1dd2-11b2-8080-808080808080' AND type='tou_scheme'
+UNION ALL SELECT '资产档案', count(*) FROM asset_profile
+UNION ALL SELECT '设备档案', count(*) FROM device_profile;
+
+-- ⑤ 菜单装没装（期望 2 行，项数 11 与 13）
+SELECT scope AS 层级, name AS 菜单名,
+       jsonb_array_length(config::jsonb->'items') AS 顶层项数
+FROM custom_menu
+WHERE name LIKE '默认导航%' OR name LIKE '业务导航%';
+
+-- ⑥ 有没有孤儿菜单（期望 0）
+SELECT count(*) AS 悬空引用
+FROM customer c
+WHERE c.custom_menu_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM custom_menu cm WHERE cm.id = c.custom_menu_id);
+
+-- ⑦ 遥测有没有在写（期望 > 0）
+SELECT count(*) AS 近一小时数据点
+FROM ts_kv
+WHERE ts > (extract(epoch from now()) - 3600) * 1000;
+```
+
+> 只看「有没有」而不看「多少」时，用 `count(*) > 0` 而不是精确值 ——
+> 演示数据会随时间增长，写死数字的断言迟早会红。

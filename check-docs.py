@@ -320,8 +320,18 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
 
     ran = 0
     errors: list[str] = []
+    # 中文别名里带空格 → PostgreSQL 只把第一个词当别名，剩下的词成为多余 token，
+    # 报 `syntax error at or near "id"`。实测踩过：`AS 源 id`。
+    # 静态检查先拦一道，比等 psql 报错更容易定位。
+    BAD_ALIAS = re.compile(r'\bAS\s+[\u4e00-\u9fff]+\s+[\u4e00-\u9fffa-zA-Z_]+\s*(?:,|$)', re.M)
     for i, sql in enumerate(blocks, 1):
         if UNSAFE.search(sql):
+            continue
+        m = BAD_ALIAS.search(sql)
+        if m:
+            alias = m.group(0).strip()
+            errors.append(f'第 {i} 条 SQL 有非法中文别名「{alias}」'
+                          f'（中文别名不能含空格，加双引号或去掉空格）')
             continue
         body = sql
         if re.search(r'<[^>]*id>', body):

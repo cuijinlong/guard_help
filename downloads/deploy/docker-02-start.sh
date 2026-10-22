@@ -7,12 +7,17 @@
 #
 # 若服务已经启动、管理员也已存在，脚本只做校验，不会重复创建。
 #
+# --public-url 是客户实际访问的地址（如 https://energy.example.com），
+#   用于生成激活链接 / 重置密码链接。不传时优先读 .env 的 PUBLIC_URL，
+#   再没有就自动探测本机 IP + HTTP_PORT。生产环境建议显式传域名。
+#
 set -euo pipefail
 
 cd "$(dirname "$0")"
 COMPOSE="docker compose"
 ADMIN_EMAIL=""
 ADMIN_PASS=""
+PUBLIC_URL_CLI=""
 
 log()  { printf '\033[36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 ok()   { printf '\033[32m  ✓\033[0m %s\n' "$*"; }
@@ -23,7 +28,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --admin-email) ADMIN_EMAIL="$2"; shift 2 ;;
     --admin-pass)  ADMIN_PASS="$2"; shift 2 ;;
-    -h|--help)     sed -n '2,12p' "$0"; exit 0 ;;
+    --public-url)  PUBLIC_URL_CLI="$2"; shift 2 ;;
+    -h|--help)     sed -n '2,16p' "$0"; exit 0 ;;
     *) die "未知参数：$1" ;;
   esac
 done
@@ -116,6 +122,64 @@ elif echo "$STATE" | grep -q "ACCOUNT_REQUIRED"; then
 else
   die "无法识别的 setup 状态：$STATE"
 fi
+
+# ---------------- 3b. 配置对外访问地址（激活链接用） ----------------
+#
+# 为什么必须配：客户账号的激活链接、忘记密码链接都由后端拼出来。
+# 采用哪个地址取决于 admin_settings.general：
+#   prohibitDifferentUrl=false（默认）→ 从请求头推导，依赖 nginx 传 X-Forwarded-Port
+#   prohibitDifferentUrl=true          → 只能用这里配的 baseUrl
+# 而出厂默认 baseUrl 是 http://localhost:8080 —— 客户拿到手点不开。
+# 这里把它改成实际对外地址，让两条路都对。
+
+# 取值优先级：--public-url > .env 的 PUBLIC_URL > 自动探测
+# 注意：.env 是在参数解析**之后**加载的，所以命令行值必须先存到 PUBLIC_URL_CLI，
+# 否则会被 .env 覆盖（踩过）。
+if [[ -z "$PUBLIC_URL_CLI" ]]; then
+  PUBLIC_URL_CLI="${PUBLIC_URL:-}"
+fi
+
+if [[ -z "$PUBLIC_URL_CLI" ]]; then
+  # 跨平台探测第一个非回环 IPv4：
+  #   Linux  hostname -I
+  #   macOS  没有 -I，用 ipconfig getifaddr（en0/en1 逐个试）
+  HOST_IP=""
+  if command -v hostname >/dev/null 2>&1 && hostname -I >/dev/null 2>&1; then
+    HOST_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -vE '^127\.|^$' | head -1 || true)
+  fi
+  if [[ -z "$HOST_IP" ]] && command -v ipconfig >/dev/null 2>&1; then
+    for IFACE in en0 en1 en2; do
+      HOST_IP=$(ipconfig getifaddr "$IFACE" 2>/dev/null || true)
+      [[ -n "$HOST_IP" ]] && break
+    done
+  fi
+  [[ -n "$HOST_IP" ]] || HOST_IP="localhost"
+
+  if [[ "$PORT" == "80" ]]; then
+    PUBLIC_URL_CLI="http://${HOST_IP}"
+  else
+    PUBLIC_URL_CLI="http://${HOST_IP}:${PORT}"
+  fi
+  log "未指定对外地址，自动探测为 ${PUBLIC_URL_CLI}（生产环境请用 --public-url 传域名）"
+else
+  log "对外访问地址：$PUBLIC_URL_CLI"
+fi
+
+PUBLIC_URL="$PUBLIC_URL_CLI"
+
+# 只改 baseUrl，保留 prohibitDifferentUrl 等其他字段
+if [[ "$MODE" == "allinone" ]]; then
+  PSQL_CMD="$COMPOSE $PROFILE_ARGS exec -T allinone psql -U ${DB_USER:-postgres} -d ${DB_NAME:-thingsboard}"
+else
+  PSQL_CMD="$COMPOSE $PROFILE_ARGS exec -T postgres psql -U ${DB_USER:-postgres} -d ${DB_NAME:-thingsboard}"
+fi
+
+$PSQL_CMD -tAc "
+UPDATE admin_settings
+SET json_value = jsonb_set(json_value::jsonb, '{baseUrl}', to_jsonb('${PUBLIC_URL}'::text))::text
+WHERE key = 'general';" >/dev/null 2>&1 \
+  && ok "已写入 baseUrl=$PUBLIC_URL" \
+  || warn "写入 baseUrl 失败（不影响启动；可从「系统设置 → 通用」手工填）"
 
 # ---------------- 4. 登录验证 ----------------
 TOKEN=$(ncurl -m 30 -X POST "$BASE/api/auth/login" \

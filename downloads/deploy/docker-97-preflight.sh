@@ -35,7 +35,7 @@ C()   { printf '\n\033[36m%s\033[0m\n' "$*"; }
 
 # ---------------------------------------------------------------- 1. 部署目录
 C "1. 部署目录完整性"
-[[ -d "$APP_HOME" ]] || { bad "部署目录不存在：$APP_HOME（还没装？）"; exit 1; }
+[[ -d "$APP_HOME" ]] || { bad "部署目录不存在：${APP_HOME}（还没装？）"; exit 1; }
 
 # docker-00 / docker-98 本来就只在仓库里，不由部署目录持有 —— 不列入检查
 for f in docker-compose.yml docker-01-install.sh docker-02-start.sh docker-99-uninstall.sh; do
@@ -98,7 +98,7 @@ if [[ -d "$SRC_DIR" && -d "$DST_DIR" ]]; then
       bad "部署目录缺脚本：$b"
       N=$((N+1))
     elif ! diff -q "$f" "$DST_DIR/$b" >/dev/null 2>&1; then
-      bad "脚本过期：$b（cp 过去）"
+      bad "脚本过期：${b}（cp 过去）"
       N=$((N+1))
     fi
   done
@@ -108,7 +108,7 @@ if [[ -d "$SRC_DIR" && -d "$DST_DIR" ]]; then
     [[ -e "$f" ]] || continue
     b=$(basename "$f")
     is_ops_script "$b" || continue
-    [[ -f "$SRC_DIR/$b" ]] || { bad "部署目录有仓库已删的脚本：$b（删掉它，避免误跑）"; N=$((N+1)); }
+    [[ -f "$SRC_DIR/$b" ]] || { bad "部署目录有仓库已删的脚本：${b}（删掉它，避免误跑）"; N=$((N+1)); }
   done
 
   [[ "$N" == "0" ]] && ok "全部一致（${TOTAL} 个，不含裸机路径 01-install.sh）"
@@ -117,11 +117,14 @@ if [[ -d "$SRC_DIR" && -d "$DST_DIR" ]]; then
   #     macOS 自带 bash 3.2，这个坑已经踩过三次（报错信息里变量名带乱码）
   CHK="$HERE/../../../tools/check-bash-cn-var.py"
   if [[ -f "$CHK" ]]; then
-    if python3 "$CHK" -q "$SRC_DIR" 2>/dev/null; then
+    # 两处都要扫：deploy/ 是本目录的脚本，scripts/ 是运维脚本。
+    # 只扫一处会漏（踩过：新增的 docker-02-start.sh 与 preflight 自身都有这个问题）。
+    if python3 "$CHK" -q "$HERE" 2>/dev/null && python3 "$CHK" -q "$SRC_DIR" 2>/dev/null; then
       ok "脚本无 \$VAR 紧跟中文（bash 3.2 兼容）"
     else
       bad "脚本里有 \$VAR 紧跟中文，macOS bash 3.2 会报 unbound variable"
-      python3 "$CHK" "$SRC_DIR" 2>/dev/null | sed 's/^/      /' | head -12
+      python3 "$CHK" "$HERE" 2>/dev/null | sed 's/^/      /' | head -8
+      python3 "$CHK" "$SRC_DIR" 2>/dev/null | sed 's/^/      /' | head -8
       N=$((N+1))
     fi
   fi
@@ -133,7 +136,7 @@ fi
 C "4. 服务健康"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' \
   "$BASE/api/noauth/whiteLabel/loginWhiteLabelParams" 2>/dev/null || echo 000)
-[[ "$CODE" == "200" ]] && ok "HTTP $CODE" || bad "HTTP $CODE（服务没起或端口不对）"
+[[ "$CODE" == "200" ]] && ok "HTTP $CODE" || bad "HTTP ${CODE}（服务没起或端口不对）"
 
 # 进程内 class 版本无法直接查；用「健康 + jar 一致」间接保证
 if command -v docker >/dev/null 2>&1 && [[ -f "$APP_HOME/docker-compose.yml" ]]; then

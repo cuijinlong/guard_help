@@ -408,9 +408,15 @@ cd /opt && tar -xzf energy-deploy-*.tar.gz
 ```bash
 cd /opt/energy-deploy
 bash docker-01-install.sh
-bash docker-02-start.sh --admin-email langmen@126.com --admin-pass 'CJLqh@163'
+bash docker-02-start.sh --admin-email langmen@126.com --admin-pass 'CJLqh@163' \
+  --public-url 'https://energy.example.com'
 bash scripts/02-onboard.sh ...（参数同上，--base 换成服务器地址）
 ```
+
+**`--public-url` 要传对**（不传会自动探测本机 IP + 端口）：
+它决定客户拿到的**激活链接**和**忘记密码链接**里的地址。
+填错的表现是客户点开链接 404 / 连接被拒 —— 见
+[故障排查 → 现象 A2](/admin/troubleshoot#_现象-a2-客户账号建好了-但激活链接点开是-80-打不开)。
 
 **服务器要额外做两件事**：
 
@@ -536,7 +542,7 @@ docker compose --profile split up -d
 | `scripts/05-import-customer-data.py` | 客户台账导入 | `~/energy-app` |
 | `scripts/06-verify-e2e.sh` | 全链路验收（53 项） | `~/energy-app` |
 | `scripts/07-init-menu.sh` | 菜单重建 | `~/energy-app` |
-| `scripts/08-verify-release.sh` | 发布内容验收（56 项） | `~/energy-app` |
+| `scripts/08-verify-release.sh` | 发布内容验收（59 项） | `~/energy-app` |
 | `scripts/09-onboard-customer.sh` | **一键开通一个客户**（带演示数据） | `~/energy-app` |
 | `scripts/10-cleanup-customer.sh` | **清理一个客户**（连带遥测，含隔离校验） | `~/energy-app` |
 

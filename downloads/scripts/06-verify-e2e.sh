@@ -53,12 +53,14 @@ done
 # 本机代理会把 127.0.0.1 也接管，必须绕过
 ncurl() { curl -s --noproxy '*' -m 30 "$@"; }
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 FAILED=()
 
 C() { printf '\n\033[36m%s\033[0m\n' "$1"; }
 ok_() { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad_() { FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  \033[31m✗\033[0m %s%s\n' "$1" "${2:+  — $2}"; }
+# 跳过项：既不算通过也不算失败（前置数据不满足时用）
+warn_() { SKIP=$((SKIP+1)); printf '  \033[33m!\033[0m %s\n' "$1"; }
 chk() { if [[ "$1" -eq 0 ]]; then ok_ "$2"; else bad_ "$2" "${3:-}"; fi; }
 
 login() {
@@ -287,7 +289,7 @@ if [[ -n "$RD_ID" ]]; then
   # MQTT 通道：裸 socket 讲 MQTT 协议，不依赖 mosquitto 客户端
   if command -v python3 >/dev/null 2>&1; then
     MQ=$(python3 - "$MQTT_PORT" "$AA" <<'PY' 2>/dev/null
-import socket, struct, sys, json
+import socket, struct, sys, json, time
 port, token = int(sys.argv[1]), sys.argv[2]
 def enc_len(n):
     out = bytearray()
@@ -297,27 +299,43 @@ def enc_len(n):
         if n == 0: return bytes(out)
 def utf8(s):
     b = s.encode(); return struct.pack('!H', len(b)) + b
-try:
-    s = socket.create_connection(('127.0.0.1', port), timeout=8)
-    p = utf8('MQTT') + bytes([4, 0x82]) + struct.pack('!H', 60)
-    p += utf8('e2e-probe') + utf8(token)
-    s.sendall(bytes([0x10]) + enc_len(len(p)) + p)
-    ack = s.recv(4)
-    if len(ack) < 4 or ack[3] != 0:
-        print('CONNACK_REJECT'); sys.exit(0)
-    body = json.dumps({"energy": 2.34, "voltage_a": 219.7})
-    pub = utf8('v1/devices/me/telemetry') + body.encode()
-    s.sendall(bytes([0x30]) + enc_len(len(pub)) + pub)
-    s.close()
-    print('OK')
-except Exception as e:
-    print('ERR:' + str(e))
+# 重试 5 次、每次间隔 2s。
+#
+# 为什么需要：服务刚重启时 HTTP 已经 200（容器 healthy），
+# 但 MQTT transport 可能还没开始 accept —— 表现为「连接超时」，
+# 隔几十秒再跑就好了。卸载重装后立刻验收最容易撞上（实测 2026-10-22）。
+last = ''
+for attempt in range(5):
+    try:
+        s = socket.create_connection(('127.0.0.1', port), timeout=10)
+        p = utf8('MQTT') + bytes([4, 0x82]) + struct.pack('!H', 60)
+        p += utf8('e2e-probe') + utf8(token)
+        s.sendall(bytes([0x10]) + enc_len(len(p)) + p)
+        ack = s.recv(4)
+        if len(ack) < 4 or ack[3] != 0:
+            print('CONNACK_REJECT'); sys.exit(0)
+        body = json.dumps({"energy": 2.34, "voltage_a": 219.7})
+        pub = utf8('v1/devices/me/telemetry') + body.encode()
+        s.sendall(bytes([0x30]) + enc_len(len(pub)) + pub)
+        s.close()
+        print('OK')
+        sys.exit(0)
+    except Exception as e:
+        last = '%s: %s' % (type(e).__name__, e)
+        if attempt < 4:
+            time.sleep(2)
+print('ERR:' + last + '（已重试 5 次）')
 PY
 )
     [[ "$MQ" == "OK" ]] && ok_ "MQTT 连接与发布成功（端口 ${MQTT_PORT}）" || bad_ "MQTT 失败（${MQ}）"
-    sleep 3
-    V=$(TAPI "/api/plugins/telemetry/DEVICE/$RD_ID/values/timeseries?keys=voltage_a" | jget "d['voltage_a'][0]['value']")
-    [[ "$V" == "219.7" ]] && ok_ "MQTT 上报值已落库（${V}）" || bad_ "MQTT 上报未落库（读回 ${V}）"
+    # 落库是异步的：轮询最多 20s，别用固定 sleep 赌
+    V=""
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      V=$(TAPI "/api/plugins/telemetry/DEVICE/$RD_ID/values/timeseries?keys=voltage_a" | jget "d['voltage_a'][0]['value']" 2>/dev/null)
+      [[ "$V" == "219.7" ]] && break
+      sleep 2
+    done
+    [[ "$V" == "219.7" ]] && ok_ "MQTT 上报值已落库（${V}）" || bad_ "MQTT 上报未落库（读回 ${V:-空}）"
   fi
 else
   bad_ "找不到进线总表，跳过上报检查"
@@ -444,12 +462,22 @@ print(round(tot,2), round(sum(agg.values()),2), (d.get('scheme') or '-'))" 2>/de
   # 与库内原始遥测交叉核对
   if [[ -f .env ]]; then
     set -a; . ./.env 2>/dev/null; set +a
+    # 只统计「整点」的点。
+    #
+    # 为什么：本脚本第 3 节会往这台设备注入几条 energy 上报（HTTP 1.23 / MQTT 2.34），
+    # 时间戳是当前时刻（秒数≠0）。这些点没有上一条表底可做差，
+    # 报表按「表底差值」口径必然不算它们；而直接 SUM 会算进去 ——
+    # 于是每跑一次验收就多差 3.57，跑 5 次差 17.85（实测 2026-10-22）。
+    # 演示数据是按整点生成的（秒=0），过滤秒数即可精确对齐两边口径。
     DBV=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc \
       "SELECT round(sum(dbl_v)::numeric,2) FROM ts_kv t
        JOIN key_dictionary k ON k.key_id=t.key
        JOIN device d ON d.id=t.entity_id
-       WHERE d.id='$RD_ID'::uuid AND k.key='energy' AND t.ts >= $FROM AND t.ts <= $TO" 2>/dev/null | tr -d ' ')
-    if [[ -n "$DBV" && -n "$T1" ]]; then
+       WHERE d.id='$RD_ID'::uuid AND k.key='energy' AND t.ts >= $FROM AND t.ts <= $TO
+         AND EXTRACT(second FROM to_timestamp(t.ts/1000)) = 0" 2>/dev/null | tr -d ' ')
+    if [[ "${DBV:-0}" == "0" || -z "$DBV" ]]; then
+      warn_ "库内没有整点遥测（演示数据可能缺失），跳过与报表的交叉核对"
+    elif [[ -n "$T1" ]]; then
       DIFF=$(python3 -c "print(abs(float('$DBV')-float('$T1')))" 2>/dev/null)
       LESS=$(python3 -c "print(1 if $DIFF <= 0.05 else 0)" 2>/dev/null)
       [[ "$LESS" == "1" ]] \

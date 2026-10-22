@@ -20,7 +20,7 @@
 
 | 页 | 内容 |
 | --- | --- |
-| [⑤ 常见问题](/admin/troubleshoot) | 登录失败、报表空白、上报不通、磁盘满、密码重置 |
+| [⑤ 常见问题](/admin/troubleshoot) | 登录失败、报表空白、上报不通、磁盘满、密码重置；**系统架构图（容器 / 数据模型 / 自建表 / 费率 / 闲时链路）**；**运维 SQL 22 组** |
 
 ---
 
@@ -37,7 +37,8 @@ cd /你的路径/iot-rule-engine
 bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
 cd ~/energy-app
 bash docker-01-install.sh
-bash docker-02-start.sh --admin-email langmen@126.com --admin-pass 'CJLqh@163'
+bash docker-02-start.sh --admin-email langmen@126.com --admin-pass 'CJLqh@163' \
+  --public-url 'http://<你的IP>:8090'
 
 # 3. 初始化数据（用户 / 字典 / 档案 / 规则 / 菜单 / 演示数据一次到位）
 bash scripts/02-onboard.sh \
@@ -69,7 +70,7 @@ bash scripts/08-verify-release.sh \
   --customer customer@126.com --customer-pass '12345678'
 ```
 
-期望 `通过 56 项`。失败项会直接给出修法，多数可以点「平台自检 → 一键修复初始化」解决。
+期望 `通过 59 项`。失败项会直接给出修法，多数可以点「平台自检 → 一键修复初始化」解决。
 
 详见[③ 数据初始化](/admin/init)的「第 0 条」。
 

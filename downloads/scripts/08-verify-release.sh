@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=56
+EXPECTED_PASS=59
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -499,6 +499,42 @@ if [[ "$SKIP_UI" != "true" ]]; then
        "$BASE/api/energy/alarm-rules" | grep -q '^\(404\|500\)$'; then
     ok "场站告警规则接口已下线"
   fi
+fi
+
+# ---------------------------------------------------------------- H. 自建表（抄表 / 账单）
+#
+# 这 4 张表是本平台自建的（不属于 TB），DDL 曾只手工建在开发库上，
+# 新装出来的库一张都没有 → 抄表与手工填报 7 个接口全 500（2026-10-22）。
+# 现在由 EnergySchemaInstaller 在启动时自动建，这里断言它真的建了。
+if [[ -f .env ]]; then
+  set -a; . ./.env 2>/dev/null; set +a
+  MISSING=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc "
+    SELECT string_agg(t, ', ')
+    FROM unnest(ARRAY['meter_reading_batch','meter_reading_record',
+                      'billing','billing_detail','tb_sync_log']) AS t
+    WHERE to_regclass('public.'||t) IS NULL;" 2>/dev/null | tr -d ' ')
+
+  if [[ -z "$MISSING" ]]; then
+    ok "自建表齐全（抄表批次/明细 · 账单/明细 · 同步日志）"
+  else
+    bad "自建表缺失：${MISSING}" "重启 energy-server 让它自动建；仍失败看日志 grep energy-schema"
+  fi
+
+  # 分区函数：抄表写入前会调它，缺了跨月就写不进去
+  HASFN=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc "
+    SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE n.nspname='public' AND p.proname='energy_ensure_reading_partition';" 2>/dev/null | tr -d ' ')
+  [[ "${HASFN:-0}" == "1" ]] \
+    && ok "抄表分区函数存在（跨月自动建分区）" \
+    || bad "抄表分区函数 energy_ensure_reading_partition 缺失" "同上，重启服务自动补建"
+
+  # 当前月分区必须已在，否则本月第一笔抄表会报 no partition found
+  THISM=$(date +%Y_%m)
+  HASPART=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc "
+    SELECT count(*) FROM pg_class WHERE relname='meter_reading_record_${THISM}' AND relkind='r';" 2>/dev/null | tr -d ' ')
+  [[ "${HASPART:-0}" -ge 1 ]] \
+    && ok "本月分区已建（meter_reading_record_${THISM}）" \
+    || bad "本月分区 meter_reading_record_${THISM} 不存在" "调用 SELECT energy_ensure_reading_partition(date_trunc('month', now())::date);"
 fi
 
 # ================================================================
