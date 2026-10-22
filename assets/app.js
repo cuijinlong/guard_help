@@ -166,7 +166,9 @@
 
     // 站内短链：/admin/deploy、/user/quick-start 这类写法也要走 hash 路由。
     // /downloads/ 下是真实文件（脚本与 SQL），必须保持原样。
-    html = html.replace(/href="\/(admin|user)\/([a-z0-9-]+)"/g,
+    // item id 的字符集要放宽：manifest 里允许 02b-cassandra 这类带点/数字的 id，
+    // 早先只写 [a-z0-9-]，写成 /admin/xxx.yyy 这种链接就匹配不到，点进去变「页面不存在」。
+    html = html.replace(/href="\/(admin|user)\/([a-zA-Z0-9._-]+)"/g,
       (match, section, item) => `href="#/${section}/${item}"`);
 
     return html;
@@ -248,7 +250,10 @@
 
   async function init() {
     try {
-      const res = await fetch(CONTENT_BASE + 'manifest.json', { cache: 'no-cache' });
+      // 加时间戳：单纯 cache:'no-cache' 只约束浏览器，CDN 边缘仍可能返回旧副本，
+      // 表现为「改了 manifest，侧边栏还是旧的」。manifest 仅 2KB，代价可忽略。
+      const res = await fetch(CONTENT_BASE + 'manifest.json?v=' + Date.now(),
+                              { cache: 'no-cache' });
       manifest = await res.json();
       versionEl.textContent = manifest.version || '';
       if (manifest.sections.length) {

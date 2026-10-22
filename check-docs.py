@@ -34,6 +34,7 @@
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -426,6 +427,60 @@ def main() -> int:
     print('-' * (sum(w) + 8))
 
     # 手册 SQL 可跑性（可选，依赖数据库在跑）
+    # ---------------- 手册页面完整性 ----------------
+    # 站点由 content/manifest.json 驱动导航：每个 item 的 file 必须真实存在，
+    # 否则侧边栏点进去就是「没有找到 admin/xxx 这一页」。
+    # 这类错误 check-docs 原来完全没查（实测踩过：新增的 cassandra 页在
+    # manifest 里登记了，但没人验证文件在不在）。
+    manifest_errors: list[str] = []
+    manifest_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'content', 'manifest.json')
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding='utf-8') as f:
+            manifest = json.load(f)
+        seen_items: set[tuple[str, str]] = set()
+        for section in manifest.get('sections', []):
+            for item in section.get('items', []):
+                key = (section.get('id', ''), item.get('id', ''))
+                if key in seen_items:
+                    manifest_errors.append(f'重复的路由 {key[0]}/{key[1]}（manifest 里登记了两次）')
+                seen_items.add(key)
+
+                rel = item.get('file', '')
+                if not rel:
+                    manifest_errors.append(f'{key[0]}/{key[1]} 缺 file 字段')
+                    continue
+                fpath = os.path.join(os.path.dirname(manifest_path), rel)
+                if not os.path.exists(fpath):
+                    manifest_errors.append(f'{key[0]}/{key[1]} 指向的 {rel} 不存在')
+                    continue
+                if os.path.getsize(fpath) == 0:
+                    manifest_errors.append(f'{rel} 是空文件')
+
+        # 反向：content 下有 .md 但没登记 → 写了却进不去（漏登记）
+        content_dir = os.path.dirname(manifest_path)
+        for root, _dirs, files in os.walk(content_dir):
+            for fn in files:
+                if not fn.endswith('.md'):
+                    continue
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, content_dir)
+                if not any(i.get('file') == rel
+                           for sec in manifest.get('sections', [])
+                           for i in sec.get('items', [])):
+                    manifest_errors.append(f'{rel} 未在 manifest 登记（写了但侧边栏进不去）')
+
+    if manifest_errors:
+        failed += len(manifest_errors)
+        print(f'\n✗ 手册页面完整性有 {len(manifest_errors)} 处问题：')
+        for e in manifest_errors:
+            print(f'    · {e}')
+        print('  改完重新运行；页面必须在 manifest 登记，file 必须真实存在。')
+    else:
+        n_items = sum(len(sec.get('items', [])) for sec in
+                      json.load(open(manifest_path, encoding='utf-8')).get('sections', [])) \
+                  if os.path.exists(manifest_path) else 0
+        print(f'✓ 手册页面完整（manifest 登记 {n_items} 页，文件全部存在）')
+
     sql_ran, sql_total, sql_errors = check_doc_sql()
     if sql_total:
         if sql_errors:

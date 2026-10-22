@@ -12,8 +12,10 @@
 /content/*.md
   Cache-Control: public, max-age=300
 
+# 脚本必须能及时更新：本来 7 天（604800），改一次 app.js 用户一周拿不到新逻辑。
+# 缩短到 5 分钟 + must-revalidate：正常访问走缓存，过期后回源校验。
 /assets/*
-  Cache-Control: public, max-age=604800
+  Cache-Control: public, max-age=300, must-revalidate
 
 # 脚本与 SQL 直接下载，不在浏览器里打开
 /downloads/*
