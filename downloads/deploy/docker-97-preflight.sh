@@ -132,6 +132,54 @@ else
   warn "缺少脚本目录，跳过"
 fi
 
+# ---------------------------------------------------------------- 3c. data/ 一致性
+#
+# 为什么必须查：部件的 controllerScript、看板模板、SQL schema 都在 data/ 下，
+# 但**它们不在 jar 里** —— 容器通过挂载 ${APP_HOME}/data 读，install 也是。
+# 所以改了 guard-server/src/main/data 下的文件，不同步到部署目录等于没改，
+# 而且 jar 的 md5 检查（第 2 节）完全抓不到。
+#
+# 实测踩过（2026-10-23）：修好了 energy_management_analysis_bar 的品种加载逻辑，
+# 数据库里也 UPDATE 了，但新装环境从部署目录的旧 json 导入 —— 修复丢失。
+DATA_SRC_DIR="$ROOT/guard-server/src/main/data"
+DATA_DST_DIR="$APP_HOME/data"
+
+if [[ -d "$DATA_SRC_DIR" && -d "$DATA_DST_DIR" ]]; then
+  N=0
+  for sub in json/system/widget_types json/tenant json/system/dashboards; do
+    S="$DATA_SRC_DIR/$sub"
+    D="$DATA_DST_DIR/$sub"
+    [[ -d "$S" ]] || continue
+    if [[ ! -d "$D" ]]; then
+      bad "部署目录缺 data/${sub}（install 会导入失败）"
+      N=$((N+1))
+      continue
+    fi
+    DIFFS=$(diff -rq "$S" "$D" 2>/dev/null | grep -v '^Only in .*cassandra' | head -6)
+    if [[ -n "$DIFFS" ]]; then
+      bad "data/$sub 与仓库不一致（改了没同步）"
+      echo "$DIFFS" | sed 's/^/      /'
+      N=$((N+1))
+    fi
+  done
+  [[ "$N" == "0" ]] && ok "data/ 关键目录一致（部件 / 看板模板 / 租户默认数据）"
+
+  # SQL schema 与 Cassandra CQL：install 建库直接读它们
+  for pair in "dao/src/main/resources/sql:data/sql" "dao/src/main/resources/cassandra:data/cassandra"; do
+    S="$ROOT/${pair%%:*}"
+    D="$APP_HOME/${pair##*:}"
+    [[ -d "$S" ]] || continue
+    if [[ ! -d "$D" ]]; then
+      warn "部署目录缺 ${pair##*:}（不影响默认部署，用到时才需要）"
+      continue
+    fi
+    DIFFS=$(diff -rq "$S" "$D" 2>/dev/null | head -4)
+    [[ -n "$DIFFS" ]] && { bad "${pair##*:} 与仓库不一致"; echo "$DIFFS" | sed 's/^/      /'; N=$((N+1)); }
+  done
+else
+  warn "缺少 data 源目录或部署目录，跳过"
+fi
+
 # ---------------------------------------------------------------- 4. 服务健康
 C "4. 服务健康"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' \
