@@ -361,7 +361,7 @@ bash scripts/08-verify-release.sh \
   --customer customer@126.com --customer-pass '12345678'
 ```
 
-**期望**：`通过 61 项` / `这一版的功能点全部到位`。
+**期望**：`通过 63 项` / `这一版的功能点全部到位`。
 
 这个脚本把**这一版每一处改动**变成断言，重装后跑一遍就知道有没有漏：
 
@@ -1514,3 +1514,108 @@ bash scripts/05-import-customer-data.py --dir ./客户数据
 ```
 
 模板在 `templates/` 下：`场站.csv`、`设备.csv`、`点位.csv`。
+
+---
+
+## 九、没接 RTU 时怎么造数据（模拟器）
+
+现场板子还没到、或者要复现某个报表问题时，用 `scripts/20-rtu-simulator.py`。
+它**按 RTU 的原始代号上报**（`U` / `I` / `P` / `Ep` …），所以顺带能验证
+规则链的 key 转换节点是否在工作。
+
+### 为什么不能靠「演示数据」验证抄表
+
+演示数据是一次性写进去的静态序列。生成完几小时后，最后一次遥测已经超过
+抄表的「新鲜度窗口」（`STALE_WINDOW_MS = 10 分钟`），于是每次抄表都判
+`stale`（设备未上报新数据），台账用量永远是空 —— 看起来像抄表坏了，
+其实是数据不新鲜。模拟器能持续上报，这个问题就不存在了。
+
+### 三条命令
+
+```bash
+# 1. 看有哪些表
+./scripts/20-rtu-simulator.py --base http://127.0.0.1:8090 \
+    --tenant tenant@126.com --tenant-pass '12345678' --list
+
+# 2. 给一块表持续上报（每 60 秒一次，共 30 次）
+./scripts/20-rtu-simulator.py --base http://127.0.0.1:8090 \
+    --tenant tenant@126.com --tenant-pass '12345678' \
+    --device '单相园-1#进线总表' --interval 60 --count 30
+
+# 3. 一直跑，Ctrl-C 停
+./scripts/20-rtu-simulator.py ... --device '单相园-1#进线总表' --interval 300 --count 0
+```
+
+`--device` 支持精确名或唯一的部分匹配。名字有歧义时会列出来让你写全。
+
+### 表底（Ep）是累积值，不要乱跳
+
+模拟器的 `Ep` 单调递增，每轮把「本段用电」加进去。
+手上有历史表底时用 `--seed-reading` 接着往上跑；
+如果种子比库里已有的表底**小**，抄表会判「电量倒走」为 abnormal（这是对的，不是 bug）。
+
+### 网关模式：与真实 RTU 走同一条路
+
+```bash
+./scripts/20-rtu-simulator.py ... --mode gateway --gateway 'ED1-Gateway' \
+    --device '单相园-1#进线总表' --mqtt-host 127.0.0.1 --mqtt-port 1883
+```
+
+它发的就是 `v1/gateway/telemetry`，payload 形如：
+
+```json
+{"单相园-1#进线总表": [{"values": {"U": 232.9, "I": 14.55, "Ep": 1305.8}}]}
+```
+
+### 现场板子的设备名必须与平台一致
+
+RTU `main.py` 里的两个名字是**编译进固件的**：
+
+```python
+GATEWAY_NAME  = "ED1-Gateway"
+METER_DEVICE  = "PowerMeter-DDSU777"
+SENSOR_DEVICE = "Sensor-HZ8706"
+```
+
+网关模式靠**名字**匹配平台设备。平台上叫「单相园-1#进线总表·星河工业园」，
+板子上却发 `PowerMeter-DDSU777`，数据会全部丢掉（平台收不到就不会报错，只是没数）。
+
+**上线前对一遍**：
+
+```
+平台上的设备名  ==  rtu/main.py 里的 METER_DEVICE
+网关设备名      ==  rtu/main.py 里的 GATEWAY_NAME
+```
+
+对不上就改 `main.py` 重新烧录；一台网关带多块表时，`METER_DEVICE` 要按表逐台对应。
+
+---
+
+## 九之二、抄表的用量口径（账单准不准看这里）
+
+台账和账单上的「用量」是 **账期累计**，不是「最后一次抄表的增量」。
+
+```
+账期用量 = (账期期末表底 − 账期期初表底) × 倍率
+
+期初 = 本月第一条记录的 coalesce(prev_reading, curr_reading)
+        （首月首抄没有上月表底，就是基线值本身）
+期末 = 本月最后一条记录的 curr_reading
+```
+
+接口里两个字段都给了：
+
+| 字段 | 含义 | 用在哪 |
+| --- | --- | --- |
+| `usage` | 账期累计 | 台账、账单金额 |
+| `lastUsage` | 本次抄表的增量 | 月内对账、看「这两次之间用了多少」 |
+| `periodOpen` / `periodClose` | 期初 / 期末表底 | 核对、审计 |
+
+**为什么强调这个**：一个账期里会抄多次（首抄建基线 → 月中核对 → 月末出账）。
+若按「最后一条的增量」算，月末那次抄表只要设备没新增读数，月用量就成了 0，
+账单金额跟着变 0 —— 实测踩过：实际 94.575 kWh，台账报 0.0000。
+
+**首月为什么可能没数**：第一次抄表只建基线（`state=first`），没有上月表底就算不出用量。
+第二次抄表才开始有数。这不是故障。
+
+---

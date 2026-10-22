@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=61
+EXPECTED_PASS=63
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -577,6 +577,44 @@ if [[ -f .env ]]; then
     bad "电表 Key 标准化节点异常（节点/连线/直连 = ${MK:-空}，期望 1,2,0）" \
         "POST /api/energy/repair-init 自动补装；仍异常看手册 ③ 五之二"
   fi
+fi
+
+# ---------------------------------------------------------------- I. 接口语义与统计口径
+
+# I-1. 缺参数必须返回 400，不能是 500。
+#      500 会让前端去查服务端日志、让监控把「调用方写错」计入 5xx 告警，
+#      真正的服务故障被噪声淹没（实测 2026-10-23：tou-analysis 缺 from 返回 500）。
+CODE=$(curl -s --noproxy '*' -m 30 -o /tmp/verify_badparam.json -w '%{http_code}' \
+       -H "X-Authorization: Bearer $CTOK" "$BASE/api/energy/tou-analysis" 2>/dev/null)
+ERRC=$(jget < /tmp/verify_badparam.json "print(d.get('errorCode'))" 2>/dev/null)
+if [[ "$CODE" == "400" && "$ERRC" == "31" ]]; then
+  ok "缺参数返回 400（BAD_REQUEST_PARAMS）"
+else
+  bad "缺参数返回 ${CODE:-空} / errorCode=${ERRC:-空}，期望 400 / 31" \
+      "看 ThingsboardErrorResponseHandler.handle：参数类异常要先分流成 400"
+fi
+
+# I-2. 台账用量必须是「账期累计」，不是「最后一次抄表的增量」。
+#      一个月内多次抄表时，后者会把月用量算成 0（实测：实际 94.575 kWh → 台账 0.0000，
+#      账单金额跟着变 0）。合法值域：usage 为 null（无表底/倒走）或 >= lastUsage。
+LEDGER=$(CAPI '/api/energy/meter-reading/ledger')
+LED_OK=$(echo "$LEDGER" | jget "
+items = d.get('items') or []
+print('1' if all(x.get('periodOpen') is not None or x.get('usage') is None for x in items) and items else '0')" 2>/dev/null)
+MONO=$(echo "$LEDGER" | jget "
+bad = 0
+for x in (d.get('items') or []):
+    u, lu = x.get('usage'), x.get('lastUsage')
+    if u is not None and lu is not None:
+        try:
+            if float(u) + 1e-6 < float(lu): bad += 1
+        except Exception: pass
+print('1' if bad == 0 else '0')" 2>/dev/null)
+if [[ "$LED_OK" == "1" && "$MONO" == "1" ]]; then
+  ok "台账用量为账期累计口径（含 periodOpen/periodClose）"
+else
+  bad "台账用量口径异常（字段缺失或累计 < 本次增量）" \
+      "看 EnergyMeterReadingController.ledger：应按「期末表底 − 期初表底」计费"
 fi
 
 # ================================================================

@@ -575,10 +575,11 @@ docker compose --profile split up -d
 | `scripts/05-import-customer-data.py` | 客户台账导入 | `~/energy-app` |
 | `scripts/06-verify-e2e.sh` | 全链路验收（53 项） | `~/energy-app` |
 | `scripts/07-init-menu.sh` | 菜单重建 | `~/energy-app` |
-| `scripts/08-verify-release.sh` | 发布内容验收（61 项） | `~/energy-app` |
+| `scripts/08-verify-release.sh` | 发布内容验收（63 项） | `~/energy-app` |
 | `scripts/09-onboard-customer.sh` | **一键开通一个客户**（带演示数据） | `~/energy-app` |
 | `scripts/10-cleanup-customer.sh` | **清理一个客户**（连带遥测，含隔离校验） | `~/energy-app` |
 | `scripts/11-cassandra.sh` | **Cassandra 管理**（status/init/enable/disable/uninstall） | `~/energy-app` |
+| `scripts/20-rtu-simulator.py` | **RTU 模拟器**（无硬件时造新鲜数据；顺带验 key 转换） | `~/energy-app` |
 
 > `docker-00` 与 `docker-97` / `docker-98` **只在仓库里**，不要从部署目录找 ——
 > 它们要读仓库源码。
@@ -587,7 +588,7 @@ docker compose --profile split up -d
 
 ```
 docker-compose.yml  docker-01-install.sh  docker-02-start.sh  docker-99-uninstall.sh
-scripts/01..11-*.sh  scripts/05-import-customer-data.py
+scripts/01..11-*.sh  scripts/05-import-customer-data.py  scripts/20-rtu-simulator.py
 ```
 
 **改脚本的铁律**：

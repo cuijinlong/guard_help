@@ -500,6 +500,68 @@ group by k.key order by 2 desc;"
 
 ---
 
+### 现象 K：抄表能跑，但台账用量是 0 / 账单金额是空的
+
+**先看是哪种 0**：
+
+```bash
+curl --noproxy '*' -s -H "X-Authorization: Bearer $TOKEN" \
+  "$BASE/api/energy/meter-reading/ledger?period=2026-10" \
+  | jq '.items[] | {deviceName, usage, lastUsage, periodOpen, periodClose}'
+```
+
+| 看到什么 | 含义 | 怎么办 |
+| --- | --- | --- |
+| `usage: null`，`periodOpen: null` | 本月只有一次抄表（首抄建基线）| 等下一次抄表；不是故障 |
+| `usage: null`，`periodClose` 有值 | 表底倒走或读不到表底 | 查现场表计/倍率 |
+| `usage: 0` 但 `periodOpen == periodClose` | 本月确实没新增用电 | 正常 |
+| 设备全部 `quality: estimated`、`reason` 含「数据陈旧」 | 遥测超过 10 分钟没更新 | 看下一条 |
+
+**「数据陈旧」是抄表最常见的空数原因**
+
+抄表要的是「此刻的读数」，不是「最后一次读到的数」。设备超过
+`STALE_WINDOW_MS = 10 分钟` 没上报，一律判 `stale` 而不拿旧值充数。
+
+- 真实设备：查网关在线、看 `/api/noauth/energy/health`、重启 RTU
+- 演示环境 / 没有硬件：用模拟器持续上报
+
+```bash
+./scripts/20-rtu-simulator.py --base http://127.0.0.1:8090 \
+    --tenant tenant@126.com --tenant-pass '12345678' \
+    --device '单相园-1#进线总表' --interval 60 --count 0
+```
+
+**如果 usage 明显小于实际用电**（例如本月用了 94 kWh，台账只报 0.313）
+
+那是旧版本的「取最后一次增量」口径。正确口径是「账期累计」：
+账期用量 = 期末表底 − 期初表底。升级后 `usage` 就是累计值，
+`lastUsage` 保留本次增量。详见手册 **③ 九之二、抄表的用量口径**。
+
+---
+
+### 现象 L：接口返回 500「Required request parameter ... is not present」
+
+**这是调用方少传了参数，不是服务端故障。** 正确状态码应该是 `400` +
+`errorCode=31`（`BAD_REQUEST_PARAMS`）。
+
+如果看到的是 `500` / `errorCode=2`（`GENERAL`），说明异常处理器把它当成了
+服务端错误 —— 后果是前端去查数据库日志、监控把参数错误计入 5xx 告警。
+
+修复后应该是：
+
+```bash
+curl --noproxy '*' -s -o /dev/null -w '%{http_code}\n' \
+  -H "X-Authorization: Bearer $TOKEN" "$BASE/api/energy/tou-analysis"
+# 期望 400
+```
+
+代码位置：`ThingsboardErrorResponseHandler.handle` —— 参数类异常要在兑底分支里
+提前分流。**不要**用 `@ExceptionHandler` 单独声明这两个异常：父类
+`ResponseEntityExceptionHandler` 已经注册过，再写一遍会让 Spring 启动时抛
+`Ambiguous @ExceptionHandler method mapped for ...`，服务直接起不来。
+
+---
+
 ## 1. 全新部署卡在第一步：setup 接口返回 423
 
 **现象**
