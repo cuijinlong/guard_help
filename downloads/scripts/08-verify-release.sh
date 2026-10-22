@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=67
+EXPECTED_PASS=68
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -720,6 +720,50 @@ if [[ "$DUP" == "1" ]]; then
   ok "账单号唯一（每个客户/账期/品种/表码一张）"
 else
   bad "账单号有重复" "看 EnergyBillingService.billingNo：必须带 meterNo 或设备 id 前 8 位"
+fi
+
+# I-3d. 演示数据的用电层级必须守恒：父表 >= Σ 子表。
+#
+#      这是演示数据「看起来真实」的底线。客户会拿进线表底减去各分项之和，
+#      差值应当等于线损 + 未装表负荷（正数），而不是负数。
+#
+#      实测踩过（2026-10-23）：手工用模拟器注入 --seed-reading 2800 到一个
+#      表底已到 6.7 万的车间总表上，min(表底) 被拉到 2800，
+#      于是「车间 64,980 + 办公 3,917 = 68,897 > 进线 68,109」——
+#      看着像演示数据算错，实际是测试污染。这个断言就是为了让这类问题
+#      在验收时直接暴露，而不是靠人肉盯数。
+if [[ -f .env ]]; then
+  set -a; . ./.env 2>/dev/null; set +a
+  HIER=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc "
+    WITH span AS (
+        SELECT v.entity_id, max(v.dbl_v) - min(v.dbl_v) AS delta
+        FROM ts_kv v JOIN key_dictionary k ON k.key_id = v.key AND k.key = 'energy_reading'
+        GROUP BY v.entity_id
+    ),
+    edge AS (
+        SELECT r.from_id AS pid, r.to_id AS cid
+        FROM relation r
+        JOIN device pf ON pf.id = r.from_id
+        JOIN device cf ON cf.id = r.to_id
+        WHERE r.relation_type_group = 'COMMON' AND r.relation_type = 'Contains'
+    ),
+    bad AS (
+        SELECT DISTINCT pf.name AS pname, sp.delta AS pdelta, SUM(sc.delta) AS cdelta
+        FROM edge e
+        JOIN device pf ON pf.id = e.pid
+        JOIN span sp ON sp.entity_id = e.pid
+        JOIN span sc ON sc.entity_id = e.cid
+        GROUP BY pf.name, sp.delta, e.pid
+        HAVING sp.delta < SUM(sc.delta) - 0.5
+    )
+    SELECT COALESCE(string_agg(pname || ' ' || round(pdelta::numeric,1) || '<' || round(cdelta::numeric,1), '; '), '')
+    FROM bad;" 2>/dev/null | tr -d '\r')
+  if [[ -z "$HIER" ]]; then
+    ok "演示用电层级守恒（父表 >= Σ 子表，差值 = 线损 + 未装表）"
+  else
+    bad "父表小于子表之和：${HIER}" \
+        "多为手工注入表底造成（换表 / 重放数据）—— 看手册 ③ 九之四：总分差为负怎么办"
+  fi
 fi
 
 # I-4. 现场补抄提交后，记录列表必须能读到 fieldStatus。

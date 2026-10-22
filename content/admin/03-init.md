@@ -361,7 +361,7 @@ bash scripts/08-verify-release.sh \
   --customer customer@126.com --customer-pass '12345678'
 ```
 
-**期望**：`通过 67 项` / `这一版的功能点全部到位`。
+**期望**：`通过 68 项` / `这一版的功能点全部到位`。
 
 这个脚本把**这一版每一处改动**变成断言，重装后跑一遍就知道有没有漏：
 
@@ -1687,6 +1687,109 @@ DELETE /api/customer/asset/{assetId}                    取消（归还租户）
 不告警的话，页面上是一张正常的图 + 一个错数，查一个月也查不出来。
 
 ---
+
+---
+
+## 九之四、总分差为负怎么办（用电层级）
+
+### 演示数据的层级是**算出来的**，不是各自随机
+
+```
+末端表   energy[h] = 基准 × 负荷系数 × 确定性扰动
+上级表   energy[h] = Σ 下级表 energy[h] × (1 + 未装表率) × (1 + 线损率)
+```
+
+所以每一层都严格满足：
+
+```
+进线表底增量  =  Σ 各分项表底增量 × 系数
+```
+
+实测（2026-10-23，14 天演示数据）：
+
+```
+单相园 进线 1,588.31 = (照明 815.02 + 插座 734.17) × 1.0253
+三相园 进线 68,108.89 = (车间 62,529.80 + 办公 3,917.46) × 1.0250
+       车间 62,529.80 = (空压 30,019.89 + 车床 26,191.72) × 1.1124
+```
+
+系数就是配置的线损与未装表：进线 1.025（2.5% 线损），
+车间 1.1124（3% 线损 + 8% 未装表）。
+
+### 「总分差」是物理量，不是误差
+
+客户拿进线表底减去各分项之和，得到的差额**应该为正**，含义是：
+
+```
+差额 = 线损电量 + 尚未装表的负荷（如空调、公共照明）
+```
+
+这个差额在演示数据里是设计好的，不是算错。真实项目里同样存在。
+
+### 差额变成负数 = 表底被覆盖过
+
+如果 `父表增量 < 子表增量之和`，几乎只有两种原因：
+
+| 原因 | 特征 | 怎么修 |
+| --- | --- | --- |
+| 换表 / 表计归零 | 某台表表底骤降 | 换表要在平台侧重建或重置基线 |
+| 手工/脚本写入了较低表底 | 同一时刻出现两个差异很大的值 | 删掉错误点 |
+
+**实测踩过**（2026-10-23）：用模拟器给一台表底已到 6.7 万的车间总表
+`--seed-reading 2800`，那一小时的表底被写成 2800，
+于是 `min` 被拉到 2800，「车间 64,980 + 办公 3,917 = 68,897 > 进线 68,109」。
+
+看着像演示数据算错，实际是**测试污染**。
+
+### 一句话自查
+
+```sql
+-- 应返回空；有输出就是把哪台表改成倒挂了
+WITH span AS (
+    SELECT v.entity_id, max(v.dbl_v) - min(v.dbl_v) AS delta
+    FROM ts_kv v JOIN key_dictionary k ON k.key_id = v.key AND k.key = 'energy_reading'
+    GROUP BY v.entity_id
+),
+edge AS (
+    SELECT r.from_id AS pid, r.to_id AS cid
+    FROM relation r
+    JOIN device pf ON pf.id = r.from_id
+    JOIN device cf ON cf.id = r.to_id
+    WHERE r.relation_type_group = 'COMMON' AND r.relation_type = 'Contains'
+)
+SELECT pf.name AS 父表, sp.delta AS 父增量, SUM(sc.delta) AS 子表和
+FROM edge e
+JOIN device pf ON pf.id = e.pid
+JOIN span sp ON sp.entity_id = e.pid
+JOIN span sc ON sc.entity_id = e.cid
+GROUP BY pf.name, sp.delta, e.pid
+HAVING sp.delta < SUM(sc.delta) - 0.5;
+```
+
+`08-verify-release.sh` 已把它做成常规断言（「演示用电层级守恒」），
+每次发版都查，不用人工盯。
+
+### 用模拟器续数据时不要覆盖历史表底
+
+```bash
+# 对：next 值接在库内最新表底之后
+./scripts/20-rtu-simulator.py ... --device '单相园-1#进线总表' --seed-reading 2790.18
+
+# 错：给一个比库内最小值还小的种子，min 被拉低，层级立刻倒挂
+./scripts/20-rtu-simulator.py ... --seed-reading 2800   # 库内已到 67780
+```
+
+`--seed-reading` 传**当前库内最新表底**，不是任意值。
+
+### 空调这类「没装表」的分项
+
+演示数据里「空调虚拟表」是**独立分项**，不进进线表的层级：
+
+- 有实表的分项（照明、插座、动力）→ 走采集，进线表底包含它们
+- 没装表的分项（空调、其他水表）→ 走手工填报，按月填数
+
+两者互斥、不重不漏 —— 虚拟表不再当汇总表，否则同一度电会被算两次。
+所以核对总分差时，虚拟表不参与。
 
 ---
 
