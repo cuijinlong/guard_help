@@ -628,6 +628,56 @@ DELETE /api/customer/device/{id}   → customer_id = NULL_UUID（租户所有）
 
 ---
 
+### 现象 O：账单出不来 / 金额是 0 / 账单数比表少
+
+**先看返回里的 `reason`** —— 出账接口对每台表都会说明为什么没出：
+
+```bash
+curl ... -d '{"period":"2026-10","dryRun":true}' /api/energy/billing/generate \
+  | jq '.items[] | select(.usable==false) | {deviceName, reason}'
+```
+
+四种最常见的原因：
+
+| reason | 原因 | 处理 |
+| --- | --- | --- |
+| 设备档案未声明 energyTypeCode | 档案没绑定能源品种 | 设备档案 → 编辑 → 能源品种 |
+| 未配置「elec」的电价 | 三级费率都没配 | 场站/组织/客户任一处配价 |
+| 设备未归属任何客户 | 账单要开给客户 | 把设备分配给客户 |
+| 本账期读数不足两点 | 新接入或设备离线 | 等上报；或用 20-rtu-simulator.py |
+
+**账单数比表少很多（例如 17 台只剩 4 张）** → 账单号重复，后一张覆盖前一张。
+账单号必须带表码：`BILL-<客户码>-<账期>-<品种>-<表码>`。
+
+```bash
+# 查有没有重名（正常应为 0）
+curl ... "/api/energy/billing/summary?period=2026-10" | jq '.items[].billingNo' | sort | uniq -d
+```
+
+**金额是 0**：
+
+- 电度费 0 → 单价没配到该品种，或 `fixedPrice` 写成了 `prices.flat`（错误结构）
+- 只有基本电费 → 该表没用量（表底没变或读数不足）
+
+**基本电费被重复收了很多次** → 检查 `meterLevel`。
+基本电费/力调电费只计入线总表（`meterLevel=1`）。
+如果所有表都被打了 level 1，就会出现 11 × 1600 元这种账单。
+
+```bash
+docker exec energy-postgres psql -U postgres -d thingsboard -At -F' | ' -c "
+select d.name, coalesce(a.dbl_v::text,a.str_v) lvl
+from device d left join attribute_kv a on a.entity_id=d.id
+left join key_dictionary k on k.key_id=a.attribute_key and k.key='meterLevel'
+where d.name like '%进线%' or d.name like '%分项%' order by lvl;"
+```
+
+**已经付款的账单被重算改了** → 不应该发生。
+受保护的账单状态是 `paid` / `void`，重算返回 `action=skipped-paid` 并保留全部字段。
+若发现被改，检查 `EnergyBillingService.upsertBill` 是否还在用 `readAttrJson` 读状态
+（status 是字符串属性，必须用 `attributesOf`）。
+
+---
+
 ## 1. 全新部署卡在第一步：setup 接口返回 423
 
 **现象**

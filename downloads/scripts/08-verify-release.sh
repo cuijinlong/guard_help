@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=65
+EXPECTED_PASS=67
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -598,9 +598,18 @@ fi
 #      一个月内多次抄表时，后者会把月用量算成 0（实测：实际 94.575 kWh → 台账 0.0000，
 #      账单金额跟着变 0）。合法值域：usage 为 null（无表底/倒走）或 >= lastUsage。
 LEDGER=$(CAPI '/api/energy/meter-reading/ledger')
+# 有账单时 usage 合法地来自账单（计费口径），此时不要求 periodOpen；
+# 没有账单时才必须能追溯到「期初/期末表底」。
 LED_OK=$(echo "$LEDGER" | jget "
 items = d.get('items') or []
-print('1' if all(x.get('periodOpen') is not None or x.get('usage') is None for x in items) and items else '0')" 2>/dev/null)
+def ok(x):
+    if x.get('usage') is None:
+        return True
+    if x.get('usageSource') == 'bill':
+        b = x.get('bill') or {}
+        return b.get('billUsage') is not None and abs(float(x['usage']) - float(b['billUsage'])) < 1e-4
+    return x.get('periodOpen') is not None
+print('1' if items and all(ok(x) for x in items) else '0')" 2>/dev/null)
 MONO=$(echo "$LEDGER" | jget "
 bad = 0
 for x in (d.get('items') or []):
@@ -670,6 +679,47 @@ print(int(d.timestamp()*1000), int((d+datetime.timedelta(days=1)).timestamp()*10
   else
     bad "峰谷分析核对跳过：找不到有设备的维度" "确认演示数据已生成"
   fi
+fi
+
+# I-3b. 出账必须能跑通，且账单金额 = 四项费用之和。
+#
+#      账单是客户最终看到的东西，金额算错比页面报错严重得多。
+#      这里只做结构性校验（能出账 / 金额自洽 / 幂等），
+#      具体单价的复算由手册里的「三步核对」人工完成。
+BILL=$(curl -s --noproxy '*' -m 60 -X POST \
+       -H "X-Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+       -d "{\"period\":\"$(date +%Y-%m)\",\"dryRun\":true}" \
+       "$BASE/api/energy/billing/generate" 2>/dev/null)
+BILL_N=$(echo "$BILL" | jget "print(d.get('total') or 0)" 2>/dev/null)
+BILL_OK=$(echo "$BILL" | jget "
+items = [x for x in (d.get('items') or []) if x.get('usable')]
+def ok(x):
+    try:
+        parts = [float(x.get(k) or 0) for k in ('energyFee','basicFee','powerFactorFee','surchargeFee')]
+        return abs(sum(parts) - float(x.get('amount') or 0)) < 0.02
+    except Exception:
+        return False
+print('1' if items and all(ok(x) for x in items) else '0')" 2>/dev/null)
+if [[ "${BILL_N:-0}" -gt 0 && "$BILL_OK" == "1" ]]; then
+  ok "出账试算通过（${BILL_N} 台表，金额四项合计自洽）"
+elif [[ "${BILL_N:-0}" -eq 0 ]]; then
+  bad "出账试算没有任何明细" "检查 /api/energy/billing/generate 返回的 items 与失败原因"
+else
+  bad "账单金额与四项费用之和对不上" "看 EnergyBillingService.billOne：energyFee+basicFee+powerFactorFee+surchargeFee 应等于 amount"
+fi
+
+# I-3c. 账单号必须含表码，否则同客户同品种的多块表会互相覆盖。
+#
+#      实测踩过：账单号只到「客户+账期+能源」时，11 块电表算出同一个号，
+#      后一笔覆盖前一笔，17 台表出完账只剩 4 张。
+DUP=$(TAPI '/api/energy/billing/summary?period='"$(date +%Y-%m)" | jget "
+items = d.get('items') or []
+codes = [x.get('billingNo') for x in items]
+print('1' if len(codes) == len(set(codes)) else '0')" 2>/dev/null)
+if [[ "$DUP" == "1" ]]; then
+  ok "账单号唯一（每个客户/账期/品种/表码一张）"
+else
+  bad "账单号有重复" "看 EnergyBillingService.billingNo：必须带 meterNo 或设备 id 前 8 位"
 fi
 
 # I-4. 现场补抄提交后，记录列表必须能读到 fieldStatus。
