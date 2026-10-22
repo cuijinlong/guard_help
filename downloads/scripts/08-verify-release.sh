@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=60
+EXPECTED_PASS=61
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -551,6 +551,32 @@ if [[ -f .env ]]; then
   [[ "${HASPART:-0}" -ge 1 ]] \
     && ok "本月分区已建（meter_reading_record_${THISM}）" \
     || bad "本月分区 meter_reading_record_${THISM} 不存在" "调用 SELECT energy_ensure_reading_partition(date_trunc('month', now())::date);"
+
+  # 电表 Key 标准化节点：缺了不会报错 —— 上报照样 200，但原始代号
+  # U/I/P/Ep 原样落库，报表按标准名取数就是空的（2026-10-23）。
+  # 同时要求没有 Switch → Save 的直连（它会让转换节点被绕过）。
+  MK=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc "
+    WITH root AS (SELECT rule_chain_id FROM rule_node WHERE name='电表Key标准化' LIMIT 1)
+    SELECT (SELECT count(*) FROM rule_node WHERE name='电表Key标准化'
+              AND type='org.thingsboard.rule.engine.transform.TbTransformMsgNode')
+        || ',' ||
+           (SELECT count(*) FROM relation r
+              JOIN rule_node n1 ON n1.id=r.from_id JOIN rule_node n2 ON n2.id=r.to_id
+             WHERE r.relation_type_group='RULE_NODE' AND n1.rule_chain_id=(SELECT rule_chain_id FROM root)
+               AND ((n1.name='Message Type Switch' AND r.relation_type='Post telemetry' AND n2.name='电表Key标准化')
+                 OR (n1.name='电表Key标准化' AND r.relation_type='Success' AND n2.name='Save Timeseries')))
+        || ',' ||
+           (SELECT count(*) FROM relation r
+              JOIN rule_node n1 ON n1.id=r.from_id JOIN rule_node n2 ON n2.id=r.to_id
+             WHERE r.relation_type_group='RULE_NODE' AND n1.rule_chain_id=(SELECT rule_chain_id FROM root)
+               AND n1.name='Message Type Switch' AND n2.name='Save Timeseries'
+               AND r.relation_type='Post telemetry');" 2>/dev/null | tr -d ' ')
+  if [[ "${MK}" == "1,2,0" ]]; then
+    ok "电表 Key 标准化节点就绪（节点 1 · 连线 2 · 无直连）"
+  else
+    bad "电表 Key 标准化节点异常（节点/连线/直连 = ${MK:-空}，期望 1,2,0）" \
+        "POST /api/energy/repair-init 自动补装；仍异常看手册 ③ 五之二"
+  fi
 fi
 
 # ================================================================

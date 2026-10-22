@@ -314,12 +314,30 @@ curl -s --noproxy '*' -H "X-Authorization: Bearer $TOK" \
 - 资产档案（14 个）
 - 设备档案上的告警规则 + 派生指标（11 条）
 - 租户菜单（11 项）、客户菜单（13 项，含首页看板绑定）
-- 客户看板里指向**租户级资产**的真实 id（会让客户 403 刷屏；换回占位符）
+- 客户看板里指向**租户级资产**的真实 id（会让客户 403 刷屏；自动换回占位符）
 - 「峰谷时段」看板：改名 + 6 个部件重叠修正
 
 **不动**场站、分项、设备、遥测 —— 那是客户自己的账。
 整个过程 10–30 秒，跑完自动刷新自检结果。
-返回里的 `dashboardsFixed` / `configCenterFixed` 分别是修好的看板数。
+返回里几个关键字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `dashboardsFixed` | 补了「该替换却没替换」的占位符（客户看板显示空图） |
+| `tenantAssetLeaksFixed` | **回退了「不该替换却替换了」的租户级 id**（客户 403 刷屏） |
+| `configCenterFixed` | 「峰谷时段」看板改名与布局修正 |
+| `menusFixed` | 客户菜单首项不是落地页的，重建 |
+| `labelsFixed` | 设备/分类显示名带「·客户名」后缀的，去掉 |
+
+实测一次真实修复：
+
+```
+POST /api/energy/repair-init
+  dashboardsFixed        = 0
+  tenantAssetLeaksFixed  = 10     ← 10 个客户看板回退了租户级引用
+```
+
+修完自检 17 项全 `OK`，客户打开看板不再有 403/404。
 
 命令行等价：
 
@@ -343,7 +361,7 @@ bash scripts/08-verify-release.sh \
   --customer customer@126.com --customer-pass '12345678'
 ```
 
-**期望**：`通过 60 项` / `这一版的功能点全部到位`。
+**期望**：`通过 61 项` / `这一版的功能点全部到位`。
 
 这个脚本把**这一版每一处改动**变成断言，重装后跑一遍就知道有没有漏：
 
@@ -690,6 +708,93 @@ curl -s --noproxy '*' -X POST \
 每套含 `blocks`：`[{type, start, end}]`，档位 `tip/peak/flat/valley/deep`。
 
 **时段必须首尾相接、无空洞**（`00:00` 到 `24:00` 全覆盖）。有空洞的小时会被归「平」。
+
+---
+
+## 五之二、电表 Key 标准化节点
+
+现场 RTU 按**厂家手册**发数据，键名是 `U` / `I` / `P` / `Ep` 这种原始代号；
+平台所有报表、告警、账单只认一套标准名：
+
+```
+RTU 原始代号          平台标准名
+U              →     voltage_a
+I              →     current_a
+P              →     power_total
+Q              →     reactive_power_total
+S              →     apparent_power_total
+PF             →     power_factor_total
+Freq           →     frequency
+Ep             →     energy_reading
+```
+
+翻译发生在**根规则链**里，不在设备侧 —— 换厂家不用重烧固件：
+
+```
+设备上报
+   │
+   ▼
+[Message Type Switch] --Post telemetry--> [电表Key标准化] --Success--> [Save Timeseries]
+```
+
+### 为什么必须由平台装好
+
+节点缺了**不报错**：
+
+- 上报接口照样返回 `200`
+- `ts_kv` 里存的是 `U` / `I` / `P`，不是 `voltage_a`
+- 报表按标准名取数 → **全空**
+
+所以它被纳入「平台自检」和「一键修复初始化」：
+
+```bash
+curl --noproxy '*' -s -X POST \
+  -H "X-Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8090/api/energy/repair-init | jq '.meterKeyTransformFixed'
+```
+
+第一次装会返回 `true`；已经装好时返回 `false`（幂等）。
+自检里对应项是 `tenant.meter-key-transform`。
+
+### 自己改脚本时的两条硬约束
+
+规则节点的 JS 由平台包装后执行，**入参已经是对象、返回值会被再序列化一次**：
+
+```js
+function wrapper(msgStr, metadataStr, msgType) {
+    var msg = JSON.parse(msgStr);        // 传入脚本时 msg 已经是对象
+    var metadata = JSON.parse(metadataStr);
+    return JSON.stringify(ruleNodeFunc(msg, metadata, msgType));  // 返回值会被 stringify
+}
+```
+
+由此：
+
+- **不要**在脚本里再 `JSON.parse(msg)` / `JSON.parse(metadata)`
+  → 会抛异常，脚本走 `catch` 后原样返回，表现为「节点配了但数据没转换」
+- **不要**在脚本里 `JSON.stringify(...)` 返回值
+  → 会得到带引号的字符串，`Save Timeseries` 报 `Can't parse value`
+
+正确写法（节选）：
+
+```js
+var out = {};
+out["voltage_a"] = msg["U"];
+return {msg: out, metadata: metadata, msgType: msgType};
+```
+
+### 验证
+
+```bash
+# 1. 节点在不在（应为 1）
+docker exec energy-postgres psql -U postgres -d thingsboard -At -c \
+  "select count(*) from rule_node where name='电表Key标准化';"
+
+# 2. 上报一组原始代号，6 秒后看标准名是否更新
+#    原始键 U 的时间戳应停在本次上报之前
+```
+
+**只转换表里列出的代号**，其它 key 原样保留 —— 已经上报标准名的设备重复经过本节点也不会被改坏。
 
 ---
 

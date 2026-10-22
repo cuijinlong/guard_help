@@ -380,11 +380,39 @@ WHERE a.id IN (SELECT id FROM ta)
 
 有任何一行 → 就是这个问题。期望 **0 行**。
 
-**修法一（代码已修，新客户不再出现）**：
-`buildDashboardPlaceholders()` 已把「能源参数字典」「电能品种」从替换表移除，
-保持占位符。部件改用 `/api/energy/metric-params` 取品种（客户与租户都 200）。
+**修法一（推荐）：点「平台自检 → 一键修复初始化」**
 
-**修法二（存量客户，直接改数据）**：
+不用写 SQL、不用懂原理。`repair-init` 会自动：
+
+1. 找出所有租户级资产的 id
+2. 扫描每个客户的看板 config
+3. 把落在里面的租户级 id 换回占位符
+
+返回里看 `tenantAssetLeaksFixed` 这个数（修好的看板数）：
+
+```bash
+TOK=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+
+curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOK" \
+  http://127.0.0.1:8090/api/energy/repair-init
+# {"dashboardsFixed":0,"tenantAssetLeaksFixed":10,...}
+```
+
+**平台自检里也能先看到问题**（新增检查项 `customer.dashboard-tenant-leaks`）：
+
+```
+customer.dashboard-tenant-leaks   看板无租户级资产引用   实际 10 / 期望 0 处   ✗
+                ↓ 点一键修复
+                                  实际 0 / 期望 0 处     ✓
+```
+
+> 新版复制逻辑也已修好（`buildDashboardPlaceholders` 不再替换字典与电能品种），
+> 所以**新开的客户不会再出现**；一键修复负责治存量。
+
+**修法二（手工改数据，仅在无法调接口时用）**：
 
 ```sql
 -- 先把租户级资产的 id 找出来
@@ -401,9 +429,11 @@ WHERE customer_id IS NOT NULL
   AND configuration LIKE '%<上面查到的id>%';
 ```
 
-**⚠ 改完必须让用户强制刷新浏览器**（`Cmd+Shift+R` / `Ctrl+Shift+R`）。
+**⚠ 修完必须让用户强制刷新浏览器**（`Cmd+Shift+R` / `Ctrl+Shift+R`）。
 数据库改了，但**已经打开的页面内存里还是旧配置**，会继续重试。
 表现是「间隔从 3 秒变成 60 秒但没消失」—— 改数据前就已经打开的页面不会自动重新拉取。
+
+这一点对「一键修复」同样成立：**修复是改服务端数据，不会推送到已打开的页面。**
 
 **验证刷新后确实没事**：用客户 token 逐个解析全部看板的别名，
 真实 id 都应当 200，占位符应当跳过，失败数应为 0。完整脚本见
@@ -420,6 +450,53 @@ WHERE customer_id IS NOT NULL
 
 > 设计原则：**能从 API 拿的数据，不要通过实体别名拿。**
 > 实体别名受用户权限约束，API 只要接口放行就不受。
+
+---
+
+### 现象 J：RTU 上报成功（HTTP 200），但报表全空；库里只有 `U` / `I` / `P`
+
+**先看一眼库里存的到底是什么**：
+
+```bash
+# 最近 2 分钟有哪些 key（按写入时间倒序）
+docker exec energy-postgres psql -U postgres -d thingsboard -At -F' | ' -c "
+select k.key, to_char(to_timestamp(max(v.ts)/1000),'HH24:MI:SS'), max(v.dbl_v)
+from ts_kv v join key_dictionary k on k.key_id=v.key
+where v.ts > (extract(epoch from now())*1000 - 120000)::bigint
+group by k.key order by 2 desc;"
+```
+
+- 看到 `voltage_a` / `current_a` / `power_total` → 正常
+- 看到 `U` / `I` / `P` / `Ep` → **电表 Key 标准化节点没生效**，报表按标准名取数自然全空
+
+**两个原因，按顺序查**：
+
+1. **节点根本没装**（新装 / 重装 / 新租户）
+
+   ```bash
+   curl --noproxy '*' -s -X POST \
+     -H "X-Authorization: Bearer $TOKEN" \
+     http://127.0.0.1:8090/api/energy/repair-init | jq '.meterKeyTransformFixed'
+   ```
+
+   返回 `true` = 刚补装，再上报一次验证；返回 `false` 说明节点在，看第 2 条。
+
+2. **节点在，但脚本写错了**（历史手工配置常见）
+
+   日志或 `ruleEngineException` 里如果出现：
+
+   ```
+   Can't parse value: "{\"U\":232.9,...}"
+   ```
+
+   说明脚本里多写了一次 `JSON.stringify(...)`，返回值被双重编码。
+   同样，脚本里多写 `JSON.parse(msg)` 会抛异常 → 走 `catch` 原样返回 → 数据不转换。
+
+   原因和正确写法见手册 **③ 数据初始化 → 五之二、电表 Key 标准化节点**；
+   执行一次 `repair-init` 会自动把脚本刷成平台标准版本。
+
+**为什么这种故障难发现**：上报接口是 fire-and-forget，消息处理失败也返回 `200`；
+节点缺失也不影响服务启动。唯一的早期信号就是「报表没数」。
 
 ---
 
@@ -1290,6 +1367,28 @@ WHERE d.customer_id IS NOT NULL
 实体别名受用户权限约束；API 只要接口放行，对客户与租户一视同仁。
 `/api/energy/metric-params` 就是按这个原则做的 —— 客户和租户都返回 200，
 所以部件不依赖「能源参数字典」那个实体。
+
+**这张表已经由「一键修复初始化」自动维护**
+
+```
+平台自检
+   └─ customer.dashboard-tenant-leaks   看板无租户级资产引用
+        实际 N / 期望 0 处
+              │
+              ▼  点「一键修复初始化」
+        repair-init → repairTenantAssetLeaks()
+              │
+              ├─ 列出所有租户级资产的 id
+              ├─ 扫每个客户的看板 config
+              └─ 换回占位符 → 返回 tenantAssetLeaksFixed
+```
+
+所以**不需要人肉排查、也不需要写 SQL**。
+自检里看到该项不为 0，点一下就修好了（存量客户一并处理）。
+
+> 这项检查的 `status` 语义与其他项相反：**0 才是正确状态**。
+> 通用 `item()` 把 `actual <= 0` 判为 `MISSING`（缺数据），
+> 在这里会把「一切正常」显示成「缺失」—— 已单独覆盖为 `leaks == 0 ? OK : PARTIAL`。
 
 ### 13.5 自建表：哪些表是我们自己的，不属于 ThingsBoard
 
