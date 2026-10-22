@@ -45,6 +45,7 @@ JAVA_INSTALL = GS / 'java' / 'com' / 'guard' / 'server' / 'service' / 'install'
 RES_ENERGY = GS / 'resources' / 'data' / 'json' / 'system' / 'energy'
 DASHBOARDS = GS / 'data' / 'json' / 'tenant' / 'dashboards'
 DOCS = ROOT / 'content' / 'admin'
+DOWNLOADS = ROOT / 'downloads'
 
 
 # ----------------------------------------------------------------------
@@ -133,6 +134,32 @@ def count_rate_templates(_repo) -> int:
     return len(re.findall(r'createRateTemplate\(tenantId,', body.group(0)))
 
 
+def count_org_tabs(_repo) -> int:
+    """组织节点右侧页签数：读 sites.component.html 里 type !== '场站' 的 tab 组"""
+    src = _read(REPO / 'ui-ngx' / 'src' / 'app' / 'modules' / 'home' / 'pages' / 'sites'
+                / 'sites.component.html')
+    m = re.search(r"<mat-tab-group \*ngIf=\"selectedNode\.type !== '场站'\".*?</mat-tab-group>",
+                  src, re.S)
+    if not m:
+        raise RuntimeError('sites.component.html: 找不到组织页签组')
+    return len(re.findall(r'<mat-tab[ >]', m.group(0)))
+
+
+def count_verify_items(_repo) -> int:
+    """
+    发布验收项数：读 08-verify-release.sh 里的 EXPECTED_PASS。
+
+    不静态数 ok/ge/eq 调用 —— 有些断言在 if/else 分支里，
+    实际执行到哪一支取决于数据，静态统计会得出错误项数。
+    脚本自己会在结尾用这个常量自校验，所以它是唯一可信来源。
+    """
+    src = _read(DOWNLOADS / 'scripts' / '08-verify-release.sh')
+    m = re.search(r'^EXPECTED_PASS=(\d+)\s*$', src, re.M)
+    if not m:
+        raise RuntimeError('08-verify-release.sh: 找不到 EXPECTED_PASS')
+    return int(m.group(1))
+
+
 def count_dashboards(_repo) -> int:
     return len(list(DASHBOARDS.glob('*.json')))
 
@@ -217,7 +244,14 @@ CHECKS = [
         ('03-init.md', r'## 五、分时时段方案（(\d+) 套）'),
     ]),
     Check('rate_templates', '费率模板', count_rate_templates, [
-        ('03-init.md', r'\| 费率模板 \| 建租户时自动 \| (\d+) 个'),
+        ('03-init.md', r'\| 费率模板（示例价） \| 建租户时自动 \| (\d+) 个'),
+    ]),
+    Check('org_tabs', '组织页签', count_org_tabs, [
+        ('03-init.md', r'选中组织 → (\d+) 个页签'),
+    ]),
+    Check('verify_items', '发布验收项数', count_verify_items, [
+        ('03-init.md', r'\*\*期望\*\*：`通过 (\d+) 项`'),
+        ('00-index.md', r'期望 `通过 (\d+) 项`'),
     ]),
     Check('dashboards', '看板模板', count_dashboards, [
         ('02-deploy.md', r'wc -l\s+# 必须是 (\d+)'),
@@ -231,6 +265,60 @@ CHECKS = [
         ('02-deploy.md', r'\| 客户菜单 \| (\d+) 个顶层项 \|'),
     ]),
 ]
+
+
+def check_doc_sql() -> tuple[int, int, list[str]]:
+    """
+    校验手册里的运维 SQL 是否还能在真实库上跑通。
+
+    <p>为什么值得做：改了表名/列名之后，手册里的 SQL 会静默失效 ——
+    运维照着敲，得到的是 `column does not exist`，而没人会去改手册。
+    这里把每条 SQL 真跑一遍（`ON_ERROR_STOP=1`，结果丢弃）。
+
+    <p>可选：需要 `docker` 且 `energy-postgres` 容器在跑。
+    不满足就整体跳过（返回 0,0），不阻塞文档同步 ——
+    文档一致性不该依赖数据库是否启动。
+    """
+    import json as _json
+    import subprocess
+    import tempfile
+    import os
+
+    try:
+        probe = subprocess.run(
+            ['docker', 'exec', 'energy-postgres', 'psql', '-U', 'postgres', '-d', 'thingsboard',
+             '-tAc', 'SELECT 1'],
+            capture_output=True, text=True, timeout=20)
+    except Exception:
+        return 0, 0, ['跳过：docker 不可用']
+    if probe.returncode != 0:
+        return 0, 0, ['跳过：energy-postgres 未运行']
+
+    src = _read(DOCS / '05-troubleshoot.md')
+    tail = src[src.find('## 14. 运维常用 SQL'):]
+    blocks = re.findall(r'```sql\n(.*?)```', tail, re.S)
+
+    ran = 0
+    errors: list[str] = []
+    for i, sql in enumerate(blocks, 1):
+        # 含占位符的（给运维自己填的）不跑
+        if re.search(r'<[^>]*id>|_TOKEN|你的|xxx', sql):
+            continue
+        with tempfile.NamedTemporaryFile('w', suffix='.sql', delete=False, encoding='utf-8') as f:
+            f.write(sql)
+            path = f.name
+        try:
+            r = subprocess.run(
+                ['docker', 'exec', '-i', 'energy-postgres', 'psql', '-U', 'postgres',
+                 '-d', 'thingsboard', '-v', 'ON_ERROR_STOP=1', '-o', '/dev/null', '-f', '-'],
+                stdin=open(path), capture_output=True, text=True, timeout=60)
+        finally:
+            os.unlink(path)
+        ran += 1
+        if r.returncode != 0:
+            first = next((l for l in r.stderr.splitlines() if 'ERROR' in l), r.stderr[:80])
+            errors.append(f'第 {i} 条 SQL 失败：{first.strip()[:90]}')
+    return ran, len(blocks), errors
 
 
 def main() -> int:
@@ -300,6 +388,17 @@ def main() -> int:
     for r in rows:
         print('  '.join(pad(v, w[i]) for i, v in enumerate(r)))
     print('-' * (sum(w) + 8))
+
+    # 手册 SQL 可跑性（可选，依赖数据库在跑）
+    sql_ran, sql_total, sql_errors = check_doc_sql()
+    if sql_total:
+        if sql_errors:
+            failed += len(sql_errors)
+            print(f'\n✗ 运维 SQL 校验失败（{sql_ran}/{sql_total} 条执行过）：')
+            for e in sql_errors:
+                print(f'    · {e}')
+        else:
+            print(f'\n✓ 运维 SQL 全部可执行（{sql_ran}/{sql_total} 条，含占位符的已跳过）')
 
     if failed:
         print(f'\n✗ {failed} 项不一致 —— 改代码后要同步手册：')

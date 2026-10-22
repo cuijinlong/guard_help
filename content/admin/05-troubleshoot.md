@@ -599,3 +599,541 @@ tail -200 /opt/energy/logs/guard-server.log | grep -E "ERROR|Caused by"
 curl -s --noproxy '*' http://127.0.0.1:8090/api/noauth/setup/state
 curl -s --noproxy '*' http://127.0.0.1:8090/api/auth/user -H "X-Authorization: Bearer $TOKEN"
 ```
+
+---
+
+## 13. 系统架构图
+
+### 13.1 容器与端口
+
+```
+                        浏览器（租户 / 客户）
+                                 │  http://<主机>:8090
+                                 ▼
+        ┌────────────────────────────────────────────────────┐
+        │  energy-gateway          nginx:1.27-alpine         │
+        │  容器内 :80，宿主映射 ${HTTP_PORT:-8090}            │
+        │  职责：统一入口、gzip、WebSocket 升级、路由分流       │
+        └───┬──────────────────────────────┬─────────────────┘
+            │ /  /api/  /ngxapi?           │ /ngxai/  /ngxapi/
+            │ （前端产物 + REST + WS）       │ （AI 前端静态 + AI 后端）
+            ▼                              ▼
+  ┌─────────────────────────┐   ┌──────────────────────────┐
+  │  energy-server          │   │  energy-ngxai-backend    │
+  │  eclipse-temurin:25-jre │   │  energy/ngxai-backend    │
+  │  :8090  HTTP/REST       │   │  :18801  FastAPI          │
+  │  :1883  MQTT（设备接入） │   │  预测 / 建议 / 质量分析    │
+  └───────────┬─────────────┘   └────────────┬─────────────┘
+              │                              │
+              └──────────────┬───────────────┘
+                             ▼
+              ┌──────────────────────────────┐
+              │  energy-postgres             │
+              │  postgres:16-alpine  :5432   │
+              │  卷 pgdata（唯一有状态服务）   │
+              └──────────────────────────────┘
+```
+
+**设备接入只有一条路**：设备 → MQTT `:1883` → `energy-server` 的规则链 → 写库。
+没有直连数据库的路径。
+
+**为什么 gateway 不代理 MQTT**：1883 是 TCP 协议，nginx 这个配置只做 HTTP。
+设备要连宿主机的 1883（compose 里 `energy-server` 直接映射了该端口）。
+
+### 13.2 数据模型（业务视角）
+
+```
+tenant（租户 / 能源服务商）
+  │
+  ├── customer（客户 / 用能单位）
+  │     │  additional_info.energyRates  ← 客户级兜底费率
+  │     │  custom_menu_id               ← 该客户看到的左侧菜单
+  │     │
+  │     ├── asset(type='组织')           ← 费率维护层级
+  │     │     │  SERVER_SCOPE.energyRates ← 组织级费率（下属场站继承）
+  │     │     │
+  │     │     ├── asset(type='场站')
+  │     │     │     │  SERVER_SCOPE.idleConfig     ← 闲时阈值
+  │     │     │     │  SERVER_SCOPE.siteCustomRates ← 场站自定义费率（最高优先）
+  │     │     │     │
+  │     │     │     ├── device（计量点 / 传感器 / 网关）
+  │     │     │     │     │  device_profile_id → 决定它是电表/水表/…
+  │     │     │     │     └── ts_kv（遥测，按月分区）
+  │     │     │     │
+  │     │     │     └── asset(type='分项'|'区域'|'空间位置'|'用能性质')
+  │     │     │
+  │     │     └── asset(type='组织')  ← 组织可嵌套
+  │     │
+  │     └── dashboard（看板副本，customer_id = 该客户）
+  │
+  ├── asset_profile（资产档案 16 个）← 租户级
+  ├── device_profile（设备档案 8 个）← 租户级
+  │     │  isMeter / energyTypeCode / wiring  ← 能力声明
+  │     └── calculated_field（告警规则 + 派生指标，11 条）
+  │
+  ├── asset(type='energy_type_library') 能源参数字典 ← 租户级
+  │     └── asset(type='default') 电能 / 水表 / 燃气 / 蒸汽
+  │            └── SERVER_SCOPE.paramDict  ← 两级指标 key
+  │
+  ├── asset(type='tou_scheme') 分时时段方案 ×4 ← 租户级
+  ├── asset(type='rate_template') 费率模板 ×4 ← 租户级（仅示例价参考）
+  ├── asset(type='厂商' / '设备型号') ← 租户级
+  │
+  └── custom_menu（租户菜单 11 项 / 客户菜单 13 项）
+```
+
+**两条铁律**（踩过坑，写在这）：
+
+1. **租户级实体的 `customer_id` 是 NULL_UUID，不是 `null`**。
+   判断要写 `customerId == null || customerId.isNullUid()`，
+   只写 `== null` 会永远不成立，把租户级主数据全部过滤掉，且不报错。
+2. **客户菜单的 `custom_menu.customer_id` 恒为 NULL_UUID**。
+   归属关系走反方向：`customer.custom_menu_id → custom_menu.id`。
+
+### 13.3 费率的三层解析顺序
+
+```
+请求：这个场站按什么价结算？
+   │
+   ├─① 场站 SERVER_SCOPE.siteCustomRates 有该品种？ ──有──▶ 用它
+   │
+   ├─② 沿 Contains 父链向上，找最近的 type='组织'
+   │     且 SERVER_SCOPE.energyRates 非空？
+   │         └─有──▶ 用它（支持组织嵌套，逐级向上，最多 8 层）
+   │
+   └─③ 客户 additional_info.energyRates 有该品种？ ──有──▶ 用它
+          └─都没有──▶ 视为该品种未开通
+```
+
+### 13.4 闲时能耗的判定链路
+
+```
+① 场站 idleConfig（workStart/workEnd/standbyPowerThreshold/idleRatioThreshold）
+        │
+        ▼
+② IdleEnergyService 扫描设备遥测（energy_reading / power_total）
+        │  只统计「设备档案 isMeter=true 且 energyTypeCode=elec」的设备
+        ▼
+③ 逐日算「闲时电量占比」与「闲时平均功率」，判定 isExceed
+        │
+        ├── 历史天数：直写 ts_kv（不触发告警，避免刷屏）
+        └── 最新一天：经 TelemetrySubscriptionService 推一次
+                │
+                ▼
+④ 设备档案上的计算字段「闲时能耗超标」读 idle_exceed
+        │  参数映射只认**本次上报批次**里的键 —— 这是必须走②而不是直写 DAO 的原因
+        ▼
+⑤ 生成 / 清除 alarm（type='闲时能耗超标'）
+```
+
+**关键约束**：TB 的计算字段参数（`TS_LATEST`）只从本次上报的那批遥测取值，
+不去库里查最新点。直接把值写进 `ts_kv` 不会触发告警，症状是规则一直报
+`Required arguments are missing: exceed`。
+
+---
+
+## 14. 运维常用 SQL
+
+全部在 `energy-postgres` 容器里执行：
+
+```bash
+docker exec -it energy-postgres psql -U postgres -d thingsboard
+```
+
+> 下面的 SQL 都在真实库上跑通过。涉及 `additional_info` 的查询必须写
+> `additional_info::jsonb->>'key'` —— 该列是 `character varying`，
+> 直接写 `additional_info->>'key'` 会报
+> `operator does not exist: character varying ->> unknown`。
+
+### 14.1 总览：这套系统里到底有什么
+
+```sql
+SELECT '租户'   AS 实体, count(*) AS 数量 FROM tenant
+UNION ALL SELECT '客户',       count(*) FROM customer
+UNION ALL SELECT '组织',       count(*) FROM asset  WHERE type='组织'
+UNION ALL SELECT '场站',       count(*) FROM asset  WHERE type='场站'
+UNION ALL SELECT '资产档案',   count(*) FROM asset_profile
+UNION ALL SELECT '设备档案',   count(*) FROM device_profile
+UNION ALL SELECT '设备',       count(*) FROM device
+UNION ALL SELECT '遥测点',     count(*) FROM ts_kv
+UNION ALL SELECT '计算字段',   count(*) FROM calculated_field
+UNION ALL SELECT '告警',       count(*) FROM alarm
+UNION ALL SELECT '看板',       count(*) FROM dashboard
+UNION ALL SELECT '自定义菜单', count(*) FROM custom_menu;
+```
+
+### 14.2 组织与场站的层级
+
+```sql
+SELECT
+  a.type                        AS 类型,
+  a.name                        AS 名称,
+  coalesce(p.name, '(无父节点)') AS 上级,
+  c.title                       AS 客户
+FROM asset a
+LEFT JOIN relation r ON r.to_id = a.id
+                    AND r.relation_type = 'Contains'
+                    AND r.relation_type_group = 'COMMON'
+LEFT JOIN asset    p ON p.id = r.from_id
+LEFT JOIN customer c ON c.id = a.customer_id
+WHERE a.type IN ('组织','场站')
+ORDER BY a.type DESC, 上级, a.name;
+```
+
+**怎么读**：`上级 = (无父节点)` 的组织是这个客户最顶层；
+场站的上级应该是一个组织。若场站上级为空，它拿不到组织级费率（只能吃客户兜底）。
+
+### 14.3 每个场站挂了哪些设备、最后上报时间
+
+```sql
+SELECT
+  s.name                       AS 场站,
+  dp.name                      AS 设备档案,
+  count(DISTINCT d.id)         AS 设备数,
+  to_char(to_timestamp(max(kv.ts)/1000) AT TIME ZONE 'Asia/Shanghai',
+          'MM-DD HH24:MI')     AS 最后上报
+FROM asset s
+JOIN device d          ON d.additional_info::jsonb->>'siteId' = s.id::text
+JOIN device_profile dp ON dp.id = d.device_profile_id
+LEFT JOIN ts_kv kv     ON kv.entity_id = d.id
+WHERE s.type = '场站'
+GROUP BY s.name, dp.name
+ORDER BY s.name, dp.name;
+```
+
+### 14.4 谁配了费率（组织 / 客户 / 场站三级）
+
+```sql
+SELECT '组织' AS 层级, a.name  AS 对象,
+       jsonb_object_keys(ak.json_v::jsonb) AS 品种
+FROM asset a
+JOIN attribute_kv ak  ON ak.entity_id = a.id
+JOIN key_dictionary k ON k.key_id = ak.attribute_key
+WHERE k.key = 'energyRates' AND a.type = '组织'
+UNION ALL
+SELECT '客户', c.title, jsonb_object_keys(ak.json_v::jsonb)
+FROM customer c
+JOIN attribute_kv ak  ON ak.entity_id = c.id
+JOIN key_dictionary k ON k.key_id = ak.attribute_key
+WHERE k.key = 'energyRates'
+UNION ALL
+SELECT '场站', a.name, jsonb_object_keys(ak.json_v::jsonb)
+FROM asset a
+JOIN attribute_kv ak  ON ak.entity_id = a.id
+JOIN key_dictionary k ON k.key_id = ak.attribute_key
+WHERE k.key = 'siteCustomRates' AND a.type = '场站'
+ORDER BY 1, 2, 3;
+```
+
+### 14.5 某场站最终会用哪一层的价（继承链）
+
+```sql
+WITH RECURSIVE up(id, name, type, depth) AS (
+  SELECT a.id, a.name, a.type, 0
+  FROM asset a
+  WHERE a.name = '单相园区·星河工业园'          -- ← 换成要查的场站名
+  UNION ALL
+  SELECT p.id, p.name, p.type, up.depth + 1
+  FROM up
+  JOIN relation r ON r.to_id = up.id
+                 AND r.relation_type = 'Contains'
+                 AND r.relation_type_group = 'COMMON'
+  JOIN asset p    ON p.id = r.from_id
+  WHERE up.depth < 8
+)
+SELECT depth AS 层, type AS 类型, name AS 名称,
+       EXISTS (SELECT 1 FROM attribute_kv ak
+                 JOIN key_dictionary k ON k.key_id = ak.attribute_key
+                WHERE ak.entity_id = up.id AND k.key = 'energyRates') AS 配了组织费率,
+       EXISTS (SELECT 1 FROM attribute_kv ak
+                 JOIN key_dictionary k ON k.key_id = ak.attribute_key
+                WHERE ak.entity_id = up.id AND k.key = 'siteCustomRates') AS 配了场站自定义
+FROM up ORDER BY depth;
+```
+
+**怎么读**：从 `层=0`（场站自己）往上，第一个「配了组织费率」的组织就是生效来源；
+若场站自己「配了场站自定义」，则它以最高优先级覆盖。
+
+### 14.6 品种字典的两级指标数
+
+```sql
+SELECT a.name AS 品种,
+       ak.str_v AS 编码,
+       jsonb_array_length(ak2.json_v::jsonb->'params') AS 一级指标,
+       (SELECT count(*)
+          FROM jsonb_array_elements(ak2.json_v::jsonb->'params') p
+          CROSS JOIN LATERAL jsonb_array_elements(coalesce(p->'children','[]'::jsonb)) ch
+       ) AS 二级key,
+       ak2.json_v::jsonb->>'version' AS 版本
+FROM asset lib
+JOIN relation r ON r.from_id = lib.id
+               AND r.relation_type='Contains' AND r.relation_type_group='COMMON'
+JOIN asset a    ON a.id = r.to_id
+LEFT JOIN attribute_kv ak  ON ak.entity_id = a.id
+                          AND ak.attribute_key = (SELECT key_id FROM key_dictionary WHERE key='code')
+LEFT JOIN attribute_kv ak2 ON ak2.entity_id = a.id
+                          AND ak2.attribute_key = (SELECT key_id FROM key_dictionary WHERE key='paramDict')
+WHERE lib.type = 'energy_type_library'
+ORDER BY a.name;
+```
+
+**期望**（本版）：电能 26 一级 / 48 二级；水表、燃气、蒸汽各 3 / 3；版本 `4`。
+
+### 14.7 设备档案能力（判断某设备算不算表计）
+
+```sql
+SELECT dp.name AS 设备档案,
+       coalesce(
+         (SELECT a.bool_v::text FROM attribute_kv a JOIN key_dictionary k ON k.key_id=a.attribute_key
+           WHERE a.entity_id=dp.id AND k.key='isMeter'),
+         (SELECT a.str_v        FROM attribute_kv a JOIN key_dictionary k ON k.key_id=a.attribute_key
+           WHERE a.entity_id=dp.id AND k.key='isMeter')
+       ) AS 表计,
+       (SELECT a.str_v FROM attribute_kv a JOIN key_dictionary k ON k.key_id=a.attribute_key
+         WHERE a.entity_id=dp.id AND k.key='energyTypeCode') AS 能源品种,
+       (SELECT a.str_v FROM attribute_kv a JOIN key_dictionary k ON k.key_id=a.attribute_key
+         WHERE a.entity_id=dp.id AND k.key='wiring') AS 接线
+FROM device_profile dp
+ORDER BY dp.name;
+```
+
+> `isMeter` 在库里存的是 `bool_v`（布尔列），`energyTypeCode` 存 `str_v`。
+> 一律用 `str_v` 读 `isMeter` 会得到 null，把所有电表判成「不是表计」。
+
+### 14.8 ⚠ 自查：非电表却被判闲时超标（期望 0 行）
+
+```sql
+SELECT DISTINCT
+  d.name  AS 设备,
+  dp.name AS 档案,
+  coalesce((SELECT a.str_v FROM attribute_kv a
+             WHERE a.entity_id = dp.id
+               AND a.attribute_key = (SELECT key_id FROM key_dictionary WHERE key='energyTypeCode')),
+           '(未标品种)') AS 能源品种
+FROM ts_kv kv
+JOIN key_dictionary k  ON k.key_id = kv.key
+JOIN device d          ON d.id = kv.entity_id
+JOIN device_profile dp ON dp.id = d.device_profile_id
+WHERE k.key = 'idle_exceed' AND kv.long_v = 1
+  AND coalesce((SELECT a.str_v FROM attribute_kv a
+                 WHERE a.entity_id = dp.id
+                   AND a.attribute_key = (SELECT key_id FROM key_dictionary WHERE key='energyTypeCode')), '') <> 'elec'
+ORDER BY 设备;
+```
+
+**有结果说明什么**：水表 / 燃气表 / 蒸汽表被算进了闲时能耗判定。
+它们没有 `power_total`，闲时电量占比会被算成 100%，于是全部误判「超标」，
+把告警中心塞满假告警。
+
+**修法**：这些是旧版本跑出来的历史数据（旧版把场站下所有表计都算进闲时）。
+
+代码侧已改为只统计「`isMeter=true` 且 `energyTypeCode=elec`」的设备
+（`EnergyScopeService.electricMeterProfileIds`），重算不会再给非电表写结果。
+但**重算不会删除旧点**，历史脏数据要单独清：
+
+```sql
+-- 备份（先看会删多少）
+SELECT dp.name AS 档案, k.key AS 键, count(*) AS 点数
+FROM ts_kv kv
+JOIN key_dictionary k  ON k.key_id = kv.key
+JOIN device d          ON d.id = kv.entity_id
+JOIN device_profile dp ON dp.id = d.device_profile_id
+WHERE k.key IN ('idle_exceed','idle_energy','work_energy','idle_avg_power','idle_delta_count')
+  AND coalesce((SELECT a.str_v FROM attribute_kv a
+                 WHERE a.entity_id = dp.id
+                   AND a.attribute_key = (SELECT key_id FROM key_dictionary WHERE key='energyTypeCode')), '') <> 'elec'
+GROUP BY dp.name, k.key ORDER BY 点数 DESC;
+
+-- 删除（幂等，删干净后再跑返回 DELETE 0）
+DELETE FROM ts_kv kv
+USING device d, device_profile dp
+WHERE kv.entity_id = d.id
+  AND dp.id = d.device_profile_id
+  AND kv.key IN (SELECT key_id FROM key_dictionary
+                  WHERE key IN ('idle_exceed','idle_energy','work_energy',
+                                'idle_avg_power','idle_delta_count'))
+  AND coalesce((SELECT a.str_v FROM attribute_kv a
+                 WHERE a.entity_id = dp.id
+                   AND a.attribute_key = (SELECT key_id FROM key_dictionary WHERE key='energyTypeCode')), '') <> 'elec';
+```
+
+删之前先确认：这些设备档案上**没挂**「闲时能耗超标」计算字段，
+所以这些点从未产生过告警，删除不影响任何告警历史。
+本版实测：清理 420 点（水表 28 + 燃气表 28 + 蒸汽表 28 条 `idle_exceed`，
+其余是配套的 `idle_energy` / `work_energy` / `idle_avg_power` / `idle_delta_count`）。
+
+### 14.9 闲时阈值与判定结果
+
+```sql
+-- 阈值
+SELECT a.name AS 场站,
+       ak.json_v::jsonb->>'workStart'             AS 工作开始,
+       ak.json_v::jsonb->>'workEnd'               AS 工作结束,
+       ak.json_v::jsonb->>'standbyPowerThreshold' AS 待机功率阈值kW,
+       ak.json_v::jsonb->>'idleRatioThreshold'    AS 闲时占比阈值pct
+FROM asset a
+JOIN attribute_kv ak  ON ak.entity_id = a.id
+JOIN key_dictionary k ON k.key_id = ak.attribute_key
+WHERE k.key = 'idleConfig'
+ORDER BY a.name;
+
+-- 最新一天的判定（1 = 超标）
+SELECT d.name AS 设备,
+       kv.long_v AS 超标,
+       to_char(to_timestamp(kv.ts/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 判定时间
+FROM ts_kv kv
+JOIN key_dictionary k ON k.key_id = kv.key
+JOIN device d         ON d.id = kv.entity_id
+WHERE k.key = 'idle_exceed'
+  AND kv.ts = (SELECT max(ts) FROM ts_kv k2
+                WHERE k2.entity_id = kv.entity_id AND k2.key = kv.key)
+ORDER BY kv.long_v DESC, d.name;
+```
+
+### 14.10 未清除告警与计算字段清单
+
+```sql
+-- 未清除告警（按类型统计）
+SELECT type AS 告警类型, severity AS 级别, count(*) AS 条数
+FROM alarm WHERE NOT cleared
+GROUP BY type, severity ORDER BY 条数 DESC;
+
+-- 计算字段挂在哪（应该在设备档案上，不是单台设备上）
+SELECT dp.name AS 设备档案, cf.name AS 规则, cf.type AS 类型
+FROM calculated_field cf
+JOIN device_profile dp ON dp.id = cf.entity_id
+ORDER BY dp.name, cf.type, cf.name;
+```
+
+**期望**：单相电能表 5 条、电能表 6 条，共 11 条。
+如果 `entity_id` 指向的是 `device.id` 而不是 `device_profile.id`，
+告警只在那一台设备上生效，同档案的其它设备不会继承。
+
+### 14.11 ⚠ 自查：孤儿客户菜单（期望 0 行）
+
+```sql
+SELECT cm.name AS 菜单名, cm.scope AS 作用域,
+       count(*) AS 同名条数,
+       count(*) FILTER (WHERE cm.assignee_type <> 'ALL') AS 其中未绑定
+FROM custom_menu cm
+GROUP BY cm.name, cm.scope
+HAVING count(*) > 1
+ORDER BY 同名条数 DESC;
+```
+
+**有结果说明什么**：每次重装 / 每次 repair-init 都会新增一条同名菜单而没删旧的。
+
+**根因**（已修）：早先 `removeExisting` 按 `customer_id` 判断归属，
+但客户菜单的 `custom_menu.customer_id` 恒为 NULL_UUID，一条都删不掉。
+现在 `removeCustomerMenu` 按「客户实体当前引用的 + 未被任何客户引用的同名孤儿」两步清理。
+
+**修法**：跑一次「平台自检 → 一键修复初始化」，或重装。
+
+### 14.12 数据量与磁盘
+
+```sql
+-- ts_kv 是按月分区的，直接查父表会是 0 字节，必须统计分区
+SELECT
+  (SELECT count(*) FROM ts_kv)                  AS 遥测点数,
+  (SELECT count(DISTINCT entity_id) FROM ts_kv) AS 有数据的实体数,
+  (SELECT pg_size_pretty(sum(pg_total_relation_size(c.oid)))
+     FROM pg_inherits i
+     JOIN pg_class p ON p.oid = i.inhparent
+     JOIN pg_class c ON c.oid = i.inhrelid
+    WHERE p.relname = 'ts_kv')                  AS ts_kv_总占用,
+  pg_size_pretty(pg_database_size(current_database())) AS 整库占用;
+
+-- 分区清单（看有没有该建的新月份分区）
+SELECT child.relname AS 分区, pg_size_pretty(pg_total_relation_size(child.oid)) AS 大小
+FROM pg_inherits
+JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+JOIN pg_class child  ON pg_inherits.inhrelid  = child.oid
+WHERE parent.relname = 'ts_kv'
+ORDER BY child.relname;
+```
+
+### 14.13 ⚠ 自查：长时间没上报的设备（超过 60 分钟）
+
+```sql
+SELECT d.name AS 设备,
+       dp.name AS 档案,
+       to_char(to_timestamp(max(kv.ts)/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 最后上报,
+       round(extract(epoch FROM (now() - to_timestamp(max(kv.ts)/1000)))/60) AS 已停分钟
+FROM device d
+JOIN device_profile dp ON dp.id = d.device_profile_id
+LEFT JOIN ts_kv kv     ON kv.entity_id = d.id
+GROUP BY d.name, dp.name
+HAVING max(kv.ts) IS NULL
+    OR now() - to_timestamp(max(kv.ts)/1000) > interval '60 minutes'
+ORDER BY 已停分钟 DESC NULLS LAST;
+```
+
+**虚拟表**（名字里带「虚拟」）本来就不上报，长期出现属正常。
+其余设备出现在这里，说明网关/RTU 掉线或上报键名不对。
+
+### 14.14 ⚠ 自查：上报了但字典里没有的键（报表认不出）
+
+```sql
+SELECT k.key AS 遥测键,
+       count(DISTINCT kv.entity_id) AS 设备数,
+       count(*) AS 数据点数
+FROM ts_kv kv
+JOIN key_dictionary k  ON k.key_id = kv.key
+JOIN device d          ON d.id = kv.entity_id
+JOIN device_profile dp ON dp.id = d.device_profile_id
+WHERE k.key NOT IN (            -- 后端派生量，本就不在字典里
+        'idle_exceed','idle_energy','idle_avg_power','idle_delta_count','work_energy',
+        'load_rate','carbon_emission','energy_day','energy_used_day',
+        'energy_reverse_day','demand_max','demand_reverse_max')
+  AND NOT EXISTS (
+        SELECT 1 FROM asset lib
+        JOIN relation r     ON r.from_id = lib.id AND r.relation_type='Contains'
+                            AND r.relation_type_group='COMMON'
+        JOIN asset kind     ON kind.id = r.to_id
+        JOIN attribute_kv pd ON pd.entity_id = kind.id
+                            AND pd.attribute_key = (SELECT key_id FROM key_dictionary WHERE key='paramDict')
+        CROSS JOIN LATERAL jsonb_array_elements(pd.json_v::jsonb->'params') p
+        CROSS JOIN LATERAL jsonb_array_elements(coalesce(p->'children','[]'::jsonb)) ch
+        WHERE lib.type = 'energy_type_library' AND ch->>'key' = k.key
+      )
+GROUP BY k.key ORDER BY 数据点数 DESC;
+```
+
+**有结果说明什么**：设备上报了一个字典里没声明的键。
+数据照样存库，但所有报表都不认它 —— 表现为「设备有数据、图表全空」，**且不报错**。
+
+**本版实测**剩下 3 个（都不是问题）：
+`energy_deep`（深谷电量，字典待补）、`humidity` / `temperature`（温湿度传感器，非能源计量）。
+如果出现电压/电流/功率之类的键，就是设备的字段映射配错了。
+
+### 14.15 客户菜单配置
+
+```sql
+SELECT cm.name AS 菜单名, cm.scope AS 作用域, cm.assignee_type AS 分配给,
+       c.title AS 绑定客户,
+       jsonb_array_length(cm.config::jsonb->'items') AS 一级项数
+FROM custom_menu cm
+LEFT JOIN customer c ON c.custom_menu_id = cm.id
+ORDER BY cm.scope, cm.name;
+```
+
+**期望**：租户菜单 `默认导航（能源管理）` 11 项；
+客户菜单 `业务导航（能源管理）` 13 项且绑定到客户。
+客户菜单项数若为 0，说明配置没写进去（客户登录会看到默认菜单，不是能源菜单）。
+
+### 14.16 删数据前的确认（危险操作）
+
+```sql
+-- 1. 先看清楚要删什么（以客户为例）
+SELECT id, title FROM customer WHERE title = '星河工业园';
+
+-- 2. 该客户名下的资产 / 设备数量（删客户不会自动删这些）
+SELECT '资产' AS 类型, count(*) FROM asset  WHERE customer_id = '<客户id>'
+UNION ALL
+SELECT '设备',        count(*) FROM device WHERE customer_id = '<客户id>';
+
+-- 3. 删客户后这些实体会变成「无主」，需要单独清理
+```
+
+> TB 删除客户只把资产的 `customer_id` 置空，**不删资产**。
+> 重装/重建客户时如果看到一堆「无主」资产，就是这个原因。

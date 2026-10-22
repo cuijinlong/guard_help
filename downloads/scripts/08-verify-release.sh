@@ -52,6 +52,14 @@ done
 
 [[ -n "$TENANT" && -n "$TENANT_PASS" ]] || { echo "必须提供 --tenant 与 --tenant-pass" >&2; exit 2; }
 
+# 预期通过的检查项数。
+#
+# 为什么要有这个数：手册里写着「通过 N 项」，而 N 会随脚本增删检查项变化。
+# 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
+# check-docs.py 也读这里去比对手册。
+# **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
+EXPECTED_PASS=53
+
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
 ok()   { PASS=$((PASS+1)); [[ "$QUIET" == "true" ]] || printf '\033[32m  ✓\033[0m %s\n' "$*"; }
@@ -214,6 +222,94 @@ IDLE_ALARM=$(DASH_DB "SELECT count(*) FROM alarm WHERE type='闲时能耗超标'
 ge "闲时能耗超标告警（历史累计）" "${IDLE_ALARM:-0}" "1" \
    '计算字段没被触发：确认 persistDaily 走的是 telemetrySubscriptionService（直写 DAO 不会触发）'
 
+# 客户费率：价格现在由客户自己维护，模板不再是必经来源。
+CUST_RATES=$(curl -s --noproxy '*' -m 20 "$BASE/api/energy/rate-policies" \
+  -H "X-Authorization: Bearer $CTOK" 2>/dev/null)
+if printf '%s' "$CUST_RATES" | grep -q '"customerRates"'; then
+  ok "客户费率接口返回 customerRates"
+else
+  bad "客户费率接口缺少 customerRates 字段" \
+      '后端没重启到新版本：确认 EnergyRatePolicyController 里有 readCustomerRates'
+fi
+
+N_RATES=$(printf '%s' "$CUST_RATES" | jget "
+cr = d.get('customerRates') or {}
+print(len(cr))
+")
+ge "客户已填费率的品种数" "${N_RATES:-0}" "1" \
+   '客户还没在「能源建档」里填价：登录客户账号 → 客户列表 → 能源建档 → 填入示例价 → 保存'
+
+# 保存接口探活：故意发一个**不合法**的费率（单一制缺单价），
+# 期望 400 —— 既证明接口存在，又不会改到客户已有的价格。
+# 千万别用 {"rates":{}} 探活：那是合法的空覆盖，会把客户填的价清空。
+CODE=$(curl -s --noproxy '*' -m 15 -o /dev/null -w '%{http_code}' \
+  -X POST "$BASE/api/energy/customer-rate" \
+  -H "X-Authorization: Bearer $CTOK" -H 'Content-Type: application/json' \
+  -d '{"rates":{"__probe__":{"rateType":"flat"}}}')
+if [[ "$CODE" == "404" ]]; then
+  bad "客户费率保存接口不存在（404）" '后端是旧版：重新打包并重启 energy-server'
+elif [[ "$CODE" == "400" ]]; then
+  ok "客户费率保存接口可用（非法输入按预期拒绝 400）"
+else
+  bad "客户费率保存接口异常（HTTP ${CODE}，期望 400）" \
+      '校验逻辑可能被绕过：检查 validateCustomerRate'
+fi
+
+# 组织层：客户侧维护费率的立足点。
+# 没有组织，客户登录后进不去「组织 → 能源费率」，只能靠客户级兜底。
+ORG_N=$(DASH_DB "SELECT count(*) FROM asset WHERE type='组织';" | tr -d ' ')
+ge "组织数" "${ORG_N:-0}" "1" \
+   '客户侧没有组织 → 「能源费率」页签无处可挂：跑「平台自检 → 一键修复初始化」补建'
+
+ORG_SITE=$(DASH_DB "SELECT count(*) FROM relation r
+                      JOIN asset o ON o.id = r.from_id AND o.type='组织'
+                      JOIN asset s ON s.id = r.to_id AND s.type='场站'
+                     WHERE r.relation_type='Contains';" | tr -d ' ')
+ge "挂在组织下的场站" "${ORG_SITE:-0}" "1" \
+   '场站没挂到组织 → 组织配的费率无法被场站继承（只能吃客户级兜底）'
+
+# 探活：传一个**非法 UUID**，期望 400。
+# 不能用「不存在的组织 uuid」——那也返回 404（ITEM_NOT_FOUND），
+# 和「接口不存在」的 404 分不开，会误报。
+org_ok=$(curl -s --noproxy '*' -m 15 -o /dev/null -w '%{http_code}' \
+  -X POST "$BASE/api/energy/org-rate" \
+  -H "X-Authorization: Bearer $CTOK" -H 'Content-Type: application/json' \
+  -d '{"orgId":"not-a-uuid","energyRates":{}}')
+if [[ "$org_ok" == "400" ]]; then
+  ok "组织费率保存接口可用（非法 orgId 按预期拒绝 400）"
+elif [[ "$org_ok" == "404" ]]; then
+  bad "组织费率保存接口不存在（404）" '后端是旧版：重新打包并重启 energy-server'
+else
+  bad "组织费率保存接口异常（HTTP ${org_ok}，期望 400）" '检查 saveOrgRate 的参数校验'
+fi
+
+# 菜单唯一性：重装/repair-init 不能越跑越多条同名菜单。
+# 根因是早先按 customer_id 判归属，而客户菜单的 customer_id 恒为 NULL_UUID。
+MENU_DUP=$(DASH_DB "SELECT count(*) FROM (
+           SELECT 1 FROM custom_menu
+            WHERE scope='CUSTOMER' AND name LIKE '业务导航%'
+            GROUP BY name HAVING count(*) > 1) t;" | tr -d ' ')
+eq "客户菜单唯一（同名不超过 1 条）" "${MENU_DUP:-0}" "0" \
+   '重装/repair-init 在堆重复菜单：EnergyMenuInstaller.removeCustomerMenu 没生效，跑一次 repair-init 清理'
+
+# 拓扑数据完整性：边不能指向不存在的节点，否则双击下钻会出现「说有却点不进去」
+TOPO_JSON=$(TAPI '/api/energy/topologies')
+TOPO_ID=$(printf '%s' "$TOPO_JSON" | jget "
+items = d if isinstance(d, list) else (d.get('data') or [])
+print((items[0].get('id') if items else '') or '')
+")
+if [[ -n "$TOPO_ID" ]]; then
+  DANGLING=$(TAPI "/api/energy/topologies/$TOPO_ID" | jget "
+nodes = {n.get('id') for n in (d.get('nodes') or [])}
+edges = d.get('edges') or []
+print(sum(1 for e in edges if e.get('from') not in nodes or e.get('to') not in nodes))
+")
+  eq "拓扑图无悬空边" "${DANGLING:-0}" "0" \
+     '有边指向不存在的节点：双击该节点会提示「没有下级」，需清理拓扑数据'
+else
+  warn "没有拓扑图，跳过悬空边检查"
+fi
+
 # ================================================================
 sec "D. 看板模板"
 TPL_N=$(DASH_DB "SELECT count(*) FROM dashboard WHERE customer_id IS NULL;" | tr -d ' ')
@@ -326,7 +422,7 @@ if [[ "$SKIP_UI" != "true" ]]; then
   done
   for pair in \
     "tb-ic-default-hours|空闲时段：默认工作时段已并入排班页" \
-    "tb-rate-layers|费率方案：三层来源说明条" \
+    "tb-rate-layers|费率方案：两层来源说明条" \
     "tb-cfg-hint-warn|场站配置：暂不参与计算的橙色提示" \
     "tb-energy-dict|品种指标页" \
     "tb-self-check|平台自检页" ; do
@@ -359,5 +455,16 @@ if [[ "$FAIL" -gt 0 ]]; then
   exit 1
 fi
 echo "  这一版的功能点全部到位。"
+# 项数自校验：全部通过但项数对不上，说明脚本被改过而 EXPECTED_PASS 没跟着改。
+# 这种漂移会让手册里的「通过 N 项」变成假话，所以当成失败处理。
+if [[ "${PASS}" -ne "${EXPECTED_PASS}" ]]; then
+  echo
+  # 变量必须写成 ${VAR}：后面紧跟中文时，bash 3.2（macOS 自带）
+  # 会把中文字节当成变量名的一部分，报 "PASS，: unbound variable"。
+  echo "  ⚠ 项数与预期不符：实际 ${PASS} 项，预期 ${EXPECTED_PASS} 项"
+  echo "    检查项被增删过。请同步更新本脚本的 EXPECTED_PASS 与手册里的「通过 N 项」。"
+  echo "============================================================"
+  exit 1
+fi
 echo "============================================================"
 exit 0
