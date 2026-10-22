@@ -34,8 +34,28 @@ x-db-env: &db-env
   SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-thingsboard}
   SPRING_DATASOURCE_USERNAME: ${DB_USER:-postgres}
   SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
-  DATABASE_TS_TYPE: sql
+  # 实体元数据恒在 Postgres（不可改）。
   DATABASE_ENTITIES_TYPE: sql
+  # 遥测存哪：
+  #   sql       （默认）遥测也存 Postgres 的 ts_kv，按月分区
+  #   cassandra 遥测存 Cassandra，Postgres 只存实体与最新值
+  # 改这个值等于换存储后端：**存量数据不会自动迁移**，
+  # 见手册「Cassandra」一节，务必先迁移再切换。
+  DATABASE_TS_TYPE: ${DATABASE_TS_TYPE:-sql}
+  # 最新值（设备详情页、看板的实时数字）单独选存储。
+  # 小规模建议留 sql：查询快、与实体同库、少一次跨库往返。
+  # 只有 Cassandra 集群规模较大时才考虑也放 Cassandra。
+  DATABASE_TS_LATEST_TYPE: ${DATABASE_TS_LATEST_TYPE:-sql}
+  # 关掉「数据转换器库」的自动同步。
+  # TB 默认会去 GitHub 拉 thingsboard/data-converters.git，
+  # 内网/离线环境下必然失败，日志里留一条吓人的 ERROR（其实无影响）。
+  # 本平台没有集成第三方平台的需求，关掉即可。
+  TB_INTEGRATIONS_CONVERTERS_LIBRARY_ENABLED: ${TB_CONVERTERS_LIBRARY_ENABLED:-false}
+  # Cassandra 连接（DATABASE_TS_TYPE=cassandra 时才用到）
+  CASSANDRA_URL: ${CASSANDRA_URL:-cassandra:9042}
+  CASSANDRA_CLUSTER_NAME: ${CASSANDRA_CLUSTER_NAME:-Thingsboard Cluster}
+  CASSANDRA_KEYSPACE_NAME: ${CASSANDRA_KEYSPACE_NAME:-thingsboard}
+  CASSANDRA_LOCAL_DATACENTER: ${CASSANDRA_LOCAL_DATACENTER:-datacenter1}
 
 services:
 
@@ -66,15 +86,65 @@ services:
     # 数据库不对外暴露：调试用 docker compose exec postgres psql
     logging: *default-logging
 
+  # ────────────────────────────────────────────────────────────────
+  # Cassandra：可选。只在 DATABASE_TS_TYPE=cassandra 时启用。
+  #
+  # 为什么不默认开：Cassandra 至少要 2GB 内存，且启动要 1~2 分钟。
+  # 小规模部署（几十万点）Postgres 完全够用，加它只是徒增运维面。
+  # 什么时候该开：遥测点数上亿、写入 QPS 高、需要横向扩容写入端。
+  #
+  # 启动方式（必须显式带 profile，否则不会起来）：
+  #   docker compose --profile split --profile cassandra up -d
+  # 或直接用 scripts/11-cassandra.sh enable（会顺手改 .env 并校验）
+  #
+  # 数据卷：cassandra-data，**删容器不会删数据**，要清空得 down -v 或单独删卷。
+  # ────────────────────────────────────────────────────────────────
+  cassandra:
+    profiles: ["cassandra"]
+    image: cassandra:4.1
+    container_name: energy-cassandra
+    restart: unless-stopped
+    environment:
+      # 单节点部署：把自己当种子。多节点时列全部节点 "c1,c2,c3"。
+      CASSANDRA_CLUSTER_NAME: ${CASSANDRA_CLUSTER_NAME:-Thingsboard Cluster}
+      CASSANDRA_SEEDS: ${CASSANDRA_SEEDS:-cassandra}
+      CASSANDRA_DC: ${CASSANDRA_LOCAL_DATACENTER:-datacenter1}
+      CASSANDRA_RACK: rack1
+      # 堆大小。单节点建议 2G~4G：太小（<1G）会频繁 GC、写入抖动；
+      # 太大反而拖慢（Cassandra 依赖页缓存，堆吃太多宿主就没内存给缓存了）。
+      MAX_HEAP_SIZE: ${CASSANDRA_HEAP:-2G}
+      HEAP_NEWSIZE: ${CASSANDRA_NEWGEN:-512M}
+      # 关闭「用完即焚」提示；数据持久化在卷里
+      CASSANDRA_LISTEN_ADDRESS: auto
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      # 用 cqlsh 真连一次比探端口可靠：端口开了但 schema 还没就绪时，
+      # TB 连上去会报 "Keyspace does not exist"，直接启动失败。
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+    # 9042 不映射到宿主：只有 energy-server 需要连它。
+    # 要在本机用 cqlsh 调试：docker compose exec cassandra cqlsh
+    logging: *default-logging
+
   # 一次性任务：建表 + 装载系统资源。跑完即退出，不常驻。
   install:
     image: eclipse-temurin:25-jre
     profiles: ["install"]
     environment:
       <<: *db-env
+      # 与 energy-server 同一个 profile：生产（pro）时建库日志也落文件，
+      # 事后能翻到「建了哪些表 / 装了多少资源」。dev 时只有控制台。
+      SPRING_PROFILE: ${SPRING_PROFILE:-dev}
     volumes:
       - ${APP_HOME}/guard-server-4.4.0.jar:/opt/energy/app.jar:ro
       - ${APP_HOME}/data:/opt/energy/data:ro
+      # 日志目录：容器内 /opt/energy/logs ↔ 宿主 ${APP_HOME}/logs
+      # pro profile 下按天写 guard-server.log / guard-server.YYYY-MM-DD.log
+      - ${APP_HOME}/logs:/opt/energy/logs
     depends_on:
       postgres:
         condition: service_healthy
@@ -89,6 +159,7 @@ services:
       - /opt/energy/app.jar
       - org.springframework.boot.loader.launch.PropertiesLauncher
       - --spring.config.name=thingsboard
+      - --spring.profiles.active=${SPRING_PROFILE:-dev}
       - --server.port=0
     logging: *default-logging
 
@@ -232,6 +303,8 @@ services:
 volumes:
   pgdata:
     name: energy-pgdata
+  cassandra-data:
+    name: energy-cassandra-data
   ngxai-data:
     name: energy-ngxai-data
   allinone-data:

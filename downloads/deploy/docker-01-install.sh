@@ -57,6 +57,7 @@ DB_USER=postgres
 DB_PASSWORD=$(gen_pass)
 DB_PORT=$_dp
 SERVER_HEAP=2g
+# dev = 只有控制台日志；pro = 生产，日志按天落盘到 ${APP_HOME}/logs/
 SPRING_PROFILE=dev
 AI_IMAGE=energy/ngxai-backend:4.4.0
 TB_API_USERNAME=tenant@thingsboard.org

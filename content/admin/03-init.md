@@ -48,14 +48,29 @@
 | `billing` / `billing_detail` | 用能账单与明细 | 同上 | 同上 |
 | `tb_sync_log` | 同步日志 | 同上 | 同上 |
 
-**不需要手工建，也不在 install 阶段** —— 它挂在 `ApplicationReadyEvent` 上，
-服务起来就有。判断方法：
+**不需要手工建**。它挂在 `ApplicationReadyEvent` 上，两个阶段都会触发：
+
+```
+docker-01-install.sh（建库）→ 表在这里就建好了   ← 全新安装走这条
+energy-server 启动         → 表已在，跳过（幂等）
+```
+
+判断方法（**先查表在不在，别只看 server 日志**）：
 
 ```bash
-docker compose logs energy-server | grep energy-schema
-# 有「能源自建表补齐：新建 N 个对象」→ 建过
-# 完全没这行 → 表本来就齐（幂等，没事不打日志）
+# 1. 表在不在（唯一判据）
+docker compose exec -T postgres psql -U postgres -d thingsboard -tAc "
+SELECT t, CASE WHEN to_regclass('public.'||t) IS NULL THEN '缺失' ELSE 'OK' END
+FROM unnest(ARRAY['meter_reading_batch','meter_reading_record',
+                  'billing','billing_detail','tb_sync_log']) AS t;"
+
+# 2. 建表日志在哪
+grep energy-schema /tmp/energy-install.log    # install 阶段（全新安装看这里）
+docker compose logs energy-server | grep energy-schema   # server 阶段（表缺时才打）
 ```
+
+⚠️ `docker logs energy-server` 里**没有** `energy-schema` 不代表没建 ——
+全新安装时是在 install 阶段建的，server 起来只会看到表已存在（走 DEBUG，不打 INFO）。
 
 **为什么单独说这件事**：这 4 张表的 DDL 早就写在
 `nenghaobao/energy-config/sql/`，但当初只有一个手工迁移脚本把它们建在

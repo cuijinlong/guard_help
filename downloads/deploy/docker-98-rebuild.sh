@@ -309,5 +309,8 @@ echo
 echo "  入口      http://127.0.0.1:8090"
 echo "  凭据      $CRED"
 echo "  日志      /tmp/rebuild-{prepare,install,start,onboard,verify,data,e2e}.log"
+echo
+echo "  遥测存储   Postgres（默认）。要换 Cassandra："
+echo "               bash scripts/11-cassandra.sh enable"
 echo "============================================================"
 [[ "$FAILED" == "0" ]] || exit 1

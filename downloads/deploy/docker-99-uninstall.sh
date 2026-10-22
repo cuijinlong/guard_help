@@ -8,6 +8,11 @@
 #   bash docker-99-uninstall.sh --purge --yes      同上，不再询问
 #   bash docker-99-uninstall.sh --purge --dry-run  只列出会删什么，不真删（推荐先跑）
 #
+# Cassandra（可选遥测后端）：
+#   只要 Cassandra 容器起过（--profile cassandra），上面每条命令都会**自动带上**它 ——
+#   不用额外传参。启用过 Cassandra 的部署，数据卷会多一个 energy-cassandra-data，
+#   --purge 时会一并删除（dry-run 会列出来）。
+#
 # 镜像清理是独立开关，默认【保留】镜像：
 #   bash docker-99-uninstall.sh --purge --yes --images=app      只删自建镜像（推荐）
 #   bash docker-99-uninstall.sh --purge --yes --images=all      连公共基础镜像一起删
@@ -60,6 +65,15 @@ case "$MODE" in
   *)        PROFILE_ARGS="" ;;
 esac
 
+# Cassandra 是可选 profile：只有真的用过才带上，否则 compose 会去拉镜像。
+# 判据用「卷或容器存在」，用户不用记着传 --cassandra。
+CASS_PROFILE=""
+if docker volume ls --format '{{.Name}}' 2>/dev/null | grep -qx energy-cassandra-data \
+   || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx energy-cassandra; then
+  CASS_PROFILE="--profile cassandra"
+  PROFILE_ARGS="$PROFILE_ARGS --profile cassandra"
+fi
+
 # ---------------------------------------------------------------- 只停服务
 if [[ "$PURGE" != "true" ]]; then
   log "停止服务（保留数据卷与镜像）"
@@ -75,6 +89,7 @@ echo
 warn "即将彻底删除以下内容，不可恢复："
 echo "   · 本项目全部容器"
 echo "   · 数据卷 energy-pgdata / energy-ngxai-data / energy-allinone-data"
+  [[ -n "$CASS_PROFILE" ]] && echo "   · 数据卷 energy-cassandra-data（检测到用过 Cassandra）"
 echo "   · 网络 energy_default"
 echo "   · 目录 ${APP_HOME}（jar、data、日志、前端产物）"
 case "$IMAGES" in
@@ -124,7 +139,7 @@ fi
 log "删除容器、网络、卷"
 $COMPOSE $PROFILE_ARGS down -v --remove-orphans 2>/dev/null || $COMPOSE down -v --remove-orphans 2>/dev/null || true
 # down -v 对未在 compose 声明的外部卷不生效，按名字兜底
-docker volume rm -f energy-pgdata energy-ngxai-data energy-allinone-data >/dev/null 2>&1 || true
+docker volume rm -f energy-pgdata energy-ngxai-data energy-allinone-data energy-cassandra-data >/dev/null 2>&1 || true
 docker network rm energy_default >/dev/null 2>&1 || true
 docker ps -aq --filter "name=energy-" | xargs -r docker rm -f >/dev/null 2>&1 || true
 

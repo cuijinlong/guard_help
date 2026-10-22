@@ -660,12 +660,300 @@ docker image prune -f        # 清悬空镜像（<none>）
 | 磁盘 | `df -h /` | 低于 10% 立即清理，见第 10 节 |
 | 慢查询 | `SELECT * FROM pg_stat_activity WHERE state='active' AND now()-query_start > interval '30s';` | 长时间 active 的查询要优化 |
 
-日志位置：
+### 日志在哪：**没有文件日志，全在 Docker 里**
+
+这一点必须先说清楚，否则会去找一个不存在的文件。
+
+```
+energy-server 的 logback.xml 只有 ConsoleAppender（STDOUT）
+        │
+        ▼
+   Docker json-file 驱动接管
+        │
+        ▼
+/var/lib/docker/containers/<容器id>/<容器id>-json.log
+        │
+        ▼
+   docker logs / docker compose logs 读它
+```
+
+**关键事实**：
+
+| 项目 | 实际情况 |
+| --- | --- |
+| 有没有 `/opt/energy/logs/guard-server.log` | **没有**。这个目录挂载着（→ 宿主 `~/energy-app/logs`）但永远空 |
+| 日志按天切吗 | **不按天**，按**大小**切 |
+| 每个容器保留多少 | `max-size=50m` × `max-file=5` = **最多 250MB**，超了滚掉 |
+| 滚动会丢吗 | **会**。超过 250MB 的旧日志被删除，不进任何归档 |
+| 容器重建后还在吗 | **不在**。`docker compose down` 后 json.log 随容器删除 |
+
+**怎么确认当前配置**：
 
 ```bash
-docker compose logs --tail=200 energy-server | grep -E "ERROR|Caused by"
-docker compose logs --tail=100 gateway
+# 轮转策略（每个容器都一样，来自 docker-compose.yml 的 x-logging）
+docker inspect energy-server \
+  --format '{{.HostConfig.LogConfig.Type}} {{.HostConfig.LogConfig.Config}}'
+# 期望输出：json-file map[max-file:5 max-size:50m]
+
+# 日志文件真实位置与大小
+docker inspect energy-server --format '{{.LogPath}}'
 ```
+
+**常用查法**：
+
+```bash
+docker compose logs --tail=200 energy-server          # 最近 200 行
+docker compose logs --since 30m energy-server         # 最近 30 分钟
+docker compose logs -f energy-server                  # 实时跟
+docker compose logs energy-server | grep -E "ERROR|Caused by"
+```
+
+⚠️ **别 `tail /opt/energy/logs/*.log`** —— 那里是空的。
+这是本项目手册早前写错的地方（2026-10-22 修正）。
+
+**想长期留存怎么办**：Docker 的 json.log 不做归档。
+需要留存时在执行操作前先导出：
+
+```bash
+docker compose logs --since 24h energy-server > /tmp/energy-server-$(date +%F).log
+```
+
+> 如果你的场景需要「一天一个文件、保留 N 天」，
+> 那得给 logback 加 FileAppender（改 `logback.xml` 后重打 jar），
+> 当前版本**没有**这个能力。
+
+## 11A. 日志排查命令大全（照抄即用）
+
+> 先决条件：`SPRING_PROFILE=pro` 时日志会按天落盘到 `~/energy-app/logs/`。
+> dev 模式只有容器控制台，下面的 `logs/` 命令要换成 `docker compose logs`。
+
+### 11A.1 日志在哪
+
+```
+① 文件日志（pro 模式，按天）
+   ~/energy-app/logs/guard-server.log              ← 今天正在写
+   ~/energy-app/logs/guard-server.2026-10-21.log   ← 归档（保留 30 天）
+
+② 容器控制台（任何模式都有）
+   docker compose logs energy-server
+      ↳ 底层是 /var/lib/docker/containers/<id>/<id>-json.log
+      ↳ 按大小轮转：50MB × 5 个 = 最多 250MB，超了滚掉
+```
+
+**两者内容相同**，区别是：文件日志按天留存、可用 `grep`/`awk` 精细处理；
+控制台适合实时跟、且不受 `docker compose down` 之外的删除影响。
+
+```bash
+cd ~/energy-app
+
+# 今天
+tail -f logs/guard-server.log
+
+# 指定日期
+less logs/guard-server.2026-10-21.log
+
+# 最近 N 行（等价于 docker compose logs --tail）
+tail -200 logs/guard-server.log
+```
+
+### 11A.2 三个基础动作
+
+```bash
+# ① 实时跟（排障时开着，复现一次就抓到）
+tail -f logs/guard-server.log
+
+# ② 只看最近 30 分钟
+awk -v t="$(date -v-30M '+%Y-%m-%d %H:%M:%S')" '$0 >= t' logs/guard-server.log
+
+# ③ 某个时间窗（例：14:00 到 15:00 之间出事）
+sed -n '/2026-10-22 14:00/,/2026-10-22 15:00/p' logs/guard-server.log
+```
+
+> macOS 的 `date -v-30M` 在 Linux 上要写 `date -d '30 minutes ago'`。服务器上是后者。
+
+### 11A.3 按级别筛
+
+```bash
+# 只看错误（最常用）
+grep -E " (ERROR|FATAL) " logs/guard-server.log
+
+# 警告 + 错误
+grep -E " (WARN|ERROR|FATAL) " logs/guard-server.log
+
+# 排除噪音，只看真正的业务错误
+grep " ERROR " logs/guard-server.log | grep -v "GitSyncService"
+
+# 统计各级别条数（一眼看出今天健康不健康）
+awk '{for(i=1;i<=NF;i++) if($i=="ERROR"||$i=="WARN"||$i=="INFO"){print $i; break}}' \
+  logs/guard-server.log | sort | uniq -c | sort -rn
+```
+
+### 11A.4 关键词匹配（按问题类型）
+
+```bash
+# 数据库
+grep -iE "SQLException|BadSqlGrammar|relation .* does not exist|constraint|deadlock" \
+  logs/guard-server.log
+
+# 表/字段不存在（迁移漏表的典型症状）
+grep -iE 'relation "[a-z_]+" does not exist' logs/guard-server.log
+
+# 超时
+grep -iE "timeout|timed out|Read timed out|connect timed out" logs/guard-server.log
+
+# 内存
+grep -iE "OutOfMemory|heap space|GC overhead" logs/guard-server.log
+
+# 空指针（多半是代码 bug）
+grep -iE "NullPointerException" logs/guard-server.log
+
+# 权限 / 认证
+grep -iE "AccessDenied|Unauthorized|403|401|BadCredentials" logs/guard-server.log
+
+# 设备接入（MQTT / HTTP）
+grep -iE "mqtt|transport|Credentials|device.*not found" logs/guard-server.log
+
+# 规则链 / 计算字段
+grep -iE "rule.engine|calculated.field|RuleNode|CalculatedField" logs/guard-server.log
+
+# 能源业务（本项目自建的部分）
+grep -iE "\[energy\]|\[energy-schema\]|meter-reading|self-check" logs/guard-server.log
+```
+
+### 11A.5 带上下文（定位根因的关键）
+
+错误行本身往往没用，**前因在它上面几行**：
+
+```bash
+# 错误前后各 5 行
+grep -n -B5 -A10 " ERROR " logs/guard-server.log
+
+# 把整段异常栈打出来（Caused by 才是根因）
+grep -n -A30 "Exception" logs/guard-server.log | grep -E "Caused by|at com.guard" | head -30
+
+# 只看本项目自己的代码行（过滤掉 Spring/JDK 的栈帧）
+grep -E "^\s+at com\.guard" logs/guard-server.log | sort | uniq -c | sort -rn | head -20
+```
+
+### 11A.6 聚合统计（找规律）
+
+```bash
+# 出现最多的错误消息（去掉时间戳和线程名，只留消息正文）
+grep " ERROR " logs/guard-server.log \
+  | sed -E 's/^[0-9-]+ [0-9:,]+ \[[^]]*\] ERROR +[^ ]+ - //' \
+  | sort | uniq -c | sort -rn | head -20
+
+# 按小时看错误分布（判断是持续故障还是瞬时抖动）
+grep " ERROR " logs/guard-server.log \
+  | awk '{print substr($2,1,2)":00"}' | sort | uniq -c
+
+# 哪些 logger 在刷屏（找出噪音源）
+awk '/^[0-9]{4}-/ {for(i=1;i<=NF;i++) if($i=="INFO"||$i=="WARN"||$i=="ERROR"){print $(i+1); break}}' \
+  logs/guard-server.log | sort | uniq -c | sort -rn | head -15
+```
+
+### 11A.7 追踪一次请求
+
+本平台日志**没有 requestId / traceId**（TB 未启用 MDC），所以只能靠
+**线程名 + 时间窗**定位：
+
+```bash
+# 1. 先找到可疑时间点（用户报障的时间）
+grep "2026-10-22 14:3" logs/guard-server.log | tail -50
+
+# 2. 从错误行拿到线程名，例：[http-nio-0.0.0.0-8090-exec-5]
+# 3. 追这个线程的全部输出
+grep "http-nio-0.0.0.0-8090-exec-5" logs/guard-server.log
+
+# 4. HTTP 请求的线程名规律
+#    http-nio-0.0.0.0-8090-exec-N       REST 请求
+#    sql-log-N-thread-1                 SQL 批量写
+#    TB-Scheduling-N                    定时任务
+#    git-sync-N-thread-1                git 同步（可忽略，见 11A.8）
+```
+
+> 想真正拿到 requestId，需要在 `logback-spring.xml` 的 pattern 里加
+> `%X{requestId}` 并在过滤器里 `MDC.put`。当前版本没做。
+
+### 11A.8 已知噪音（可以安全忽略）
+
+这几条出现**不代表故障**，别浪费时间：
+
+| 日志内容 | 原因 | 要不要处理 |
+| --- | --- | --- |
+| `DefaultGitSyncService ... Failed to initialize repository ... github.com/thingsboard/data-converters.git` | 内网/离线环境拉不到 GitHub。TB 内置的示例库同步 | **不用**。功能不依赖它 |
+| `AgentAppTemplateSyncService ... sync completed` | 正常心跳 | 不用 |
+| `Transport Stats: connections_active[protocol=MQTT] [0]` | 每分钟统计，0 表示当前无设备连接 | 有设备在线时应当 > 0 |
+| `TbSqlBlockingQueue ... totalFailed [0]` | 写库队列统计，`totalFailed` 才是关键 | 0 正常；非 0 要查 |
+| `HikariPool-N - Starting...` / `Start completed` | 连接池正常启动 | 不用 |
+
+**过滤掉噪音看真正的错误**：
+
+```bash
+grep " ERROR " logs/guard-server.log \
+  | grep -vE "GitSyncService|data-converters" 
+```
+
+### 11A.9 按本项目历史故障反查（最有用的表）
+
+这份表是从实际踩过的坑反推出来的 **grep 速查**：
+
+| 症状 | 命令 | 典型根因 |
+| --- | --- | --- |
+| 页面 500 / 提示表不存在 | `grep 'relation ".*" does not exist' logs/guard-server.log` | 迁移漏表（抄表/账单那 5 张） |
+| 客户登录后空白 | `grep -iE "customMenu|HomeMenuItem|homeDashboard" logs/guard-server.log` | 菜单第一项不是 home |
+| 看不费率 / 组织树空 | `grep -iE "visible-sites|organization|energyRates" logs/guard-server.log` | 组织缺失或费率层级断 |
+| 峰谷报表全 0 | `grep -iE "tou-analysis\|touScheme\|scheme" logs/guard-server.log` | 分时方案没命中 |
+| 闲时告警不出 | `grep -iE "idle_exceed\|IdleEnergy\|Required arguments" logs/guard-server.log` | 计算字段没拿到参数 |
+| 设备上报 404 | `grep -iE "v1/.*telemetry\|Device.*not found\|Invalid credentials" logs/guard-server.log` | token 错 / 设备不存在 |
+| MQTT 连不上 | `grep -iE "MQTT\|CONNACK\|transport.*start" logs/guard-server.log` | 端口没映射 / transport 未就绪 |
+| 激活链接打不开 | `grep -iE "activationLink\|baseUrl" logs/guard-server.log` | `X-Forwarded-Port` 缺失 |
+| 启动报 bean 找不到 | `grep -iE "NoSuchBeanDefinition\|Unsatisfied dependency" logs/guard-server.log` | 包不在 `@ComponentScan` |
+| 建表没生效 | `grep "energy-schema" logs/guard-server.log /tmp/energy-install.log` | 表在 install 阶段建的 |
+
+### 11A.10 导出与归档
+
+```bash
+# 导出最近 24 小时（发给开发排查）
+docker compose logs --since 24h energy-server > /tmp/server-$(date +%F).log
+
+# 导出指定日期的文件日志
+cp logs/guard-server.2026-10-21.log /tmp/
+
+# 打包所有日志（注意体积）
+tar czf /tmp/energy-logs-$(date +%F).tar.gz logs/
+
+# 只看某个客户/设备相关的
+grep "<设备uuid>\|<客户uuid>" logs/guard-server.log
+
+# 把 ERROR 段单独抽出来（通常只有几百 KB，便于传阅）
+grep -A30 " ERROR " logs/guard-server.log > /tmp/errors-$(date +%F).log
+```
+
+### 11A.11 日志占多少磁盘
+
+```bash
+# 文件日志（pro 模式）
+du -sh ~/energy-app/logs/
+ls -lh ~/energy-app/logs/
+
+# 归档超过 30 天的会被自动删除（maxHistory=30）
+# 总量上限 2GB（totalSizeCap），超了从最旧的删
+
+# 容器控制台日志
+docker inspect energy-server --format '{{.LogPath}}' | xargs ls -lh
+```
+
+**日志暴涨的排查**（一天几百 MB 通常不正常）：
+
+```bash
+# 哪个 logger 在刷
+awk '/^[0-9]{4}-/ {for(i=1;i<=NF;i++) if($i=="INFO"||$i=="WARN"||$i=="ERROR"){print $(i+1); break}}' \
+  logs/guard-server.log | sort | uniq -c | sort -rn | head -5
+```
+
+最常见是某个设备高频上报、或规则链死循环。先看 `TbSqlBlockingQueue` 的
+`totalAdded` 增长速度。
 
 ## 12. 排障通用三件套
 
@@ -673,8 +961,8 @@ docker compose logs --tail=100 gateway
 # 1. 端口在不在
 lsof -nP -iTCP:8090 -sTCP:LISTEN
 
-# 2. 最近的错误
-tail -200 /opt/energy/logs/guard-server.log | grep -E "ERROR|Caused by"
+# 2. 最近的错误（日志在 Docker 里，不是文件）
+docker compose logs --tail=200 energy-server | grep -E "ERROR|Caused by"
 
 # 3. 状态自检
 curl -s --noproxy '*' http://127.0.0.1:8090/api/noauth/setup/state
@@ -857,27 +1145,52 @@ tenant（租户 / 能源服务商）
 设备数 × 12 行。单表能撑，但查询永远带时间范围（台账按账期、报表按月），
 分区后只扫目标月份，也便于整月归档或删除。
 
-**建表在什么时候发生**
+**建表在什么时候发生 —— 两个阶段，同一个方法**
 
 ```
-energy-server 启动
+① install 建库阶段（docker-01-install.sh）
+   ThingsboardInstallApplication 启动
+      │  它的 @ComponentScan 包含 com.guard.server.service.install
+      ▼
+   ApplicationReadyEvent
       │
       ▼
-ApplicationReadyEvent
+   EnergySchemaInstaller.ensureEnergyTables()   ← 全新库在这里就把表建好
+      │
+② energy-server 启动阶段
+   ApplicationReadyEvent
       │
       ▼
-EnergySchemaInstaller.ensureEnergyTables()
-      │
-      ├─ 表在？ ──在──▶ 什么都不做（幂等）
-      │
-      └─ 不在 ──▶ 建表 + 建索引 + 建分区函数 + 建当月及未来两个月分区
+   ensureEnergyTables()   ← 表已在 → 直接返回，什么也不做
 ```
 
-日志特征（建了东西才会打 INFO）：
+**为什么两个阶段都会触发**：`install` 和 `server` 是两个独立进程，
+但扫描到同一个组件、监听同一个事件。结果是——
+**全新安装时，`docker-01-install.sh` 跑完表就有了**，
+`energy-server` 起来时只是确认一遍。
+
+**日志去哪个文件找**：
+
+| 阶段 | 日志位置 | 特征 |
+| --- | --- | --- |
+| install 建库 | `/tmp/energy-install.log`（重装脚本）/ 命令行输出 | `能源自建表补齐：新建 8 个对象` |
+| server 启动 | `docker logs energy-server` | **表已存在时不打 INFO**（只有 DEBUG） |
+
+⚠️ **别只查 `docker logs energy-server` 就断言「没建表」** ——
+如果是 install 阶段建的，server 日志里什么都不会有。
+先用 14.18 的 SQL 查表在不在，那才是判据。
+
+日志特征（真正建了东西才打 INFO）：
 
 ```
-[energy-schema] 能源自建表补齐：新建 5 个对象，分区 [meter_reading_record_2026_10, ...]
+[energy-schema] 能源自建表补齐：新建 8 个对象，分区 [meter_reading_record_2026_10, ...]
 ```
+
+「8 个对象」= 5 张表 + 3 个分区，`created` 列表把两者都算进去了。
+
+**幂等性实测**（2026-10-22 重装验证）：全新库 install 阶段建 8 个对象；
+随后 `energy-server` 启动无日志；再跑两次 `repair-init` 也不碰表。
+
 
 **这是一次真实的迁移事故**：这 4 张表的 DDL 早就写在
 `nenghaobao/energy-config/sql/`（01-billing / 02-meter-reading /
@@ -892,6 +1205,36 @@ EnergySchemaInstaller.ensureEnergyTables()
 
 **教训**：功能上线前，必须在**全新空库**上跑一遍完整流程，
 而不是在「跑了几个月、表早就手工建好」的库上验收。
+
+---
+
+## 13A. Cassandra（可选存储后端）
+
+Cassandra 是**可选的遥测存储**，默认不用（遥测存 Postgres）。
+
+**完整文档在独立页面**：[②b Cassandra](/admin/cassandra) ——
+安装启用、切回、卸载、cqlsh 查询、nodetool 运维、备份恢复、常见故障都在那里。
+
+这里只留三条**最容易在排障时撞上**的：
+
+**① 改 `.env` 直接重启会失败**
+
+```
+InvalidKeyspaceException: Invalid keyspace thingsboard
+```
+
+keyspace 只在 install 阶段建（`@Profile("install")`），server 不会补。
+正确做法：`bash scripts/11-cassandra.sh enable`（内部走 TB 原生 install）。
+
+**② install 报 `tenant_profile_name_unq_key` 重复键是正常的**
+
+非空库上 install 会在重建系统数据时撞重复键 —— 但 Cassandra 建表在它**之前**
+已完成。判成败看 keyspace 与两张表是否存在，不看 install 退出码。
+
+**③ `data/cassandra/` 必须存在**
+
+早先打包漏了这个目录，install 直接崩 `NoSuchFileException`。
+已修；若你的部署目录缺，重跑 `docker-00-prepare.sh --force`。
 
 ---
 

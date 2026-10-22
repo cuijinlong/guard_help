@@ -23,6 +23,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 DATA_SRC="$ROOT/guard-server/src/main/data"
 SQL_SRC="$ROOT/dao/src/main/resources/sql"
+# Cassandra 的建表 CQL（可选后端）。install 会从 ${install.data_dir}/cassandra/ 读，
+# 少了这个目录、又把 DATABASE_TS_TYPE 改成 cassandra 时，install 直接崩：
+#   java.nio.file.NoSuchFileException: /opt/energy/data/cassandra/schema-keyspace.cql
+# 实测 2026-10-22：打包漏了这个目录，切 Cassandra 一直失败。
+CQL_SRC="$ROOT/dao/src/main/resources/cassandra"
 JAR="$ROOT/guard-server/target/guard-server-4.4.0.jar"
 
 TARGET=""
@@ -122,12 +127,15 @@ fi
 
 log "组装部署目录：$STAGE"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/data/sql" "$STAGE/logs" "$STAGE/scripts"
+mkdir -p "$STAGE/data/sql" "$STAGE/data/cassandra" "$STAGE/logs" "$STAGE/scripts"
 
 cp "$JAR" "$STAGE/guard-server-4.4.0.jar"
 cp -R "$DATA_SRC/json" "$STAGE/data/"
 # 仓库里 data/sql 是符号链接，必须从 dao 的真实目录拷贝
 cp "$SQL_SRC"/*.sql "$STAGE/data/sql/"
+# Cassandra 建表脚本（schema-keyspace / schema-ts / schema-ts-latest）。
+# 不用 Cassandra 时这几个文件是死重量（<2KB），但漏了就无法启用，宁可带上。
+cp "$CQL_SRC"/*.cql "$STAGE/data/cassandra/" 2>/dev/null || true
 cp "$HERE/docker-compose.yml"        "$STAGE/"
 # 不再拷 env.example 到部署目录：第 3 节会直接生成 .env，
 # 目录里只留一个配置文件，避免“到底该改哪个”的困惑。
@@ -297,6 +305,7 @@ DB_PORT=$ENV_DB_PORT
 MQTT_PORT=$ENV_MQTT_PORT
 SERVER_HEAP=2g
 SERVER_HEAP_MB=2048
+# dev = 只有控制台日志；pro = 生产，日志按天落盘到 ${APP_HOME}/logs/
 SPRING_PROFILE=dev
 AI_IMAGE=energy/ngxai-backend:4.4.0
 ALLINONE_IMAGE=energy/allinone:4.4.0

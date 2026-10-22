@@ -64,6 +64,11 @@
           "file": "admin/02-deploy.md"
         },
         {
+          "id": "cassandra",
+          "title": "②b Cassandra（可选存储）",
+          "file": "admin/02b-cassandra.md"
+        },
+        {
           "id": "init",
           "title": "③ 数据初始化",
           "file": "admin/03-init.md"
