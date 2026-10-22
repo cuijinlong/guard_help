@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=59
+EXPECTED_PASS=60
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -332,10 +332,26 @@ has  "「峰谷时段」已改名" "$TITLES" '峰谷时段' \
 hasnt "无旧名「基础配置中心」" "$TITLES" '基础配置中心' \
      '同上'
 
-# 客户副本不应残留占位符
-PH=$(DASH_DB "SELECT count(*) FROM dashboard WHERE customer_id <> '13814000-1dd2-11b2-8080-808080808080' AND configuration LIKE '%00000000-0000-0000-0000-00000000%';" | tr -d ' ')
-eq "客户看板残留占位符" "${PH:-0}" "0" \
-   '跑一键修复初始化（repairCustomerDashboards 就地重写）；或重建客户'
+# 客户副本里**不能有指向租户级实体的真实 id**。
+#
+# ★ 这里曾经写成「不能有占位符」，是错的（2026-10-23 修正）：
+#   占位符是**有意保留**的 —— 租户级主数据（能源参数字典 / 电能品种）
+#   客户无权读，替换成真实 id 会 403；留占位符前端静默跳过。
+#   反过来说，客户看板里出现租户级资产的**真实 id** 才是问题。
+#
+# 判断方法：拿租户级资产 id 去 LIKE 客户的 configuration。
+LEAK=$(DASH_DB "
+WITH ta AS (SELECT id::text AS aid FROM asset
+            WHERE customer_id = '13814000-1dd2-11b2-8080-808080808080')
+SELECT count(*) FROM dashboard d, ta
+WHERE d.customer_id IS NOT NULL AND d.configuration LIKE '%'||ta.aid||'%';" | tr -d ' ')
+eq "客户看板无租户级实体引用" "${LEAK:-0}" "0" \
+   '客户会 403+404 刷屏：用 SQL 把这些 id 换回占位符 00000000-0000-0000-0000-0000000011b7（见故障排查「现象 I」）'
+
+# 占位符本身应当在（租户级主数据的引用就靠它）
+PH=$(DASH_DB "SELECT count(*) FROM dashboard WHERE customer_id IS NOT NULL AND configuration LIKE '%00000000-0000-0000-0000-00000000%';" | tr -d ' ')
+ge "客户看板保留占位符" "${PH:-0}" "1" \
+   '租户级主数据的引用应当留占位符；全是真实 id 说明替换表又把手伸到租户级资产了'
 
 # 峰谷时段 6 个部件不能重叠
 OVERLAP=$(DASH_DB "SELECT configuration FROM dashboard WHERE customer_id IS NULL AND title='峰谷时段' LIMIT 1;" | python3 -c "

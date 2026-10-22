@@ -768,50 +768,80 @@ energy-server 的 logback.xml 只有 ConsoleAppender（STDOUT）
    docker logs / docker compose logs 读它
 ```
 
+**日志有两份，取决于 `SPRING_PROFILE`**：
+
+| profile | 控制台（Docker） | 文件（宿主 `~/energy-app/logs/`） |
+| --- | --- | --- |
+| `dev` | ✓ | ✗ 不生成 |
+| **`pro`（生产）** | ✓ | ✓ **一天一个文件**，保留 30 天 |
+
+```
+pro 模式：
+
+  logback-spring.xml
+        ├── ConsoleAppender ──▶ stdout ──▶ Docker json-file ──▶ docker logs
+        └── RollingFileAppender ─▶ /opt/energy/logs/guard-server.log
+                                      │  过了当天自动重命名
+                                      ▼
+                                  guard-server.2026-10-22.log
+                                  guard-server.2026-10-23.log
+                                  …（最多 30 个，总量上限 2GB）
+```
+
 **关键事实**：
 
 | 项目 | 实际情况 |
 | --- | --- |
-| 有没有 `/opt/energy/logs/guard-server.log` | **没有**。这个目录挂载着（→ 宿主 `~/energy-app/logs`）但永远空 |
-| 日志按天切吗 | **不按天**，按**大小**切 |
-| 每个容器保留多少 | `max-size=50m` × `max-file=5` = **最多 250MB**，超了滚掉 |
-| 滚动会丢吗 | **会**。超过 250MB 的旧日志被删除，不进任何归档 |
-| 容器重建后还在吗 | **不在**。`docker compose down` 后 json.log 随容器删除 |
+| 文件在哪 | 宿主 `~/energy-app/logs/`（挂载到容器 `/opt/energy/logs`） |
+| 文件名 | 当天：`guard-server.log`；归档：`guard-server.YYYY-MM-DD.log` |
+| 按天切吗 | **pro 模式按天切**（`TimeBasedRollingPolicy`，严格一天一个，不按大小分片） |
+| 保留多久 | `maxHistory=30` 天，更早的自动删 |
+| 总量上限 | `totalSizeCap=2GB`，30 天加起来超 2GB 就从最旧的删 |
+| `dev` 模式有文件吗 | **没有**，只有控制台 |
+| 容器控制台日志 | `json-file`，`max-size=50m` × `max-file=5` = 最多 250MB，`down` 后随容器删除 |
 
-**怎么确认当前配置**：
+**怎么确认当前是哪个模式**：
 
 ```bash
-# 轮转策略（每个容器都一样，来自 docker-compose.yml 的 x-logging）
-docker inspect energy-server \
-  --format '{{.HostConfig.LogConfig.Type}} {{.HostConfig.LogConfig.Config}}'
-# 期望输出：json-file map[max-file:5 max-size:50m]
+cd ~/energy-app
+grep '^SPRING_PROFILE' .env          # 期望 pro
+ls -lh logs/                          # 期望看到 guard-server.log
+head -3 logs/guard-server.log         # 期望 "The following 1 profile is active: \"pro\""
+```
 
-# 日志文件真实位置与大小
-docker inspect energy-server --format '{{.LogPath}}'
+**切到生产模式**（如果没有文件日志）：
+
+```bash
+sed -i 's/^SPRING_PROFILE=.*/SPRING_PROFILE=pro/' ~/energy-app/.env
+cd ~/energy-app && docker compose --profile split up -d --force-recreate energy-server
+# 改环境变量必须 up -d，restart 不生效
 ```
 
 **常用查法**：
 
 ```bash
-docker compose logs --tail=200 energy-server          # 最近 200 行
-docker compose logs --since 30m energy-server         # 最近 30 分钟
-docker compose logs -f energy-server                  # 实时跟
+cd ~/energy-app
+
+# 文件日志（pro）
+tail -f logs/guard-server.log                     # 实时跟
+tail -200 logs/guard-server.log                   # 最近 200 行
+less logs/guard-server.2026-10-22.log             # 看某一天
+
+# 控制台（任何模式都有）
+docker compose logs --tail=200 energy-server
+docker compose logs --since 30m energy-server
+docker compose logs -f energy-server
 docker compose logs energy-server | grep -E "ERROR|Caused by"
 ```
 
-⚠️ **别 `tail /opt/energy/logs/*.log`** —— 那里是空的。
-这是本项目手册早前写错的地方（2026-10-22 修正）。
+> 两者内容相同。文件日志便于按日期回溯与归档，控制台便于实时跟。
 
-**想长期留存怎么办**：Docker 的 json.log 不做归档。
-需要留存时在执行操作前先导出：
+**日志配置在哪**：`guard-server/src/main/resources/logback-spring.xml`。
 
-```bash
-docker compose logs --since 24h energy-server > /tmp/energy-server-$(date +%F).log
-```
-
-> 如果你的场景需要「一天一个文件、保留 N 天」，
-> 那得给 logback 加 FileAppender（改 `logback.xml` 后重打 jar），
-> 当前版本**没有**这个能力。
+⚠️ 文件名必须是 `logback-spring.xml`，不能是 `logback.xml` ——
+只有 `-spring` 后缀才会被 Spring Boot 的 Joran 配置器加载，
+`<springProfile>` 标签才生效。早期用 `logback.xml` 时该标签会被忽略，
+表现为「配置写了但 dev/pro 没区别」。
 
 ## 11A. 日志排查命令大全（照抄即用）
 
@@ -1189,6 +1219,77 @@ tenant（租户 / 能源服务商）
 **关键约束**：TB 的计算字段参数（`TS_LATEST`）只从本次上报的那批遥测取值，
 不去库里查最新点。直接把值写进 `ts_kv` 不会触发告警，症状是规则一直报
 `Required arguments are missing: exceed`。
+
+### 13.4b 看板配置里的 id：三类，只有一类要担心
+
+客户的 20 个看板都是从**租户级模板**复制出来的。模板是共享的，
+所以里面不能用某个客户的真实 id，只能用约定的**占位符**：
+
+```
+00000000-0000-0000-0000-00000000xxxx
+```
+
+复制给客户时，「该替换的」换成那个客户的真实 id，「不该替换的」保留占位符。
+
+```
+                    ┌─────────────────────────────┐
+                    │ 模板（租户名下 20 个看板）      │
+                    │  全部是占位符                  │
+                    └──────────────┬──────────────┘
+                                   │ 复制给客户
+                                   ▼
+              ┌────────────────────┴────────────────────┐
+              │         按「引用的是谁」分流              │
+              └───────┬───────────────────────┬─────────┘
+                      │                       │
+        ┌─────────────▼──────────┐  ┌─────────▼────────────────┐
+        │ 客户级实体（能替换）      │  │ 租户级实体（保持占位符）    │
+        │  · 场站  …05a1          │  │  · 能源参数字典  …11b7     │
+        │  · 4 个维度根 d101~d104 │  │  · 电能品种节点  …e1ec     │
+        │  · 用电分项根  …17e0    │  │                            │
+        └─────────────┬──────────┘  └─────────┬─────────────────┘
+                      │                       │
+                      ▼                       ▼
+        换成客户真实 id                原样保留占位符
+        客户有权读 → 200              前端不发请求，部件走 API
+```
+
+**三类 id 的判断表**（在 `configuration` JSON 里看到的 UUID）：
+
+| 类别 | 例子 | 正常吗 | 说明 |
+| --- | --- | --- | --- |
+| 占位符 | `00000000-…-0000000011b7` | ✓ | 前端当「上下文实体」哨兵，**不发请求** |
+| 客户自有实体 | 场站/维度根真实 id | ✓ | 客户有权读，200 |
+| 配置内部 id | 部件 id、alias key、datasource id | ✓ | 不是实体引用，前端内部用 |
+| **租户级实体** | 能源参数字典真实 id | ✗ | **403**，客户无权读 |
+| **别家客户实体** | 别的客户的场站 id | ✗ | 403/404 |
+
+**只有最后两类要修。**
+
+**为什么不能用「占位符数量是否为 0」当判据**
+
+这是本项目踩过的坑：早期验收脚本写「客户副本不应残留占位符 = 0」，
+把占位符一律视为错误。结果修好之后这条断言反而失败 ——
+因为租户级主数据的引用**本来就该留占位符**。
+
+正确判据是**反向检查**：客户看板里有没有出现**租户级资产的真实 id**。
+
+```sql
+-- 期望 0 行
+WITH ta AS (
+  SELECT id::text AS aid FROM asset
+  WHERE customer_id = '13814000-1dd2-11b2-8080-808080808080'
+)
+SELECT d.title, ta.aid
+FROM dashboard d, ta
+WHERE d.customer_id IS NOT NULL
+  AND d.configuration LIKE '%'||ta.aid||'%';
+```
+
+**设计原则**：**能从 API 拿的数据，不要通过实体别名拿。**
+实体别名受用户权限约束；API 只要接口放行，对客户与租户一视同仁。
+`/api/energy/metric-params` 就是按这个原则做的 —— 客户和租户都返回 200，
+所以部件不依赖「能源参数字典」那个实体。
 
 ### 13.5 自建表：哪些表是我们自己的，不属于 ThingsBoard
 

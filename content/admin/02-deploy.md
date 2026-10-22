@@ -99,8 +99,13 @@ docker compose --profile split exec -T postgres \
 cd ~/energy-app
 bash docker-02-start.sh \
   --admin-email langmen@126.com \
-  --admin-pass 'CJLqh@163'
+  --admin-pass 'CJLqh@163' \
+  --public-url 'http://<你的IP>:8090'
 ```
+
+**`--public-url` 决定客户拿到的激活链接**（不传会自动探测本机 IP + 端口）。
+生产环境请传真实域名，传错的表现是客户点开链接 404 —— 见
+[故障排查 → 现象 A2](/admin/troubleshoot#_现象-a2-客户账号建好了-但激活链接点开是-80-打不开)。
 
 **预计输出**：
 
@@ -116,6 +121,34 @@ bash docker-02-start.sh \
 **首次启动 3–5 分钟**（要构建分析服务镜像），之后重启 20 秒。
 
 **验证**：浏览器打开 `http://本机IP:8090`，用 `langmen@126.com / CJLqh@163` 登录。
+
+### 顺手确认两件事（生产必做）
+
+**① 日志是不是按天落盘**
+
+```bash
+cd ~/energy-app
+grep '^SPRING_PROFILE' .env     # 期望 pro（dev 只有控制台，不留文件）
+ls -lh logs/                     # 期望看到 guard-server.log
+```
+
+不是 `pro` 就改：
+
+```bash
+sed -i 's/^SPRING_PROFILE=.*/SPRING_PROFILE=pro/' .env
+docker compose --profile split up -d --force-recreate energy-server
+```
+
+**② 对外地址是否正确**
+
+```bash
+docker compose exec -T postgres psql -U postgres -d thingsboard -tAc \
+  "SELECT json_value FROM admin_settings WHERE key='general';"
+# 期望 baseUrl 是你的真实地址，不是 localhost:8080
+```
+
+> 日志规则：`pro` 一天一个文件 `guard-server.YYYY-MM-DD.log`，保留 30 天、总量上限 2GB。
+> 详见 [⑤ 常见问题 → 日志在哪](/admin/troubleshoot#_日志在哪-没有文件日志-全在-docker-里)。
 
 ---
 
@@ -542,7 +575,7 @@ docker compose --profile split up -d
 | `scripts/05-import-customer-data.py` | 客户台账导入 | `~/energy-app` |
 | `scripts/06-verify-e2e.sh` | 全链路验收（53 项） | `~/energy-app` |
 | `scripts/07-init-menu.sh` | 菜单重建 | `~/energy-app` |
-| `scripts/08-verify-release.sh` | 发布内容验收（59 项） | `~/energy-app` |
+| `scripts/08-verify-release.sh` | 发布内容验收（60 项） | `~/energy-app` |
 | `scripts/09-onboard-customer.sh` | **一键开通一个客户**（带演示数据） | `~/energy-app` |
 | `scripts/10-cleanup-customer.sh` | **清理一个客户**（连带遥测，含隔离校验） | `~/energy-app` |
 | `scripts/11-cassandra.sh` | **Cassandra 管理**（status/init/enable/disable/uninstall） | `~/energy-app` |
