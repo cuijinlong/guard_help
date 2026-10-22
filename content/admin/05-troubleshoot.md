@@ -332,6 +332,97 @@ docker compose exec -T postgres psql -U postgres -d thingsboard -tAc \
 新版后端已修，重装后该计数应为 0。
 
 
+### 现象 I：客户看板持续刷 403 + 404（同一个 id），几秒或一分钟一次
+
+**现象**：客户登录后，首页 Network 里反复出现**同一个 id**的两种请求：
+
+```
+GET /api/asset/9f9af670-...   403
+GET /api/device/9f9af670-...  404
+```
+
+间隔可能是 3 秒（部件无限重试）或 60 秒（页面定时刷新）。
+`Referer` 是 `/home`。
+
+**这和现象 H 正好相反**：
+
+| | 现象 H | 现象 I |
+| --- | --- | --- |
+| 问题 | 占位符**没被**替换 | 替换**过头**了 |
+| 请求的 id | `00000000-…` 开头的占位符 | 真实 id，但属于**租户级**实体 |
+| 状态码 | 404 | asset 403 / device 404 |
+
+**原因**：客户看板里存了**租户级资产**的 id。
+客户用户无权读租户级实体（`customer_id` = `NULL_UUID`），所以 403；
+前端失败后回退去试设备，但不是设备，所以 404。
+
+典型是「能源参数字典」「电能品种节点」这两个 —— 它们是租户级主数据，
+客户共用但不能直接读。
+
+**为什么部件会一直重试**：品种选项取不到 → `sources` 为空 →
+部件设了 `retryTimer`（3 秒）等它。看起来就是「一直在报」。
+
+**确认**（分类 config JSON 里所有 UUID）：
+
+```bash
+cd ~/energy-app
+docker compose exec -T postgres psql -U postgres -d thingsboard -tAc "
+WITH ta AS (
+  SELECT id FROM asset WHERE customer_id = '13814000-1dd2-11b2-8080-808080808080'
+)
+SELECT c.title, d.title, a.id
+FROM dashboard d
+JOIN customer c ON c.id = d.customer_id,
+     asset a
+WHERE a.id IN (SELECT id FROM ta)
+  AND d.configuration LIKE '%'||a.id||'%';"
+```
+
+有任何一行 → 就是这个问题。期望 **0 行**。
+
+**修法一（代码已修，新客户不再出现）**：
+`buildDashboardPlaceholders()` 已把「能源参数字典」「电能品种」从替换表移除，
+保持占位符。部件改用 `/api/energy/metric-params` 取品种（客户与租户都 200）。
+
+**修法二（存量客户，直接改数据）**：
+
+```sql
+-- 先把租户级资产的 id 找出来
+SELECT id, name FROM asset
+WHERE customer_id = '13814000-1dd2-11b2-8080-808080808080'
+  AND name IN ('能源参数字典');
+
+-- 把客户看板里的这些 id 换回占位符
+UPDATE dashboard
+SET configuration = replace(configuration,
+      '<上面查到的id>',
+      '00000000-0000-0000-0000-0000000011b7')
+WHERE customer_id IS NOT NULL
+  AND configuration LIKE '%<上面查到的id>%';
+```
+
+**⚠ 改完必须让用户强制刷新浏览器**（`Cmd+Shift+R` / `Ctrl+Shift+R`）。
+数据库改了，但**已经打开的页面内存里还是旧配置**，会继续重试。
+表现是「间隔从 3 秒变成 60 秒但没消失」—— 改数据前就已经打开的页面不会自动重新拉取。
+
+**验证刷新后确实没事**：用客户 token 逐个解析全部看板的别名，
+真实 id 都应当 200，占位符应当跳过，失败数应为 0。完整脚本见
+知识库 `05-踩坑清单.md` 第十四节。
+
+**顺便记住 config JSON 里的 id 分三类**（不是「有 id 就有问题」）：
+
+| 类别 | 正常吗 | 说明 |
+| --- | --- | --- |
+| 占位符 `00000000-…` | ✓ | 前端当「上下文实体」哨兵，**不发请求** |
+| 客户自有实体 id | ✓ | 客户有权读 |
+| 配置内部 id（部件/别名自身） | ✓ | 不是实体引用 |
+| **租户级 / 别家客户实体 id** | ✗ | **只有这类要修** |
+
+> 设计原则：**能从 API 拿的数据，不要通过实体别名拿。**
+> 实体别名受用户权限约束，API 只要接口放行就不受。
+
+---
+
 ## 1. 全新部署卡在第一步：setup 接口返回 423
 
 **现象**
