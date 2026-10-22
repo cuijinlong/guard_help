@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=63
+EXPECTED_PASS=65
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -615,6 +615,76 @@ if [[ "$LED_OK" == "1" && "$MONO" == "1" ]]; then
 else
   bad "台账用量口径异常（字段缺失或累计 < 本次增量）" \
       "看 EnergyMeterReadingController.ledger：应按「期末表底 − 期初表底」计费"
+fi
+
+# I-3. 峰谷分析必须与「表底首末差」逐日对齐。
+#
+#      这个断言防的是一类极难发现的错：报表看起来正常、各档合计也等于总量，
+#      但边界那一个小时被算重/算漏。实测过的三种表现：
+#        · 少了 to 那一刻的点      → 每天少 1/24（57.09 应为 58.09）
+#        · 拿桶中心当数据时间比较  → 边界小时错位半小时
+#        · 上界延一小时取点        → to 之后的数据混进同一小时桶（多 0.5）
+#      统一成「整段落在 (from, to] 内」后三种都消失。
+#
+#      选一台数据完整的表，任取 3 天逐日比对表底差。
+if [[ -f .env ]]; then
+  set -a; . ./.env 2>/dev/null; set +a
+  TOU_DEV=$(TAPI '/api/energy/meter-reading/tree' | jget "
+dims=d.get('dimensions') or []
+for dm in dims:
+    for n in dm.get('nodes') or []:
+        ids=n.get('deviceIds') or []
+        if ids: print(ids[0]); raise SystemExit" 2>/dev/null)
+  if [[ -n "$TOU_DEV" ]]; then
+    TOU_BAD=0
+    TOU_CHECKED=0
+    for OFF in 2 3 4; do
+      read -r F T <<< "$(python3 -c "
+import time,datetime
+bj=datetime.timezone(datetime.timedelta(hours=8))
+now=datetime.datetime.now(bj).replace(minute=0,second=0,microsecond=0)
+d=now-datetime.timedelta(days=$OFF)
+print(int(d.timestamp()*1000), int((d+datetime.timedelta(days=1)).timestamp()*1000))")"
+      T1=$(TAPI "/api/energy/tou-analysis?deviceId=$TOU_DEV&granularity=day&from=$F&to=$T" \
+        | jget "print(round(sum(b['total'] for b in d.get('buckets',[])),2))" 2>/dev/null)
+      DBV=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc \
+        "SELECT round((max(dbl_v)-min(dbl_v))::numeric,2) FROM ts_kv t
+         JOIN key_dictionary k ON k.key_id=t.key
+         WHERE t.entity_id='$TOU_DEV'::uuid AND k.key='energy_reading'
+           AND t.ts >= $F AND t.ts <= $T" 2>/dev/null | tr -d ' ')
+      if [[ -n "$T1" && -n "$DBV" && "$DBV" != "0" ]]; then
+        TOU_CHECKED=$((TOU_CHECKED+1))
+        DIFF=$(python3 -c "print(abs(float('$T1')-float('$DBV')))" 2>/dev/null)
+        LESS=$(python3 -c "print(1 if ${DIFF:-9} <= 0.05 else 0)" 2>/dev/null)
+        [[ "$LESS" == "1" ]] || TOU_BAD=$((TOU_BAD+1))
+      fi
+    done
+    if [[ "$TOU_CHECKED" -eq 0 ]]; then
+      bad "峰谷分析无法核对（设备无整点表底）" "确认演示数据已生成；或换一台有 energy_reading 的设备"
+    elif [[ "$TOU_BAD" -eq 0 ]]; then
+      ok "峰谷分析逐日 == 表底首末差（${TOU_CHECKED} 天）"
+    else
+      bad "峰谷分析与表底首末差不一致（${TOU_BAD}/${TOU_CHECKED} 天）" \
+          "看 EnergyAnalysisController.readHourlyUsageDetailed：边界按「整段落在 (from,to]」过滤"
+    fi
+  else
+    bad "峰谷分析核对跳过：找不到有设备的维度" "确认演示数据已生成"
+  fi
+fi
+
+# I-4. 现场补抄提交后，记录列表必须能读到 fieldStatus。
+#
+#      写进去了但列表不返回 → 工人刷新一看没变化，重复提交；管理员也看不到待审。
+#      （实测 2026-10-23：field-submit 返回 pending，records 里却是 null。）
+RECS=$(CAPI '/api/energy/meter-reading/records?period='"$(date +%Y-%m)")
+HAS_FIELD=$(echo "$RECS" | jget "
+items=d.get('items') or []
+print('1' if items and all('fieldStatus' in x for x in items) else '0')" 2>/dev/null)
+if [[ "$HAS_FIELD" == "1" ]]; then
+  ok "抄表记录含现场补抄状态字段（fieldValue/fieldStatus）"
+else
+  bad "抄表记录缺 fieldStatus 字段" \
+      "看 EnergyMeterReadingController.records：SELECT 要带上 field_value/field_status/field_note"
 fi
 
 # ================================================================

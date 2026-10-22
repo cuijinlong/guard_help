@@ -562,6 +562,72 @@ curl --noproxy '*' -s -o /dev/null -w '%{http_code}\n' \
 
 ---
 
+### 现象 M：把设备/资产分配给客户后，对方看不到
+
+**先分清是哪种「看不到」**：
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 列表里没有 | 分配接口 404 / 没调成功 | 看下一段 |
+| 列表里有、点开 403 | 权限缓存没失效 | 见「缓存」段 |
+| 列表里有、点开 404 | 分配到了别的租户 | 查 `customer_id` |
+
+**列表里没有** —— 分配接口本身可能不存在（迁移遗漏）。
+
+```bash
+# 应返回 200 + 设备 JSON；404 说明接口缺失
+curl --noproxy '*' -s -o /dev/null -w '%{http_code}\n' -X POST \
+  -H "X-Authorization: Bearer $TENANT_TOKEN" \
+  "$BASE/api/customer/$CUSTOMER_ID/device/$DEVICE_ID"
+```
+
+**点开 403** —— 归属改了但 `ENTITY_OWNERS_CACHE` 没失效。
+
+正确实现必须走 `ownersCacheService.changeEntityOwner(...)`（它内部改组 + 清缓存），
+而不是只 `device.setCustomerId(...)` + `saveDevice`。后者会让已登录会话继续用旧的
+owner 判断 —— 表现为「分配成功、对方 403、重启服务才恢复」。
+
+**取消分配是还给租户，不是还给原客户**：
+
+```bash
+DELETE /api/customer/device/{id}   → customer_id = NULL_UUID（租户所有）
+```
+
+要让原客户重新看到，得再 `POST /api/customer/{原客户}/device/{id}`。
+测试时容易踩：把客户资产「取消分配」后，它变成租户级，
+客户看板里引用它的地方全 403，自检报「看板无租户级资产引用 9 处」。
+
+---
+
+### 现象 N：峰谷分析的数和台账对不上
+
+**九成是边界没对齐整点。**
+
+峰谷按小时聚合，只统计「终点落在 `(from, to]` 内」的增量。
+传整点区间时，结果与「末点表底 − 首点表底」**分毫不差**：
+
+```bash
+# 对，总量 == 表底首末差
+/api/energy/tou-analysis?deviceId=X&from=1791547200000&to=1791561600000   # 10-09 00:00 ~ 10-10 00:00
+
+# 也会差一点（首尾各一小时不能整除）—— 正常，不是 bug
+/api/energy/tou-analysis?deviceId=X&from=<now-13d>&to=<now-1h>
+```
+
+**如果差得离谱**（几十倍），看响应里的 `backwardDevices`：
+
+```json
+{ "backwardDevices": 1, "backwardSegments": 1,
+  "warnings": ["1 台表计出现表底倒走…"] }
+```
+
+表底倒走（换表 / 归零 / 上报错值）的段被跳过了，这个月的数不能用，先核对表底。
+
+**如果台账有数、峰谷是 0**：区间太短（< 1 小时）。两次抄表间隔几十秒时，
+小时聚合只有 1 个点，算不出差值。这不是故障，见手册 ③ 九之三。
+
+---
+
 ## 1. 全新部署卡在第一步：setup 接口返回 423
 
 **现象**

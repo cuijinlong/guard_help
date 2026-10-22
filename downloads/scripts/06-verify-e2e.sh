@@ -437,8 +437,15 @@ if [[ -n "$RD_ID" ]]; then
   # 上界取「1 小时前」：本脚本刚注入了几条 HTTP/MQTT 上报点，
   # 那些点没有表底配对，会让「库内 SUM」比「按表底差值算的报表」多出来。
   # 报表本身的口径是表底差值，所以窗口要和它的输入对齐。
-  FROM=$(python3 -c "import time;print(int((time.time()-13*86400)*1000))")
-  TO=$(python3 -c "import time;print(int((time.time()-3600)*1000))")
+  # 边界对齐到整点。
+  #
+  # 小时聚合下，非整点边界必然产生最多 1 小时的歧义：
+  #   · 报表按「跨越 FROM 的那一小时也算」→ 从 FROM 所在小时的起点起算
+  #   · 库按「第一个 >= FROM 的点」→ 少算那一小时
+  # 实测发现两边差 0.5 kWh（正是 FROM 那一小时的一部分）。
+  # 验收脚本要的是可复现、无歧义，所以直接把边界对齐到整点。
+  FROM=$(python3 -c "import time;t=int((time.time()-13*86400)*1000);print(t-t%3600000)")
+  TO=$(python3 -c "import time;t=int((time.time()-3600)*1000);print(t-t%3600000)")
   TOU=$(TAPI "/api/energy/tou-analysis?deviceId=$RD_ID&granularity=day&from=$FROM&to=$TO")
 
   RES=$(echo "$TOU" | python3 -c "
@@ -462,19 +469,25 @@ print(round(tot,2), round(sum(agg.values()),2), (d.get('scheme') or '-'))" 2>/de
   # 与库内原始遥测交叉核对
   if [[ -f .env ]]; then
     set -a; . ./.env 2>/dev/null; set +a
-    # 只统计「整点」的点。
+    # 口径：表底首末差，不是 sum(energy)。
     #
-    # 为什么：本脚本第 3 节会往这台设备注入几条 energy 上报（HTTP 1.23 / MQTT 2.34），
-    # 时间戳是当前时刻（秒数≠0）。这些点没有上一条表底可做差，
-    # 报表按「表底差值」口径必然不算它们；而直接 SUM 会算进去 ——
-    # 于是每跑一次验收就多差 3.57，跑 5 次差 17.85（实测 2026-10-22）。
-    # 演示数据是按整点生成的（秒=0），过滤秒数即可精确对齐两边口径。
+    # 两个 key 的语义不同（见 EnergyBootstrapInstaller.writeDemoSeries）：
+    #   energy[t]         = (t−1h, t] 这一小时的增量
+    #   energy_reading[t] = t 时刻的累积表底
+    # 所以区间 [FROM, TO] 的用电 = reading(TO) − reading(FROM)；
+    # 而 sum(energy WHERE ts >= FROM AND ts < TO) 会**多算 energy(FROM)** 这一小时
+    # （实测每天差约 1.0~1.2 kWh，14 天累计差 16.6）。
+    # 报表按表底差算，核对也必须用表底差，否则每跑一次就"不一致"一次。
+    #
+    # 不过滤整点：energy_reading 的任何点都是合法表底（现场设备本来就不按整点上报）。
+    # 报表按「小时 MAX」聚合，末值取的是该小时最大值；库这里也必须取所有点的 max，
+    # 否则会被真实存在的小时内上报拉开差距（实测差 0.5 kWh）。
+    # 第 3 节注入的是 energy / power_total / voltage_a，不含 energy_reading，不会污染这里。
     DBV=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc \
-      "SELECT round(sum(dbl_v)::numeric,2) FROM ts_kv t
+      "SELECT round((max(dbl_v) - min(dbl_v))::numeric,2) FROM ts_kv t
        JOIN key_dictionary k ON k.key_id=t.key
        JOIN device d ON d.id=t.entity_id
-       WHERE d.id='$RD_ID'::uuid AND k.key='energy' AND t.ts >= $FROM AND t.ts <= $TO
-         AND EXTRACT(second FROM to_timestamp(t.ts/1000)) = 0" 2>/dev/null | tr -d ' ')
+       WHERE d.id='$RD_ID'::uuid AND k.key='energy_reading' AND t.ts >= $FROM AND t.ts <= $TO" 2>/dev/null | tr -d ' ')
     if [[ "${DBV:-0}" == "0" || -z "$DBV" ]]; then
       warn_ "库内没有整点遥测（演示数据可能缺失），跳过与报表的交叉核对"
     elif [[ -n "$T1" ]]; then
