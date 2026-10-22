@@ -164,6 +164,28 @@ if [[ -d "$DATA_SRC_DIR" && -d "$DATA_DST_DIR" ]]; then
   done
   [[ "$N" == "0" ]] && ok "data/ 关键目录一致（部件 / 看板模板 / 租户默认数据）"
 
+  # 3c-2. jar 里必须有 sql/schema-views.sql 与 sql/schema-functions.sql
+  #
+  # 为什么必须查：guard-server 是自带 DAO 源码的单体，不依赖 dao 模块，
+  # 所以 dao/src/main/resources/sql 不会自动进 jar。
+  # 升级时 SystemPatchApplier 要读这两个文件来刷新视图/函数，
+  # 缺了会抛 IllegalArgumentException: resource sql/schema-views.sql not found，
+  # **整个系统补丁步骤失败** —— 部件更新也不会生效，且只在升级那一刻才暴露。
+  # 实测踩过（2026-10-23）：补件后升级报错，平台部件一直停在旧版本。
+  JAR_PATH="$ROOT/guard-server/target/guard-server-4.4.0.jar"
+  if [[ -f "$JAR_PATH" ]]; then
+    MISSING_SQL=""
+    for f in sql/schema-views.sql sql/schema-functions.sql; do
+      unzip -l "$JAR_PATH" 2>/dev/null | grep -q "BOOT-INF/classes/$f" || MISSING_SQL="$MISSING_SQL $f"
+    done
+    if [[ -z "$MISSING_SQL" ]]; then
+      ok "jar 含升级所需 SQL（schema-views / schema-functions）"
+    else
+      bad "jar 缺升级 SQL：${MISSING_SQL}" \
+          "把 dao/src/main/resources/sql/*.sql 拷到 guard-server/src/main/resources/sql/ 再打包"
+    fi
+  fi
+
   # SQL schema 与 Cassandra CQL：install 建库直接读它们
   for pair in "dao/src/main/resources/sql:data/sql" "dao/src/main/resources/cassandra:data/cassandra"; do
     S="$ROOT/${pair%%:*}"

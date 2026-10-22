@@ -628,6 +628,30 @@ DELETE /api/customer/device/{id}   → customer_id = NULL_UUID（租户所有）
 
 ---
 
+### 现象 O-1：升级后报 `resource sql/schema-views.sql not found`
+
+**整个系统补丁步骤会失败**，部件更新、视图刷新都不会生效。
+
+```
+ERROR SystemPatchApplier - Failed to apply system data patch updates
+java.lang.IllegalArgumentException: resource sql/schema-views.sql not found
+```
+
+原因：`guard-server` 是自带 DAO 源码的单体，不依赖 `dao` 模块，
+所以 `dao/src/main/resources/sql/` 不会自动进 jar；而升级补丁要读
+`sql/schema-views.sql` 与 `sql/schema-functions.sql`。
+
+修复：
+
+```bash
+cp dao/src/main/resources/sql/*.sql guard-server/src/main/resources/sql/
+cd guard-server && mvn package -DskipTests
+```
+
+`docker-97-preflight.sh` 第 3c-2 节会检查 jar 里有没有这两个文件，发版前跑一次。
+
+---
+
 ### 现象 O：账单出不来 / 金额是 0 / 账单数比表少
 
 **先看返回里的 `reason`** —— 出账接口对每台表都会说明为什么没出：
