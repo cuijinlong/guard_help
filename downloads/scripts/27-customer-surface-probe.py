@@ -83,6 +83,29 @@ def login(base, user, password):
     return data['token']
 
 
+def _psql_rows(sql, container='energy-postgres', db='thingsboard', user='postgres'):
+    """直连 Postgres 跑一条查询，返回 (col1, col2) 元组列表。
+
+    只用于**查部件脚本**这类 API 不给客户看的东西（widget_type 是租户级资源）。
+    取不到就抛异常，由调用方降级为「跳过该项」—— 探针在没装 docker 的机器上
+    也要能跑（那种场景只看 HTTP 语义断言）。
+    """
+    import subprocess
+    r = subprocess.run(
+        ['docker', 'exec', container, 'psql', '-U', user, '-d', db,
+         '-X', '-q', '-A', '-t', '-F', '\x1f', '-c', sql],
+        capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip()[:200])
+    out = []
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split('\x1f')
+        out.append(tuple(parts))
+    return out
+
+
 def page_all(api, path, limit=500):
     """把分页接口的数据全取回来（客户名下的资产/设备可能超过一页）"""
     out, page = [], 0
@@ -324,6 +347,56 @@ def semantic_checks(api):
                     'remedy': '重新部署 energy_management.* 部件（resolveEntity 已过滤品种）',
                 })
     checks.append('S2 看板 alias 引用品种资产：%d 处' % leaked)
+
+    # ---- S3：部件脚本不能把 deviceVirtual='real' 判成虚拟表 ----
+    #
+    # 这类 bug 在接口层完全看不见：请求全 200、数据齐全，
+    # 只是部件在 JS 里把设备池过滤空了，页面显示 0 或「没有可用计量点」。
+    #
+    # 实测 2026-10-23：5 个部件（综合能耗 / 能耗洞察 / 盘查报告 / 电能质量 /
+    # 能源流向）都有同一个黑名单判定 —— 只有 undefined/false/0/'' 算实表，
+    # 而平台写的是 deviceVirtual='real'，于是全部被判成虚拟、整池清空。
+    # 现象极具误导性：顶栏写「数据源（10 台）」，下面所有数字都是 0。
+    #
+    # 判据：控制脚本里调用了 isVirtual，但函数体是黑名单（没有把 'real'
+    # 显式排除）→ 缺陷。只查库，不依赖浏览器。
+    bad_iv = []
+    try:
+        # 用 json_agg 一次取回，避免脚本里的换行把行分隔破坏
+        raw = _psql_rows(
+            "SELECT coalesce(json_agg(json_build_object("
+            "'fqn', fqn, 'js', descriptor::jsonb->>'controllerScript')), '[]'::json)::text "
+            "FROM widget_type WHERE fqn LIKE 'energy%' OR fqn LIKE 'idle%'")
+        widgets = json.loads(raw[0][0]) if raw and raw[0] else []
+    except Exception:
+        widgets = []
+    for w in widgets:
+        fqn = w.get('fqn') or ''
+        js = w.get('js') or ''
+        if 'isVirtual' not in js:
+            continue
+        i = js.find('function isVirtual')
+        if i < 0:
+            continue
+        # 判据：取函数体（到下一个顶层 'function ' 或 800 字符为止）
+        nxt = js.find('function ', i + 10)
+        body = js[i: nxt if nxt > i else i + 800]
+        # 白名单特征：显式比较 true 或字符串 'virtual'
+        whitelist = ("=== true" in body) or ("'virtual'" in body)
+        # 黑名单特征：函数体里有 deviceVirtual，且不是白名单
+        if 'deviceVirtual' in body and not whitelist:
+            bad_iv.append(fqn)
+    checks.append('S3 部件虚拟表判据：%d 个部件仍是黑名单' % len(bad_iv))
+    for fqn in bad_iv:
+        fails.append({
+            'group': 'S3 部件虚拟表判据错误',
+            'label': fqn,
+            'path': 'widget_type.descriptor -> controllerScript',
+            'code': 200,
+            'message': "isVirtual 用黑名单判定，deviceVirtual='real' 会被当成虚拟表，设备池被清空",
+            'remedy': ('改成白名单：v === true || v === \'true\' || v === 1 || v === \'1\' '
+                       '|| v === \'virtual\'；然后同步种子 + 挂载目录 + 运行库三处'),
+        })
 
     return checks, fails
 

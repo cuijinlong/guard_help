@@ -835,7 +835,119 @@ WHERE d.customer_id = '<客户id>'
 
 ---
 
-### 6.7 排查顺序（照着走）
+### 6.7 部件的三个「静默清零」缺陷（2026-10-23 修复）
+
+这三个 bug 有个共同特征：**接口全 200、数据齐全，页面却一个数都不出**。
+它们都在部件 JS 里，探针只打接口时完全看不见。
+
+#### 缺陷 A：`isVirtual` 用黑名单判定
+
+```js
+// ✗ 修复前
+var v = (ai || {}).deviceVirtual;
+if (v === undefined || v === null || v === '' || v === false
+    || v === 'false' || v === 0 || v === '0') {
+  return false;   // 只有这些算「实表」
+}
+return true;      // 其余一律当「虚拟表」
+```
+
+平台给实表写的是 `additionalInfo.deviceVirtual = "real"` —— **`'real'` 不在排除列表里**，
+于是每台真实表都被判成虚拟，`devicesWithMeta` 把整个设备池跳过：
+
+```
+poolDevices = 0 台
+  → KPI 全 0.00
+  → 趋势图「当前范围内没有遥测数据」
+  → 但顶栏还写着「范围：数据源（10 台）」（那一步不看虚拟标记）
+```
+
+这种**自相矛盾**的显示最容易把人带偏。
+
+```js
+// ✓ 修复后：白名单，未知值按实表处理
+return v === true || v === 'true' || v === 1 || v === '1'
+    || v === 'virtual' || v === 'VIRTUAL';
+```
+
+> 影响 5 个部件：综合能耗、能耗洞察、盘查报告、电能质量、能源流向。
+> 原则：宁可把手工表算进来（数据显示 0），也不能把真实表整批丢掉。
+
+#### 缺陷 B：关系只加载一层
+
+```js
+// ✗ 修复前：只拉传入那一层
+function loadRelationsBatch(http, assetIds, cb) {
+  var pending = assetIds.length;
+  for (...) { loadRelations(http, assetIds[i], ...); }
+}
+```
+
+而 `collectDevices` 是**递归**往下走的：
+
+```
+场站 → 7 个分项（ASSET）→ 分项下 9 台设备
+```
+
+第一层只拿到分项（没直接挂设备），递归到分项时 `rels[分项id]` 是 undefined
+→ 收集到 0 台。现场表现：
+
+```
+范围：数据源（1 台）      ← 只有直接挂在场站下那 1 台
+当前 1 台计量点
+能源消费总量 0.20 tce     ← 其余 9 台没算进去
+```
+
+修复是改成 **BFS 逐层展开**（同层并发、`seen` 防环）。
+
+#### 缺陷 C：设备类型名精确匹配
+
+```js
+// ✗ 修复前
+ENERGY_OF_TYPE = { '电能表': 'elec', '水表': 'water', ... }
+```
+
+演示数据的单相表类型是 **`单相电能表`** —— 精确表里没有 → `energyOf()` 返回 `''`
+→ 设备被过滤掉。
+
+改成按关键字归类，`单相电能表 / 三相电能表 / 智能电表 / 导轨式电表` 都不会再漏：
+
+```js
+function energyTypeOfName(t) {
+  if (ENERGY_OF_TYPE[t]) { return ENERGY_OF_TYPE[t]; }
+  if (t.indexOf('电能表') >= 0 || t.indexOf('电表') >= 0) { return 'elec'; }
+  ...
+}
+```
+
+#### 怎么自查（一条命令）
+
+```bash
+python3 scripts/27-customer-surface-probe.py ... --strict
+```
+
+新增的 **S3** 断言会直连 Postgres 查全部 `energy*` / `idle*` 部件的
+`controllerScript`，凡是 `isVirtual` 仍为黑名单的直接报出来：
+
+```
+✗ S3 部件虚拟表判据错误（1 条）
+    200  energy_management.energy_overview
+         → isVirtual 用黑名单判定，deviceVirtual='real' 会被当成虚拟表，设备池被清空
+```
+
+#### 改完必须同步三处
+
+```
+① 仓库种子  guard-server/src/main/data/json/system/widget_types/*.json
+② 挂载目录  $APP_HOME/data/json/system/widget_types/*.json
+③ 运行库    widget_type.descriptor
+```
+
+只改一处，重启或重装就会回退。
+
+---
+
+### 6.8 排查顺序（照着走）
 
 ```
 页面数字是 0
@@ -847,6 +959,8 @@ WHERE d.customer_id = '<客户id>'
   ├─ 场站/分项有 energy_total 吗？ ── 没有 → 等一轮定时任务，或手工 rebuild
   │        │有
   ├─ 部件取数目标是品种资产吗？ ── 是 → 部件版本旧，重新部署 energy_management.*
+  │        │否
+  ├─ 顶栏「数据源（N 台）」但下面全 0？ ── 查 6.7 的三个静默清零缺陷
   │        │否
   └─ 数字偏大/偏小？ ── 查日桶边界是否对齐零点（6.5）
 ```

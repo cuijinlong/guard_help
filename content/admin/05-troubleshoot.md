@@ -3042,3 +3042,68 @@ SELECT id, name FROM asset WHERE customer_id='<客户id>' AND type='场站';"
 ```
 
 详细原理见[⑦ 数据流 6.6](/admin/data-pipeline)。
+
+---
+
+### 现象 W：顶栏写着「数据源（10 台）」，下面所有数字都是 0
+
+```
+范围：数据源（10 台） · 当前 8 台计量点
+综合能源消费量  0.00 tce
+能源费用        ¥ 0
+碳排放估算      0.00 tCO₂
+能源消耗趋势    当前范围内没有遥测数据
+能源品种构成    无数据
+```
+
+**这种「台数对、数字全 0」是部件 JS 里的过滤 bug，不是数据问题。**
+
+接口层完全正常：设备有遥测、场站有 `energy_total`、请求全 200。
+问题出在部件把设备池算空了。
+
+三个已知原因（2026-10-23 全部修复）：
+
+| 缺陷 | 症状 | 根因 |
+| --- | --- | --- |
+| `isVirtual` 黑名单 | **台数对、全 0** | `deviceVirtual='real'` 被判成虚拟表 |
+| 关系只加载一层 | 台数显示「1 台」 | 场站→分项→设备 只展开第一层 |
+| 类型名精确匹配 | 设备被静默跳过 | 类型是「单相电能表」，字典里只有「电能表」 |
+
+**一条命令自查**：
+
+```bash
+python3 scripts/27-customer-surface-probe.py \
+  --base http://127.0.0.1:8090 \
+  --tenant tenant@126.com --tenant-pass 12345678 \
+  --customer customer@126.com --customer-pass 12345678 --strict
+```
+
+S3 断言会直连 Postgres 扫全部部件的 `controllerScript`：
+
+```
+✗ S3 部件虚拟表判据错误（1 条）
+    200  energy_management.energy_overview
+         → isVirtual 用黑名单判定，deviceVirtual='real' 会被当成虚拟表
+```
+
+**手工确认**（不跑探针时）：
+
+```sql
+SELECT fqn,
+       (descriptor::jsonb->>'controllerScript') LIKE '%=== true%' AS 白名单,
+       (descriptor::jsonb->>'controllerScript') LIKE '%expandLevel%' AS BFS
+FROM widget_type
+WHERE fqn LIKE 'energy_management.%'
+  AND (descriptor::jsonb->>'controllerScript') LIKE '%isVirtual%';
+-- 期望两列全 t
+```
+
+修复要同步**三处**（少一处重启就回退）：
+
+```
+① 仓库种子  guard-server/src/main/data/json/system/widget_types/*.json
+② 挂载目录  $APP_HOME/data/json/system/widget_types/*.json
+③ 运行库    widget_type.descriptor
+```
+
+原理与三个缺陷的细节见[⑦ 数据流 6.7](/admin/data-pipeline)。
