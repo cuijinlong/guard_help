@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=70
+EXPECTED_PASS=72
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -833,6 +833,43 @@ elif [[ "$HAS_FIELD" == "-" ]]; then
 else
   bad "抄表记录缺 fieldStatus 字段" \
       "看 EnergyMeterReadingController.records：SELECT 要带上 field_value/field_status/field_note"
+fi
+
+# I-5. 设备计量配置端点必须可用（meterLevel + 倍率）
+#
+#      这个端点补的是「meterLevel 只有演示数据会写、真实客户没入口」的缺口。
+#      没有它，客户自建表的分层汇总永远失效 → 总表+分表相加，金额虚高 2~3 倍。
+#      只验「读得出来且字段齐全」，不写数据（避免改动演示配置）。
+ANYDEV=$(TAPI '/api/tenant/devices?pageSize=1&page=0' | jget "print((d.get('data') or [{}])[0].get('id',{}).get('id',''))" 2>/dev/null)
+if [[ -n "$ANYDEV" ]]; then
+  DC=$(TAPI "/api/energy/device-config?deviceId=$ANYDEV")
+  HAS=$(echo "$DC" | jget "
+need = {'meterLevel','ctRatio','ptRatio','meterRatio','ratioApplied','effectiveRatio','storage'}
+print('1' if need.issubset(set(d.keys())) else '0')" 2>/dev/null)
+  if [[ "$HAS" == "1" ]]; then
+    ok "设备计量配置端点可用（层级 + 倍率三件套）"
+  else
+    bad "设备计量配置端点字段缺失" \
+        "看 EnergyMeterReadingController.deviceConfig：应返回 meterLevel/ctRatio/ptRatio/meterRatio/ratioApplied/effectiveRatio"
+  fi
+else
+  bad "取不到设备，无法验证计量配置端点" "确认演示数据已生成"
+fi
+
+# I-6. SQL 埋点必须默认开启
+#
+#      用户要的是「页面数字能用 SQL 复核」。埋点被关掉（哪怕只是降到 debug），
+#      这个能力就没了，而且不会有人发现 —— 所以把它变成断言。
+TRACE_ON=$(docker logs energy-server 2>&1 | grep -c "SQL 埋点已开启" || true)
+if [[ "${TRACE_ON:-0}" -ge 1 ]]; then
+  ok "SQL 埋点默认开启（日志可复制 SQL 对照页面）"
+else
+  if docker logs energy-server 2>&1 | grep -q "SQL 埋点被关闭"; then
+    bad "SQL 埋点被关闭（页面数字将无法用 SQL 复核）" \
+        "去掉 energy.sql-trace.enabled=false；默认必须为 true"
+  else
+    printf '  \033[33m  - 跳过：日志里没有埋点开关记录（容器可能刚重启未打印）\033[0m\n'
+  fi
 fi
 
 # ================================================================
