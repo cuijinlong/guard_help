@@ -172,6 +172,7 @@ docker compose logs energy-server | grep energy-schema   # server 阶段（表�
 | 资产档案 | 按档案筛选/统计全空 | 本页「一之二」 |
 | 设备档案（含 isMeter） | 设备在、抄表和分项全空 | 本页第四节 |
 | 告警规则 + 派生指标 | 从不告警、无负荷率/碳排放 | 本页第四节 |
+| 费率配置（出账前提） | 出账全部「未配置电价」跳过，页面不报错 | 本页第十节 |
 | 厂商 / 设备型号 | 设备表单下拉为空 | 本页第一节 |
 | 分时时段方案 | 峰谷报表全算「平」 | 本页第五节 |
 | 看板模板 | 新客户没有看板 | [② 部署](/admin/deploy)第 2 步 |
@@ -367,7 +368,7 @@ bash scripts/08-verify-release.sh \
 
 | 组 | 验什么 |
 | --- | --- |
-| A | 初始化完整性（自检 9 项 missing=0 / partial=0） |
+| A | 初始化完整性（自检 11 项 missing=0 / partial=0） |
 | B | 字典两级指标（电能 26 一级 / 48 二级，含 `voltage_avg`、`current_avg`） |
 | C | 计算字段 11 条（含闲时能耗超标、电压越限、不平衡度、负荷率、碳排放） |
 | C2 | 主数据层级（租户级未被客户级污染）+ 费率模板 4 个 + 闲时链路（`idle_exceed` / `idleConfig` / 告警） |
@@ -1805,6 +1806,10 @@ HAVING sp.delta < SUM(sc.delta) - 0.5;
 | 设备是表计 | 设备档案有 `isMeter=true` | 不出账，且不会报错 |
 | 设备档案声明品种 | `energyTypeCode` = elec / water / gas / steam | 跳过，原因写在返回的 `reason` 里 |
 | 已配电价 | 场站自定义 / 组织 / 客户兜底任一处有该品种 | 跳过，「未配置电价」 |
+
+**全新库不会预置电价**：平台不帮你编一套假价（会被当成真价收钱）。
+装完先看「平台自检 → 费率配置（出账前提）」，`MISSING` 就先配电价再出账。
+优先级：场站 `siteCustomRates` > 组织 `energyRates` > 客户兜底。
 
 虚拟设备（`deviceVirtual=true`，如空调虚拟表）**同样出账**。
 

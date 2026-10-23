@@ -121,7 +121,7 @@ TAPI() { curl -s --noproxy '*' -m 40 -H "X-Authorization: Bearer $TOK" "$BASE$1"
 CAPI() { curl -s --noproxy '*' -m 40 -H "X-Authorization: Bearer $CTOK" "$BASE$1"; }
 
 # ================================================================
-sec "A. 初始化完整性（9 项自检）"
+sec "A. 初始化完整性（平台自检）"
 SC=$(TAPI '/api/energy/self-check')
 SUMMARY=$(echo "$SC" | jget "print(json.dumps(d.get('summary',{})))" 2>/dev/null)
 if [[ -n "$SUMMARY" ]]; then

@@ -95,7 +95,7 @@ if [[ -n "$TOK" ]]; then
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d['items']) if isinstance(d.get('items'), list) else 'bad')" 2>/dev/null || echo bad)
   [[ "$N" != "bad" ]]; chk $? "自定义菜单接口可用（${N} 项，空则走内置导航）"
 
-  # 平台自检接口：初始化是否完整，一次请求拿全（9 项租户级 / 8 项客户级）
+  # 平台自检接口：初始化是否完整，一次请求拿全（含费率配置，出账前提）
   N=$(TAPI '/api/energy/self-check' \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('summary',{}).get('healthy','bad'))" 2>/dev/null || echo bad)
   [[ "$N" != "bad" ]]; chk $? "平台自检接口可用（healthy=${N}）"
