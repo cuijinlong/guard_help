@@ -103,6 +103,14 @@ echo " 发布内容验收 · ${BASE}"
 echo " 时间 $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
 
+# 遥测后端可能是 Cassandra（默认）。验收 SQL 是按 Postgres 的 ts_kv 写的，
+# 这里先把它镜像过来，否则「设备数/资产汇总/峰谷自洽」会全部误报为 0。
+# 后端是 sql 时本脚本什么也不做（PG 本来就有真表）。
+if [[ -x scripts/ts-mirror.sh || -f scripts/ts-mirror.sh ]]; then
+  bash scripts/ts-mirror.sh >/tmp/ts-mirror.log 2>&1 || \
+    echo "  ! 遥测镜像失败，部分断言会误报：看 /tmp/ts-mirror.log" >&2
+fi
+
 # ---------------------------------------------------------------- 登录
 TOK=$(curl -s --noproxy '*' -m 15 -X POST "$BASE/api/auth/login" \
   -H 'Content-Type: application/json' \

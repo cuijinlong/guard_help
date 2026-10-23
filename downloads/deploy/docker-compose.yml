@@ -37,11 +37,17 @@ x-db-env: &db-env
   # 实体元数据恒在 Postgres（不可改）。
   DATABASE_ENTITIES_TYPE: sql
   # 遥测存哪：
-  #   sql       （默认）遥测也存 Postgres 的 ts_kv，按月分区
-  #   cassandra 遥测存 Cassandra，Postgres 只存实体与最新值
+  #   cassandra （默认）遥测存 Cassandra，Postgres 只存实体与最新值
+  #   sql                遥测也存 Postgres 的 ts_kv，按月分区
   # 改这个值等于换存储后端：**存量数据不会自动迁移**，
   # 见手册「Cassandra」一节，务必先迁移再切换。
-  DATABASE_TS_TYPE: ${DATABASE_TS_TYPE:-sql}
+  #
+  # 为什么默认 Cassandra：遥测是时序写入，点数随设备数 × 指标数 × 时间
+  # 线性增长，Postgres 的 ts_kv 在千万级之后索引维护成本明显上升。
+  # Cassandra 按 (entity_id, key, ts) 分区，写入随节点线性扩容。
+  # 小规模部署（几十万点）用 sql 也完全够 —— 改成 sql 即可，
+  # 此时 docker-01/02 脚本会自动跳过 Cassandra 容器，不白吃内存。
+  DATABASE_TS_TYPE: ${DATABASE_TS_TYPE:-cassandra}
   # 最新值（设备详情页、看板的实时数字）单独选存储。
   # 小规模建议留 sql：查询快、与实体同库、少一次跨库往返。
   # 只有 Cassandra 集群规模较大时才考虑也放 Cassandra。
@@ -87,15 +93,18 @@ services:
     logging: *default-logging
 
   # ────────────────────────────────────────────────────────────────
-  # Cassandra：可选。只在 DATABASE_TS_TYPE=cassandra 时启用。
+  # Cassandra：默认遥测存储（DATABASE_TS_TYPE=cassandra 时必需）。
   #
-  # 为什么不默认开：Cassandra 至少要 2GB 内存，且启动要 1~2 分钟。
-  # 小规模部署（几十万点）Postgres 完全够用，加它只是徒增运维面。
-  # 什么时候该开：遥测点数上亿、写入 QPS 高、需要横向扩容写入端。
+  # 这个服务在独立的 "cassandra" profile 下，不在 split 里 ——
+  # 这样把 DATABASE_TS_TYPE 改成 sql 之后，它不会被顺带启动、白吃 2GB 内存。
+  # 启动脚本（docker-01/02）读 .env 自动决定要不要带 --profile cassandra。
   #
-  # 启动方式（必须显式带 profile，否则不会起来）：
+  # 手工启动时需要显式带 profile：
   #   docker compose --profile split --profile cassandra up -d
-  # 或直接用 scripts/11-cassandra.sh enable（会顺手改 .env 并校验）
+  # 或用管理脚本：scripts/11-cassandra.sh status|init|enable|disable
+  #
+  # 首次启动 2~5 分钟（JVM + 建系统表），健康检查就绪前不要跑 install ——
+  # 否则安装程序会报 InvalidKeyspaceException: Invalid keyspace thingsboard。
   #
   # 数据卷：cassandra-data，**删容器不会删数据**，要清空得 down -v 或单独删卷。
   # ────────────────────────────────────────────────────────────────

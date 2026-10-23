@@ -51,6 +51,12 @@ case "$MODE" in
   allinone) PROFILE_ARGS="--profile allinone"; TARGET="allinone" ;;
   *) die "DEPLOY_MODE 只能是 split 或 allinone，当前：$MODE" ;;
 esac
+# 遥测存 Cassandra 时必须把 cassandra profile 一起带上，
+# 否则 energy-server 连不上 9042，启动即报 InvalidKeyspaceException。
+# 这个容器不在 split profile 里 —— 用 sql 时不会被顺带拉起。
+if [[ "$MODE" == "split" && "${DATABASE_TS_TYPE:-cassandra}" == "cassandra" ]]; then
+  PROFILE_ARGS="$PROFILE_ARGS --profile cassandra"
+fi
 # 本机代理会把 127.0.0.1 也接管，必须绕过
 ncurl() { curl -s --noproxy '*' "$@"; }
 
@@ -79,6 +85,11 @@ fi
 if [[ "$MODE" == "allinone" ]]; then
   WAIT_MAX=180   # 单容器首次要跑 install，给 15 分钟
   log "等待服务就绪（单容器首次含 install，约 3–5 分钟）"
+elif [[ "${DATABASE_TS_TYPE:-cassandra}" == "cassandra" ]]; then
+  # Cassandra 模式启动明显更慢：实体缓存预热 + 驱动连接池 + 分区索引都要从
+  # 远端拉。实测 2026-10-23：冷启动到 200 约 7 分钟，旧的 240 秒必然超时。
+  WAIT_MAX=120   # 600 秒
+  log "等待服务就绪（Cassandra 首次约 5–8 分钟）"
 else
   WAIT_MAX=48
   log "等待服务就绪（首次约 60–120 秒）"

@@ -1,7 +1,8 @@
-# ②b Cassandra（可选遥测存储）
+# ②b Cassandra（默认遥测存储）
 
-> **默认部署不用它。** 遥测默认存 Postgres 的 `ts_kv`（按月分区），
-> 几十万到几百万点完全够用。只有遥测上亿、写入压力大、要横向扩写入端时才需要。
+> **默认后端就是 Cassandra。** 遥测写 `ts_kv_cf`，实体元数据与最新值仍在 Postgres。
+>
+> 只有 2GB 内存的小机器、或纯演示环境，才建议改成 Postgres —— 见下方「切回 Postgres」。
 
 ---
 
@@ -9,37 +10,67 @@
 
 | 场景 | 建议 |
 | --- | --- |
-| 演示环境 / 中小客户（几十万~几百万点） | **用 Postgres**（默认） |
-| 上亿点、持续高 QPS 写入 | 用 Cassandra |
-| 多节点横向扩写入 | 用 Cassandra |
-| 只有 2GB 内存的机器 | **别用**，Cassandra 自己要 2G 堆 |
+| 正式部署 / 设备会持续增长 | **Cassandra（默认）** |
+| 上亿点、持续高 QPS 写入 | Cassandra（唯一可行） |
+| 多节点横向扩写入 | Cassandra |
+| 只有 2GB 内存的机器 / 纯功能演示 | 改 Postgres，省一个容器、省 2G 内存 |
 
 **核心区别**：只有「遥测」能换后端，实体元数据恒在 Postgres。
 
 ```
 DATABASE_ENTITIES_TYPE=sql              ← 实体元数据，不可改
-DATABASE_TS_TYPE=sql | cassandra        ← 遥测（本页讲的）
+DATABASE_TS_TYPE=cassandra | sql        ← 遥测（默认 cassandra，本页讲的）
 DATABASE_TS_LATEST_TYPE=sql | cassandra ← 最新值（建议留 sql）
 ```
 
 **为什么最新值建议留 sql**：设备详情页、看板的实时数字读的是它，
 查询频繁、数据量小，放 Postgres 更快，也少一次跨库往返。
 
+**默认值写在两处，改一处就行**：
+
+| 位置 | 作用 |
+| --- | --- |
+| `docker-compose.yml` 的 `${DATABASE_TS_TYPE:-cassandra}` | 兜底默认值 |
+| `.env` 的 `DATABASE_TS_TYPE=cassandra` | 实际生效值（prepare 生成） |
+
+`docker-01-install.sh` / `docker-02-start.sh` 会读 `.env`：
+值是 `cassandra` 时自动带 `--profile cassandra` 拉起容器；改成 `sql` 时**不会启动**
+Cassandra，所以不会白占内存。手工跑 `docker compose up` 时记得自己带这个 profile。
+
 ---
 
 ## 二、安装与启用（一条命令）
 
-Cassandra 用独立 profile，不带就不启动。**用脚本，别手工一步步来**：
+**全新部署默认就启用，你什么都不用做。** 装完 `docker-01-install.sh` 之后：
+
+```
+① up -d postgres          → 等 healthy
+② up -d cassandra         → 等 healthy（首次 2~5 分钟）
+③ install                 → 建 Postgres schema + Cassandra keyspace/两张表
+④ up -d energy-server …   → 服务连上 9042
+```
+
+`docker-01-install.sh` 会读 `.env` 的 `DATABASE_TS_TYPE`：是 `cassandra` 就自动
+带 `--profile cassandra`、并**等 Cassandra healthy 才跑 install** —— 顺序不能反，
+反了会报 `InvalidKeyspaceException: Invalid keyspace thingsboard`（见第三节）。
+
+Cassandra 用独立 profile，不在 `split` 里 —— 这样改成 `sql` 时它根本不会启动，
+不会白吃 2G 内存。**用脚本，别手工一步步来**：
 
 ```bash
 cd ~/energy-app
 
-bash scripts/11-cassandra.sh status      # 看现状
-bash scripts/11-cassandra.sh enable      # 一键启用（起容器+建 schema+改配置+重启+等健康）
-bash scripts/11-cassandra.sh disable     # 切回 Postgres（Cassandra 数据保留）
+bash scripts/11-cassandra.sh status      # 看现状（容器 / keyspace / 表 / 当前后端）
+bash scripts/11-cassandra.sh enable      # 启用或修复（起容器+建 schema+改配置+重启）
+bash scripts/11-cassandra.sh disable     # 切回 Postgres（先自动清理验收镜像）
 bash scripts/11-cassandra.sh uninstall   # 删容器+删数据卷（不可恢复）
 bash scripts/11-cassandra.sh shell       # 进 cqlsh 交互
 ```
+
+> ⚠ 启动耗时：Cassandra 模式比 Postgres 模式**慢得多**。
+> 实测冷启动到 `energy-server` 返回 200 约 **7 分钟**（Postgres 约 2 分钟）。
+> 原因是实体缓存预热 + 驱动连接池 + 分区索引都要从远端拉。
+> `docker-02-start.sh` 已按后端自动放宽等待（Cassandra 600 秒 / sql 240 秒）。
 
 `enable` 的实测输出：
 
@@ -141,6 +172,66 @@ docker compose exec cassandra cqlsh -e "SELECT count(*) FROM thingsboard.ts_kv_c
 **端到端**：触发一次设备上报，再查一次点数，应当增长。
 实测（2026-10-22）：上报 `energy=9.99` → Cassandra 写入 26 点 →
 通过 `/api/plugins/telemetry/DEVICE/<id>/values/timeseries?keys=energy` 读回 `9.99`。
+
+---
+
+## 四之二、验收脚本怎么查 Cassandra 数据（`ts-mirror.sh`）
+
+**这是切到 Cassandra 之后最容易误判的一件事。**
+
+验收脚本（`03/04/06/08`）里写了大量直查 SQL：
+
+```sql
+SELECT d.name, k.key, t.ts, t.dbl_v
+  FROM ts_kv t
+  JOIN key_dictionary k ON k.key_id = t.key
+  JOIN device d ON d.id = t.entity_id
+```
+
+这些 SQL 是按「遥测存 Postgres」写的。切到 Cassandra 之后，**Postgres 里没有
+`ts_kv` 表**，于是验收会出现一片假失败：
+
+| 现象 | 真实原因 |
+| --- | --- |
+| `单相电表 ≥ 1 台 — 0 台`（设备明明有 21 台） | 04 的 `devs` 从遥测列表派生，列表为空 |
+| `资产上没有 energy_total` | 汇总点在 Cassandra，SQL 查 PG 查不到 |
+| `峰谷分析无法核对（设备无整点表底）` | `energy_reading` 在 Cassandra |
+| `idle_exceed 时序点：实际 0` | 同上 |
+
+产品没坏，是**验收工具看错了库**。
+
+### 解决办法：镜像一份到 Postgres
+
+```bash
+bash scripts/ts-mirror.sh          # 导出 + 导入 + 建 ts_kv 视图（约 40 秒 / 14 万行）
+bash scripts/ts-mirror.sh --force  # 强制重新导出
+bash scripts/ts-mirror.sh --clean  # 删镜像（切回 sql 之前必须跑）
+```
+
+它做三件事：
+
+```
+① cqlsh COPY thingsboard.ts_kv_cf TO '/tmp/ts_kv_cf.csv'
+② 导入 PG 的 ts_kv_mirror，并把 key 名映射回 key_dictionary.key_id
+③ 建视图 ts_kv（key 列就是 key_id，与原 SQL 完全兼容）
+```
+
+`04/06/08` 开头会自动调用它，**验收 SQL 一行都不用改**。
+后端是 `sql` 时它什么也不做（PG 本来就有真表）。
+
+> ⚠ 镜像只读、只用于验收与排查。TB 本身只读写 Cassandra，不碰这两张镜像表。
+> 切回 `sql` 前必须 `ts-mirror.sh --clean`，否则 install 建真表 `ts_kv` 会撞名
+> （`11-cassandra.sh disable` 已自动清理）。
+
+### 为什么不能用 `count(*)` 查 Cassandra
+
+```bash
+docker exec energy-cassandra cqlsh -e "SELECT count(*) FROM thingsboard.ts_kv_cf;"
+# ReadFailure: Operation failed - received 0 responses and 1 failures
+```
+
+全表 `count(*)` 在 Cassandra 上要扫所有分区，默认 10 秒读超时。**不是数据坏了**。
+要看行数用 `nodetool tablestats`，或按分区查、或走 `ts-mirror.sh`。
 
 ---
 

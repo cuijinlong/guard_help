@@ -234,6 +234,19 @@ docker compose --profile split up -d
 docker compose --profile split up -d --build
 ```
 
+> **默认后端是 Cassandra，命令要不要带 `--profile cassandra`？**
+>
+> | 命令 | 要不要带 | 原因 |
+> | --- | --- | --- |
+> | `restart energy-server` | 不用 | 只重启已有容器 |
+> | `up -d energy-server` | 不用 | 只动指定的服务 |
+> | `exec -T postgres …` | 不用 | 只进 postgres |
+> | `up -d`（不带服务名） | **建议带** | 否则日志里有 orphan 提示；不影响运行 |
+> | `down` | **必须带** | 不带的话 Cassandra 容器会成为孤儿，`down -v` 也删不掉它的卷 |
+>
+> 最稳妥：直接带上 `--profile split --profile cassandra`，或者用
+> `bash scripts/11-cassandra.sh status` 确认后端与容器状态。
+
 ### 进入容器排查
 
 ```bash

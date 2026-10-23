@@ -159,6 +159,14 @@ cp "$HERE/docker-99-uninstall.sh"    "$STAGE/"
 cp "$HERE/../scripts/"0[2-9]-* "$HERE/../scripts/"[1-9][0-9]-* "$STAGE/scripts/" 2>/dev/null \
   || die "scripts/ 下没有 02-* 起的脚本"
 
+# 不带数字前缀的辅助脚本也要拷 —— 上面的通配符只匹配 02-~99- 开头的文件。
+# ts-mirror.sh 是验收脚本（04/06/08）的依赖：它把 Cassandra 遥测镜像到 PG。
+# 漏拷的后果不是报错，而是验收静默跳过镜像、然后一堆断言误报为 0
+# （实测 2026-10-23：重装后 08 报「资产上没有 energy_total」等 3 项）。
+for helper in ts-mirror.sh; do
+  [[ -f "$HERE/../scripts/$helper" ]] && cp "$HERE/../scripts/$helper" "$STAGE/scripts/"
+done
+
 # 自检：脚本数与仓库一致，防止某次改动只加了文件没被拷进来
 REPO_SCRIPTS=$(ls "$HERE/../scripts/"0[2-9]-* "$HERE/../scripts/"[1-9][0-9]-* 2>/dev/null | wc -l | tr -d ' ')
 STAGE_SCRIPTS=$(ls "$STAGE/scripts/"0[2-9]-* "$STAGE/scripts/"[1-9][0-9]-* 2>/dev/null | wc -l | tr -d ' ')
@@ -311,6 +319,11 @@ AI_IMAGE=energy/ngxai-backend:4.4.0
 ALLINONE_IMAGE=energy/allinone:4.4.0
 TB_API_USERNAME=tenant@thingsboard.org
 TB_API_PASSWORD=tenant
+# 遥测存储后端：cassandra（默认，需 2GB 内存）| sql（遥测与实体同存 Postgres）
+# 改这个值不迁移存量数据；空库部署随便切。详见手册「Cassandra」一节。
+DATABASE_TS_TYPE=${DATABASE_TS_TYPE:-cassandra}
+# 最新值后端：建议留 sql（查询快、与实体同库）
+DATABASE_TS_LATEST_TYPE=${DATABASE_TS_LATEST_TYPE:-sql}
 ENVEOF
 
 if [[ "$PACK" == "true" ]]; then

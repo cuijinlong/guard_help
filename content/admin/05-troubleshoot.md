@@ -1805,9 +1805,10 @@ WHERE d.customer_id IS NOT NULL
 
 ---
 
-## 13A. Cassandra（可选存储后端）
+## 13A. Cassandra（默认遥测存储）
 
-Cassandra 是**可选的遥测存储**，默认不用（遥测存 Postgres）。
+Cassandra 是**默认的遥测存储**（`DATABASE_TS_TYPE=cassandra`）。
+只有 2GB 内存的小机器或纯功能演示才建议改成 `sql`（遥测回到 Postgres）。
 
 **完整文档在独立页面**：[②b Cassandra](/admin/cassandra) ——
 安装启用、切回、卸载、cqlsh 查询、nodetool 运维、备份恢复、常见故障都在那里。
@@ -1847,6 +1848,16 @@ docker exec -it energy-postgres psql -U postgres -d thingsboard
 > `additional_info::jsonb->>'key'` —— 该列是 `character varying`，
 > 直接写 `additional_info->>'key'` 会报
 > `operator does not exist: character varying ->> unknown`。
+
+> **⚠ Cassandra 后端（默认）下，凡是用到 `ts_kv` 的 SQL 要先跑一次镜像**
+>
+> ```bash
+> bash scripts/ts-mirror.sh
+> ```
+>
+> 它把 Cassandra 的遥测导出到 PG 并建同名视图 `ts_kv`，SQL 一行都不用改。
+> 不跑的话会报 `relation "ts_kv" does not exist`。原理见
+> [②b · 四之二](/admin/cassandra)。
 
 ### 14.1 总览：这套系统里到底有什么
 
@@ -2906,3 +2917,128 @@ python3 scripts/27-customer-surface-probe.py \
 
 > 这条断言是 2026-10-23 补的。此前探针只把 `401/403/5xx` 判失败，
 > `200 + {}` 算通过 —— 于是「295 条全通、页面全 0」同时成立，误导了验收。
+
+---
+
+### 现象 U：切到 Cassandra 后，验收脚本大面积报「0 台 / 没有数据」
+
+```
+✗ 单相电表 ≥ 1 台  — 0 台
+✗ 三相电表 ≥ 1 台  — 0 台
+✗ 资产上没有 energy_total（看板选场站会是空的）
+✗ 峰谷分析无法核对（设备无整点表底）
+✗ idle_exceed 时序点：实际 0，至少 1
+```
+
+而设备列表里明明有 21 台，页面也正常出数。
+
+**产品没坏，是验收脚本看错了库。**
+
+验收脚本（`04/06/08`）里写的是直查 SQL：
+
+```sql
+SELECT d.name, k.key, t.ts, t.dbl_v
+  FROM ts_kv t
+  JOIN key_dictionary k ON k.key_id = t.key
+  JOIN device d ON d.id = t.entity_id
+ WHERE k.key IN ('energy', 'energy_reading')
+ LIMIT 5;
+```
+
+这是按「遥测存 Postgres」写的。默认后端换成 Cassandra 后，**PG 里没有 `ts_kv` 表**，
+于是 `04` 的 `devs`（从遥测列表派生）为空 → 所有设备统计归零。
+
+**一条命令验证是不是这个原因**：
+
+```bash
+docker compose --profile split exec -T postgres psql -U postgres -d thingsboard -tAc \
+  "SELECT count(*) FROM information_schema.tables WHERE table_name='ts_kv';"
+# sql 后端 → 1
+# cassandra 后端且没做过镜像 → 0
+```
+
+**修法**：
+
+```bash
+bash scripts/ts-mirror.sh          # 导出 Cassandra 遥测 → PG 镜像 + ts_kv 视图（约 40 秒）
+bash scripts/04-verify-data.sh     # 重跑
+```
+
+`04/06/08` 开头已自动调用 `ts-mirror.sh`。如果它没生效，先看文件在不在：
+
+```bash
+ls -la scripts/ts-mirror.sh
+# 不存在 → 重装时 prepare 漏拷，手工补：
+cp <仓库>/shiyongshouce/downloads/scripts/ts-mirror.sh scripts/
+```
+
+原理见[②b Cassandra · 四之二](/admin/cassandra)。
+
+**另一个容易误判的**：
+
+```bash
+docker exec energy-cassandra cqlsh -e "SELECT count(*) FROM thingsboard.ts_kv_cf;"
+# ReadFailure: ... received 0 responses and 1 failures
+```
+
+Cassandra 全表 `count(*)` 会读超时，**不是数据坏了**。用 `nodetool tablestats`
+或 `scripts/ts-mirror.sh`。
+
+---
+
+### 现象 V：清除演示数据后再初始化，看板全变「部件无数据可显示」
+
+```
+能耗概览：今日用电量 0.0 / 本月 0.0 / 日历「所选范围内无数据」
+而接口查场站 energy_total 有值
+```
+
+**根因：看板 alias 指向了已删除的旧场站 uuid。**
+
+```
+清除 → 场站被删
+重新初始化 → 生成新 uuid 的场站
+看板 entityAliases 里存的还是旧 uuid → 部件查一个不存在的实体
+```
+
+一条 SQL 确认：
+
+```sql
+-- 看板 alias 指向的实体还在不在
+SELECT d.title, a.value->>'alias' AS alias,
+       a.value->'filter'->'singleEntity'->>'id' AS 实体id
+FROM dashboard d, LATERAL jsonb_each(d.configuration::jsonb->'entityAliases') a
+WHERE d.customer_id = '<客户id>'
+  AND (a.value->'filter'->'singleEntity'->>'id') IS NOT NULL
+  AND (a.value->'filter'->'singleEntity'->>'id') NOT LIKE '00000000-%'
+  AND NOT EXISTS (SELECT 1 FROM asset x WHERE x.id = (a.value->'filter'->'singleEntity'->>'id')::uuid);
+-- 有行 = 悬空引用
+```
+
+> `00000000-…` 开头的是**有意保留**的占位哨兵（品种/字典），不是悬空，别一起报。
+
+**修法**（2026-10-23 版已自动闭环）：
+
+| 阶段 | 平台动作 |
+| --- | --- |
+| 清除时 | 把场站引用还原成占位符 `00000000-…-0000000005a1` |
+| 初始化时 | 对**已存在**的看板重新填占位符（旧逻辑直接跳过） |
+
+已经在旧版本上踩了的，**再点一次「初始化演示数据」即可**（不用清库）：
+
+```
+[energy] 已为客户 某某公司 处理 6 个仪表板（新建 0 / 重绑场站 6，共 20 个模板）
+```
+
+确认重绑成功：
+
+```bash
+# 看板 alias 的场站 id 应与当前场站一致
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+SELECT configuration::jsonb->'entityAliases' FROM dashboard
+ WHERE customer_id='<客户id>' AND title='能耗概览';"
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+SELECT id, name FROM asset WHERE customer_id='<客户id>' AND type='场站';"
+```
+
+详细原理见[⑦ 数据流 6.6](/admin/data-pipeline)。

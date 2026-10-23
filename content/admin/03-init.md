@@ -72,6 +72,32 @@ docker compose logs energy-server | grep energy-schema   # server 阶段（表�
 ⚠️ `docker logs energy-server` 里**没有** `energy-schema` 不代表没建 ——
 全新安装时是在 install 阶段建的，server 起来只会看到表已存在（走 DEBUG，不打 INFO）。
 
+### 遥测表：Cassandra 默认，由 install 建
+
+遥测不再存 Postgres 的 `ts_kv`，默认写 Cassandra 的 `ts_kv_cf`。
+keyspace 与两张表**也由 install 建**（`CassandraKeyspaceService` 标了 `@Profile("install")`），
+`docker-01-install.sh` 已经把它编排进去了：
+
+```
+① up -d postgres        → 等 healthy
+② up -d cassandra       → 等 healthy（首次 2~5 分钟，慢是正常的）
+③ install               → Postgres schema + Cassandra keyspace/两张表
+④ up -d energy-server   → 连 9042
+```
+
+**顺序不能反**：Cassandra 没就绪就跑 install，会报
+`InvalidKeyspaceException: Invalid keyspace thingsboard`（见[现象 A](/admin/cassandra)）。
+
+验证：
+
+```bash
+docker compose exec cassandra cqlsh -e   "SELECT table_name FROM system_schema.tables WHERE keyspace_name='thingsboard';"
+# 期望：ts_kv_cf / ts_kv_partitions_cf
+```
+
+> Postgres 里**查不到 `ts_kv` 表是正常的**（那是 `sql` 后端才有的）。
+> 验收脚本需要它时会自动镜像一份，见[②b · 四之二](/admin/cassandra)。
+
 **为什么单独说这件事**：这 4 张表的 DDL 早就写在
 `nenghaobao/energy-config/sql/`，但当初只有一个手工迁移脚本把它们建在
 **开发库**上，从未纳入自动流程。于是开发机一切正常、新装出来 0 张表，

@@ -211,12 +211,17 @@ bash ~/energy-app/scripts/dev-fast-build.sh --deploy
 # ── 2b. 改了 pom / 资源 / 签名 → 全量
 cd guard-server && mvn package -DskipTests -o
 cp target/guard-server-4.4.0.jar ~/energy-app/
-cd ~/energy-app && docker compose --profile split restart energy-server
+cd ~/energy-app && docker compose --profile split --profile cassandra \
+  restart energy-server      # ⚠ 默认后端是 Cassandra，漏了 profile 会起不来
 
-# ── 3. 验证（至少这三条）
+# ── 3. 验证（至少这四条）
+bash scripts/ts-mirror.sh                                    # Cassandra 后端必跑：镜像遥测到 PG
 python3 scripts/27-customer-surface-probe.py ... --strict    # 客户视角无 4xx + 语义断言通过
 bash scripts/08-verify-release.sh ...                        # 75 项
 bash scripts/06-verify-e2e.sh ...                            # 53 项
+
+# ── 3b. 改了看板/部件 → 浏览器实测（探针只打接口，看不到渲染）
+#        用客户账号打开「能耗概览」，确认四张卡有数字、日历有热力
 
 # ── 4. 改的是功能点 → 同步手册
 cd shiyongshouce && python3 check-docs.py && ./sync.sh

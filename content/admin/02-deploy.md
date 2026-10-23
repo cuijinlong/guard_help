@@ -59,6 +59,21 @@ ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 20
 > **`.env` 是隐藏文件**，`ls` 看不到。看内容：`cat ~/energy-app/.env`。
 > **要装到别的目录**：`bash docker-00-prepare.sh /data/energy-app`。
 
+**`.env` 里的遥测后端**（新版本新增，默认 `cassandra`）：
+
+```properties
+DATABASE_TS_TYPE=cassandra        # cassandra（默认）| sql
+DATABASE_TS_LATEST_TYPE=sql       # 建议留 sql：查询快、与实体同库
+```
+
+| 值 | 起几个容器 | 首次启动 | 什么时候选 |
+| --- | --- | --- | --- |
+| `cassandra`（默认） | postgres + **cassandra** + server… | 约 7 分钟 | 正式部署，设备会持续增长 |
+| `sql` | postgres + server… | 约 2 分钟 | 只有 2GB 内存，或纯功能演示 |
+
+脚本会读这个值：`cassandra` 时自动带 `--profile cassandra` 起容器并等它就绪，
+`sql` 时**不启动** Cassandra（不白占 2G 内存）。详见[②b Cassandra](/admin/cassandra)。
+
 ---
 
 ## 第 2 步：建库并导入部件
@@ -110,8 +125,8 @@ bash docker-02-start.sh \
 **预计输出**：
 
 ```
-[10:16:30] 等待服务就绪（首次约 60–120 秒）
-  ✓ 服务已就绪（90s）：{"status":"ACCOUNT_REQUIRED"}
+[10:16:30] 等待服务就绪（Cassandra 首次约 5–8 分钟）
+  ✓ 服务已就绪（420s）：{"status":"ACCOUNT_REQUIRED"}
 [10:17:10] 创建系统管理员 langmen@126.com
   ✓ 管理员已创建
   ✓ 设备接入通道已开放（HTTP + MQTT）

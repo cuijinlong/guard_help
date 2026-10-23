@@ -73,6 +73,14 @@ except Exception: print('')" 2>/dev/null
 
 jget() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)" 2>/dev/null; }
 
+# 遥测后端可能是 Cassandra（默认）。验收 SQL 是按 Postgres 的 ts_kv 写的，
+# 这里先把它镜像过来，否则「设备数/资产汇总/峰谷自洽」会全部误报为 0。
+# 后端是 sql 时本脚本什么也不做（PG 本来就有真表）。
+if [[ -x scripts/ts-mirror.sh || -f scripts/ts-mirror.sh ]]; then
+  bash scripts/ts-mirror.sh >/tmp/ts-mirror.log 2>&1 || \
+    echo "  ! 遥测镜像失败，部分断言会误报：看 /tmp/ts-mirror.log" >&2
+fi
+
 # ---------------------------------------------------------------- 0. 登录
 C "0. 账号与令牌"
 TOK=$(login "$TENANT" "$TENANT_PASS")
@@ -357,9 +365,14 @@ print('ERR:' + last + '（已重试 5 次）')
 PY
 )
     [[ "$MQ" == "OK" ]] && ok_ "MQTT 连接与发布成功（端口 ${MQTT_PORT}）" || bad_ "MQTT 失败（${MQ}）"
-    # 落库是异步的：轮询最多 20s，别用固定 sleep 赌
+    # 落库是异步的：轮询最多 40s，别用固定 sleep 赌。
+    #
+    # 20s 不够：Cassandra 后端下，**首次**给一台新建的临时设备写遥测时，
+    # 规则链要加载设备档案/属性缓存，再把消息排进 Cassandra 写缓冲队列，
+    # 实测偶发超过 20s（2026-10-23：同一条脚本连跑两次，一次失败一次通过）。
+    # 误报比慢 20 秒更贵 —— 它会让人以为 MQTT 通道坏了。
     V=""
-    for _i in 1 2 3 4 5 6 7 8 9 10; do
+    for _i in $(seq 1 20); do
       V=$(TAPI "/api/plugins/telemetry/DEVICE/$RD_ID/values/timeseries?keys=voltage_a" | jget "d['voltage_a'][0]['value']" 2>/dev/null)
       [[ "$V" == "219.7" ]] && break
       sleep 2

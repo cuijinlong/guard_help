@@ -2,7 +2,9 @@
 #
 # 能源管理平台 · Cassandra（可选遥测存储）管理
 #
-# 默认部署不用 Cassandra（遥测存 Postgres）。只有遥测上亿、写入压力大时才需要。
+# 默认部署**使用** Cassandra 存遥测（DATABASE_TS_TYPE=cassandra）。
+# 想省内存的小规模部署可改成 sql（本脚本 disable 子命令）：
+# 遥测与实体同存 Postgres，少一个容器、少 2GB 内存。
 #
 # 用法：
 #   bash scripts/11-cassandra.sh status      # 看现状（容器 / keyspace / 表 / 当前后端）
@@ -71,7 +73,7 @@ env_get() {
 KEYSPACE="$(env_get CASSANDRA_KEYSPACE_NAME)"
 KEYSPACE="${KEYSPACE:-thingsboard}"
 TS_TYPE="$(env_get DATABASE_TS_TYPE)"
-TS_TYPE="${TS_TYPE:-sql}"
+TS_TYPE="${TS_TYPE:-cassandra}"
 
 # ---------------------------------------------------------------- 容器探测
 cass_running() {
@@ -118,8 +120,13 @@ cmd_status() {
   echo
 
   if ! cass_running; then
-    warn "容器 ${CASS_CONTAINER} 未运行（正常：默认不用 Cassandra）"
-    echo "  启用：bash scripts/11-cassandra.sh enable"
+    if [[ "$TS_TYPE" == "cassandra" ]]; then
+      warn "容器 ${CASS_CONTAINER} 未运行，但 DATABASE_TS_TYPE=cassandra —— 服务连不上会启动失败"
+      echo "  启动：bash scripts/11-cassandra.sh enable"
+    else
+      warn "容器 ${CASS_CONTAINER} 未运行（当前遥测后端为 sql，属正常）"
+      echo "  启用：bash scripts/11-cassandra.sh enable"
+    fi
     return 0
   fi
 
@@ -254,7 +261,7 @@ cmd_enable() {
   if grep -q '^DATABASE_TS_TYPE=' "$ENV_FILE"; then
     sed -i.bak "s|^DATABASE_TS_TYPE=.*|DATABASE_TS_TYPE=cassandra|" "$ENV_FILE"
   else
-    printf '\n# 遥测存储后端：sql（默认）| cassandra\nDATABASE_TS_TYPE=cassandra\n' >> "$ENV_FILE"
+    printf '\n# 遥测存储后端：cassandra（默认）| sql\nDATABASE_TS_TYPE=cassandra\n' >> "$ENV_FILE"
   fi
   if grep -q '^DATABASE_TS_LATEST_TYPE=' "$ENV_FILE"; then
     sed -i.bak "s|^DATABASE_TS_LATEST_TYPE=.*|DATABASE_TS_LATEST_TYPE=${DATABASE_TS_LATEST_TYPE:-sql}|" "$ENV_FILE"
@@ -295,6 +302,15 @@ cmd_enable() {
 # ================================================================ disable
 cmd_disable() {
   log "切回 Postgres（Cassandra 数据保留，不删）"
+
+  # 先把验收用的 ts_kv 镜像视图删掉。
+  #
+  # 不删的后果：切回 sql 后 TB 要建真表 ts_kv，而 PG 里已经有一个同名**视图**
+  # （由 scripts/ts-mirror.sh 建的），install 会报 relation already exists。
+  if [[ -f scripts/ts-mirror.sh ]]; then
+    bash scripts/ts-mirror.sh --clean >/dev/null 2>&1 || true
+    ok "已清理验收镜像（ts_kv 视图 / ts_kv_mirror 表）"
+  fi
 
   if grep -q '^DATABASE_TS_TYPE=' "$ENV_FILE"; then
     sed -i.bak "s|^DATABASE_TS_TYPE=.*|DATABASE_TS_TYPE=sql|" "$ENV_FILE"

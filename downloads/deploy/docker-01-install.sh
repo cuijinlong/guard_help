@@ -214,6 +214,36 @@ for i in $(seq 1 40); do
   fi
 done
 
+# ---------------- 2b. 遥测后端（Cassandra 默认） ----------------
+#
+# Cassandra 放在独立的 "cassandra" profile 下（不在 split 里），
+# 所以必须在这里显式带 profile 拉起，不能指望 up postgres 顺带。
+#
+# 顺序要求：**必须等 Cassandra healthy 才跑 install**。
+# TB 建 keyspace 的服务（CassandraKeyspaceService）带 @Profile("install")，
+# 只在 install 阶段跑；连不上或 keyspace 不存在就直接：
+#     InvalidKeyspaceException: Invalid keyspace thingsboard
+# 实测 2026-10-22。首次启动 2~5 分钟，慢是正常的。
+TS_TYPE="${DATABASE_TS_TYPE:-cassandra}"
+if [[ "$MODE" == "split" && "$TS_TYPE" == "cassandra" ]]; then
+  log "遥测后端：Cassandra（启动容器，首次 2~5 分钟）"
+  $COMPOSE $PROFILE_ARGS --profile cassandra up -d cassandra
+
+  CASS_OK="false"
+  for i in $(seq 1 60); do
+    sleep 5
+    s=$(docker inspect --format '{{.State.Health.Status}}' energy-cassandra 2>/dev/null || echo none)
+    if [[ "$s" == "healthy" ]]; then CASS_OK="true"; ok "Cassandra 健康（$((i*5))s）"; break; fi
+    if (( i % 6 == 0 )); then echo "    仍在启动… $((i*5))s（首次建系统表，耐心）"; fi
+  done
+  if [[ "$CASS_OK" != "true" ]]; then
+    $COMPOSE --profile cassandra logs --tail=40 cassandra
+    die "Cassandra 300 秒内未就绪。看上面日志，或调大 CASSANDRA_HEAP"
+  fi
+else
+  log "遥测后端：${TS_TYPE}（不需要 Cassandra 容器）"
+fi
+
 # ---------------- 3. 防止重复 install ----------------
 TABLES=$($COMPOSE $PROFILE_ARGS exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc \
   "select count(*) from information_schema.tables where table_schema='public'" 2>/dev/null | tr -d ' ')
@@ -242,9 +272,15 @@ DONE
 fi
 
 # ---------------- 4. 执行 install ----------------
-log "执行 install（建表 + 装载系统资源，约 1-3 分钟）"
+log "执行 install（建表 + 装载系统资源，约 1-3 分钟；含 Cassandra schema）"
 set +e
-$COMPOSE --profile install $PROFILE_ARGS run --rm install > /tmp/energy-install.log 2>&1
+# cassandra 情形下必须带 --profile cassandra，否则 install 容器的 depends_on
+# 看不到 cassandra 服务（虽然本脚本已提前把它起来，但 compose 仍需 profile 解析）
+COMPOSE_INSTALL_ARGS="$PROFILE_ARGS"
+if [[ "$MODE" == "split" && "${DATABASE_TS_TYPE:-cassandra}" == "cassandra" ]]; then
+  COMPOSE_INSTALL_ARGS="$PROFILE_ARGS --profile cassandra"
+fi
+$COMPOSE --profile install $COMPOSE_INSTALL_ARGS run --rm install > /tmp/energy-install.log 2>&1
 RC=$?
 set -e
 if [[ $RC -ne 0 ]]; then

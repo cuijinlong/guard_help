@@ -762,10 +762,86 @@ GET /api/plugins/telemetry/ASSET/<id>/values/timeseries
 
 ---
 
-### 6.6 排查顺序（照着走）
+### 6.6 清除演示数据后，看板为什么会指向旧实体
+
+**这是「清除 → 重新初始化」这条路的专属故障，很容易被当成部件坏了。**
+
+```
+① 客户点了「清除演示数据」
+      → 场站 / 分项 / 设备被删（只有 additionalInfo.demo=true 的）
+② 客户再点「初始化演示数据」
+      → 重新生成一套，**实体 uuid 全是新的**
+③ 看板呢？
+      → entityAliases 里存的是**旧 uuid**
+      → 部件去查一个已经不存在的实体
+      → 页面显示「部件无数据可显示」，而接口、服务、数据全都正常
+```
+
+实测偏差（2026-10-23）：清除后重建，看板 alias 指向 `96a283c0`，
+新场站是 `d8d83670` —— 差了 22 处引用里的 9 处场站引用。
+
+> 注意区分：这不是「看板配置写死了某台机器的实体 id」那种架构病。
+> 正常开户时占位符替换是对的；只有「删掉实体再重建」才会让旧引用悬空。
+
+#### 平台怎么修（两段闭环）
+
+```
+清除时（EnergyBootstrapInstaller.deleteDemoData）
+  记录被删的场站 id
+      ↓
+  把客户看板里这些 id 替换回占位符 00000000-0000-0000-0000-0000000005a1
+      ↓
+  日志：看板「能耗概览」还原 1 处场站引用（等下次初始化重绑）
+
+初始化时（assignDashboardsToCustomer）
+  对**已存在**的看板重新执行占位符替换（旧逻辑是直接跳过）
+      ↓
+  日志：处理 6 个仪表板（新建 0 / 重绑场站 6，共 20 个模板）
+```
+
+只还原**场站**：四个维度根（用能区域 / 用电分项 / 空间位置 / 用能性质）
+没有 demo 标记、不会被删，动它们反而会弄坏客户的维度树。
+
+#### 怎么确认修复生效
+
+```sql
+-- 清除之后：alias 应变成占位符
+SELECT configuration::jsonb->'entityAliases'
+  FROM dashboard WHERE customer_id = '<客户id>' AND title = '能耗概览';
+-- 期望看到 "场站" → 00000000-0000-0000-0000-0000000005a1
+
+-- 初始化之后：alias 应指向**当前**场站
+SELECT a.id FROM asset a WHERE a.customer_id='<客户id>' AND a.type='场站';
+-- 与上面 alias 里的 id 一致才对
+```
+
+一条 SQL 查全部悬空（排除有意保留的占位符）：
+
+```sql
+SELECT d.title, a.value->>'alias' AS alias, a.value->'filter'->'singleEntity'->>'id' AS 实体
+FROM dashboard d, LATERAL jsonb_each(d.configuration::jsonb->'entityAliases') a
+WHERE d.customer_id = '<客户id>'
+  AND (a.value->'filter'->'singleEntity'->>'id') IS NOT NULL
+  AND (a.value->'filter'->'singleEntity'->>'id') NOT LIKE '00000000-%'
+  AND NOT EXISTS (SELECT 1 FROM asset x WHERE x.id = (a.value->'filter'->'singleEntity'->>'id')::uuid)
+  AND NOT EXISTS (SELECT 1 FROM device x WHERE x.id = (a.value->'filter'->'singleEntity'->>'id')::uuid);
+-- 期望：0 行
+```
+
+#### 清除后还没初始化，页面该长什么样
+
+看板 alias 是占位符 → 部件不发实体查询 → 显示「请为本部件绑定一个数据源实体」。
+**这是正确状态**（确实没有数据），不是故障。
+
+---
+
+### 6.7 排查顺序（照着走）
 
 ```
 页面数字是 0
+  ├─ 最近「清除」过演示数据吗？
+  │      是 → 看板 alias 可能指向已删实体 → 查 6.6，重新初始化即可重绑
+  │      否 ↓
   ├─ 设备有 energy 吗？ ── 没有 → 查上报链路（第四节 / 第五节）
   │        │有
   ├─ 场站/分项有 energy_total 吗？ ── 没有 → 等一轮定时任务，或手工 rebuild
