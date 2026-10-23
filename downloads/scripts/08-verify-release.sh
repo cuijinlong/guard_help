@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=72
+EXPECTED_PASS=73
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -854,6 +854,23 @@ print('1' if need.issubset(set(d.keys())) else '0')" 2>/dev/null)
   fi
 else
   bad "取不到设备，无法验证计量配置端点" "确认演示数据已生成"
+fi
+
+# I-5b. 资产汇总遥测必须存在（看板「选场站/分项」读的就是它）
+#
+#      看板部件在目标实体是 ASSET 时读 energy_total，不是设备的 energy。
+#      初始化只写设备遥测时，客户一选场站，卡片全是「--」——
+#      看起来像部件坏了，实际是资产维度缺数（实测 2026-10-23）。
+#      这里验「至少一个资产有 energy_total 点」，并验组织 = 各场站之和。
+ASSET_TOT=$(docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+SELECT count(*) FROM ts_kv t
+JOIN key_dictionary kd ON kd.key_id = t.key
+WHERE kd.key = 'energy_total'" 2>/dev/null | tr -d ' ')
+if [[ "${ASSET_TOT:-0}" -gt 0 ]]; then
+  ok "资产汇总遥测已写入（energy_total ${ASSET_TOT} 点）"
+else
+  bad "资产上没有 energy_total（看板选场站会是空的）" \
+      "点「平台自检 → 一键修复初始化」补算，或看 EnergyBootstrapInstaller.seedAssetTotals"
 fi
 
 # I-6. SQL 埋点必须默认开启

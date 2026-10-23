@@ -305,6 +305,9 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
         ('05-troubleshoot.md', '## 14. 运维常用 SQL'),
         ('06-customer-menu.md', None),
         ('07-data-pipeline.md', None),
+        # 客户手册「看懂分析页」也给了对照 SQL —— 客户/运营会直接复制执行，
+        # 写错一条就等于教错核对方法，所以一并跑通。
+        ('../user/03-pages.md', None),
     ]
     blocks: list[str] = []
     for fname, marker in sql_docs:

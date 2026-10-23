@@ -575,7 +575,7 @@ docker compose --profile split up -d
 | `scripts/05-import-customer-data.py` | 客户台账导入 | `~/energy-app` |
 | `scripts/06-verify-e2e.sh` | 全链路验收（53 项） | `~/energy-app` |
 | `scripts/07-init-menu.sh` | 菜单重建 | `~/energy-app` |
-| `scripts/08-verify-release.sh` | 发布内容验收（72 项） | `~/energy-app` |
+| `scripts/08-verify-release.sh` | 发布内容验收（73 项） | `~/energy-app` |
 | `scripts/09-onboard-customer.sh` | **一键开通一个客户**（带演示数据） | `~/energy-app` |
 | `scripts/10-cleanup-customer.sh` | **清理一个客户**（连带遥测，含隔离校验） | `~/energy-app` |
 | `scripts/11-cassandra.sh` | **Cassandra 管理**（status/init/enable/disable/uninstall） | `~/energy-app` |
