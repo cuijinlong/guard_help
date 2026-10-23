@@ -97,6 +97,11 @@
           "id": "customer-lifecycle",
           "title": "⑧ 客户生命周期（开户/演示数据/销户）",
           "file": "admin/08-customer-lifecycle.md"
+        },
+        {
+          "id": "dev-build",
+          "title": "⑨ 开发与构建（改代码→生效）",
+          "file": "admin/09-dev-build.md"
         }
       ],
       "description": "给平台方的：怎么部署、开租户、导入数据、排障"

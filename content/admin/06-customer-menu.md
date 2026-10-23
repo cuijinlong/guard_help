@@ -182,6 +182,35 @@ WHERE t.entity_id = (SELECT id FROM device WHERE name = '单相园-1#进线总�
 - 切天必须用 `Asia/Shanghai`。按 UTC 切会把北京时间 08:00 之后算到前一天。
 - 页面上的「实时值」是设备上报的瞬时量，不等于「区间累加」。
 
+**⚠ 「能耗概览」的四张卡读的是资产，不是设备**
+
+上面两条 SQL 查的是**设备**（单台表）。而概览页的
+「今日 / 本月 / 今年 / 总用电量」四张卡，取数实体是**场站资产**，
+键名也不同：
+
+| 页面卡片 | 取数实体 | 键 | 聚合 |
+| --- | --- | --- | --- |
+| 今日用电量 | 场站 ASSET | `energy_total` | 按日 SUM |
+| 本月用电量 | 场站 ASSET | `energy_total` | 按日 SUM 后累加 |
+| 今年用电量 | 场站 ASSET | `energy_total` | 按日 SUM 后累加 |
+| 总用电量 | 场站 ASSET | `energy_total` | 全部历史累加 |
+
+```sql
+-- 概览页「今日用电量」对应的公开 SQL（与部件同一口径）
+-- 部件实际走 timeseries 接口按日聚合；这是一次性核对用的等价写法
+SELECT round(sum(coalesce(t.dbl_v, t.long_v))::numeric, 2) AS 今日_场站合计_kWh
+FROM ts_kv t
+JOIN key_dictionary kd ON kd.key_id = t.key
+WHERE t.entity_id = '<场站资产id>'
+  AND kd.key = 'energy_total'
+  AND t.ts >= (extract(epoch FROM date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai')
+                              AT TIME ZONE 'Asia/Shanghai') * 1000)::bigint;
+```
+
+资产上的 `energy_total` 由 `AssetTotalsScheduler` 每小时汇总一次
+（设备 `energy` → 资产 `energy_total`）。设备有数但场站是 0，就是这一步没跑 ——
+成因、SQL 与排查顺序见[⑦ 数据流第六节](/admin/data-pipeline)。
+
 ---
 
 ### 3.2 历史能耗

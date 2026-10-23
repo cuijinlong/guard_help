@@ -11,7 +11,7 @@
 
 ---
 
-## 一、全景：一条数据从 RTU 到页面的七步
+## 一、全景：一条数据从 RTU 到页面的八步
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -37,6 +37,13 @@
 │ ④ 计算字段（设备档案上，同档案设备自动继承）                          │
 │    energy_day / energy_flat / load_rate / voltage_unbalance /        │
 │    carbon / idle_exceed → 再写回 ts_kv 或触发告警                    │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ ④b 资产汇总（AssetTotalsScheduler，默认每小时一轮）                   │
+│    设备 energy → 资产 energy_total / energy_day / power_total         │
+│    ★ 平台不会在每次上报时自动汇总到资产；这一步是场站页、分项页、      │
+│      概览页「有数」的唯一来源。详见第六节。                            │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 ↓
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -555,7 +562,236 @@ var MAP = {
 
 ---
 
-## 六、端到端校验清单
+## 六、设备有数、页面却是 0：资产汇总与部件取数
+
+这一节对应一个很具体的现象：
+
+> 客户登录后，设备列表里看得见数据，但「能耗概览」四张卡片全是 `0.0`，
+> 日历热力图写着「所选范围内无数据」，或者部件一直停在「加载中…」。
+
+它有**两个独立成因**，必须分开查 —— 混在一起会白折腾半天：
+
+- **成因 A：资产上没有汇总值**。设备有 `energy`，但场站/分项资产没有 `energy_total`。
+- **成因 B：部件把「品种资产」当成了取数实体**。品种资产没有遥测，查出来必然是空。
+
+2026-10-23 这两条同时命中，所以「接口全 200、页面全 0」。
+
+---
+
+### 6.1 三层数据，三个不同的键名
+
+页面上的数字来自三个层级，键名不一样，混用就会查不到：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ 设备层  DEVICE                                                │
+│   energy          本小时增量（kWh）        ← RTU 上报         │
+│   energy_reading  累积表底（单调递增）      ← RTU 上报         │
+│   energy_day      当日累计                 ← 计算字段         │
+└───────────────────────────┬──────────────────────────────────┘
+                            │  ④b 资产汇总（每小时，见 6.2）
+                            ↓
+┌──────────────────────────────────────────────────────────────┐
+│ 资产层  ASSET（场站 / 分项 / 组织）                            │
+│   energy_total    该资产下所有表的本小时合计                   │
+│   energy_day      当日累计                                    │
+│   power_total     合计功率（仅电）                             │
+│   water_total / gas_total / steam_total（按品种分开）          │
+└───────────────────────────┬──────────────────────────────────┘
+                            │  不汇总，也不采集
+                            ↓
+┌──────────────────────────────────────────────────────────────┐
+│ 品种层  ASSET（电能 / 水表 / 燃气 / 蒸汽）                     │
+│   只有 paramDict 属性（指标名、单位、参数定义）                │
+│   ★ 没有任何遥测 —— 它是「维度节点」，不是「计量点」           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+一句话记住：**设备读 `energy`，资产读 `energy_total`，品种什么都不读。**
+
+---
+
+### 6.2 资产汇总从哪来（谁写、何时写）
+
+平台**不会**在每次设备上报时自动汇总到资产 —— 根规则链里没有这种节点。
+汇总由一个定时任务批量算：
+
+```
+AssetTotalsScheduler（guard-server）
+  每 1 小时一轮，启动后延迟 5 分钟
+    ↓
+  rebuildAssetTotals(tenantId, customerId, backfillDays=2)
+    ↓  按「设备 → 所属场站 / 分项 / 组织」分组
+    ↓  组内同品种只取 meterLevel 最小者（避免总表 + 分表重复计电）
+    ↓  按 ts 覆盖写 energy_total / energy_day / power_total
+```
+
+**为什么不用规则链**：规则链是逐条消息触发的，一台表每小时一个点，
+一次汇总要读该场站下**全部**表的历史。逐条触发等于每点都全量重算，
+代价随表数量平方增长。定时批处理按小时算一次，与表数量线性相关。
+
+**开关**（`application.yml` 或环境变量）：
+
+```properties
+energy.asset-totals.refresh.enabled=true          # 关掉就退回手工重算
+energy.asset-totals.refresh.initial-delay-ms=300000
+energy.asset-totals.refresh.interval-ms=3600000
+```
+
+**手工触发**（客户也能调，只影响自己）：
+
+```bash
+# 客户或租户 token 均可
+curl -s -X POST -H "X-Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:8090/api/energy/asset-totals/rebuild' \
+  -H 'Content-Type: application/json' -d '{"days":2}'
+# → {"assetsWritten": 13}
+```
+
+**窗口必须对齐整天**：`rebuildAssetTotals` 的起点是「今天 00:00 往前推 N−1 天」，
+不是「现在往前推 N 天」。因为 `energy_day` 是当日累计，从窗口里第一个点开始加 ——
+窗口若从某天中途开始，那天的 `energy_day` 会少算前半段。
+
+---
+
+### 6.3 部件怎么选取数实体（成因 B 的根源）
+
+三个部件 `overview_stats` / `calendar_heatmap` / `asset_stats_chart` 都用同一套
+`resolveEntity()` 选目标。**正确顺序**是：
+
+```
+① state.treeNode（用户在分析范围树里点选的节点）
+② state.entityId（状态实体）
+③ 部件数据源别名 alias（场站 / 分项）
+```
+
+品种资产只用来提供**指标名和单位**（读 `paramDict`），**不能当取数目标**。
+两个原因：
+
+1. 它没有遥测 —— 拿它查 `energy_total` 返回 `{}`，页面就是 0；
+2. 它的 `Contains` 子节点**横跨同租户下所有客户** —— 遍历子树会读到别家的分项。
+
+> 历史版本把品种放在优先级第一（`targetMode=kind`），于是「接口 200 + 空对象」
+> 被当成正常，页面四张卡全 0。这是 2026-10-23 修复的核心。
+
+**部件额外做的过滤**：`00000000-0000-0000-0000-…` 开头的占位哨兵 id 一律跳过。
+客户看板里「能源参数字典」「电能品种」保留占位符，是**有意为之** ——
+换成真实 id 会让客户去读租户级资产，触发 403。
+
+---
+
+### 6.4 SQL：三层各查一次，问题立刻定位
+
+以客户「星河工业园」为例（id 换成实际的）。
+
+**① 设备到底有没有数**
+
+```sql
+SELECT d.name AS 设备,
+       to_char(to_timestamp(max(t.ts)/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 最新点,
+       count(*) FILTER (WHERE k.key='energy')         AS energy点数,
+       count(*) FILTER (WHERE k.key='energy_reading') AS 表底点数
+FROM device d
+LEFT JOIN ts_kv t ON t.entity_id = d.id
+LEFT JOIN key_dictionary k ON k.key_id = t.key
+WHERE d.customer_id = '<客户id>'
+GROUP BY d.name
+ORDER BY 最新点 NULLS FIRST;
+```
+
+> 设备有数 → 问题在资产层，继续 ②。
+> 设备没数 → 问题在上报/规则链，回第四节与第五节。
+
+**② 资产有没有汇总值**
+
+```sql
+SELECT a.name AS 资产, a.type,
+       to_char(to_timestamp(max(t.ts)/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 最新汇总,
+       count(*) FILTER (WHERE k.key='energy_total') AS 汇总点数
+FROM asset a
+LEFT JOIN ts_kv t ON t.entity_id = a.id
+LEFT JOIN key_dictionary k ON k.key_id = t.key
+WHERE a.customer_id = '<客户id>'
+  AND a.type IN ('场站','分项','组织')
+GROUP BY a.name, a.type
+ORDER BY 汇总点数, 资产;
+```
+
+> 有场站/分项是 0 点 → 成因 A：定时任务没跑或失败，跑 6.2 的手工接口。
+> 全都有点但页面还是 0 → 成因 B：部件取数目标不对，见 6.3。
+
+**③ 品种资产确认是空的（应该为空）**
+
+```sql
+SELECT a.name, a.type,
+       (SELECT count(*) FROM ts_kv t WHERE t.entity_id = a.id)        AS 遥测点数,
+       (SELECT count(*) FROM attribute_kv v WHERE v.entity_id = a.id) AS 属性数
+FROM asset a
+WHERE a.type IN ('default')
+  AND a.customer_id = '13814000-1dd2-11b2-8080-808080808080';   -- NULL_UUID = 租户级
+```
+
+正常结果：`遥测点数 = 0`，`属性数 > 0`（有 `paramDict`）。
+如果这里遥测点数不为 0，说明有人往品种资产上写过数据，那是错的。
+
+---
+
+### 6.5 日聚合的桶边界（另一个容易踩的坑）
+
+部件按日取数用：
+
+```
+GET /api/plugins/telemetry/ASSET/<id>/values/timeseries
+    ?keys=energy_total&startTs=<起点>&endTs=<现在>
+    &interval=86400000&agg=SUM
+```
+
+**`startTs` 必须对齐到当地 00:00**，否则：
+
+- TB 从 `startTs` 起按 `interval` 切桶，返回的 `ts` 是**桶中心**；
+- 起点若是「现在往前推 400 天」这种任意时刻，桶边界就落在每天 07:49 之类的位置；
+- 于是「今天」的桶实际覆盖**昨天 19:49 → 今天 19:49**，跨天数据被算进同一天。
+
+实测偏差：页面显示今日 `83.4`，数据库真实合计 `66.81`，多出来的正是昨天两小时。
+
+对齐零点后桶起点 = 每天 00:00、桶中心 = 12:00，`dkey(桶中心)` 才等于自然日。
+
+> **附带一个显示陷阱**：TB 对**未闭合的今天桶**返回的 `ts` 是
+> `(桶起点 + 请求时刻) / 2`，19:56 请求会拿到 09:56 —— 既不等于数据截止时间，
+> 也不等于当前时间。所以「截止至」只显示到**日**，不显示时分秒。
+
+---
+
+### 6.6 排查顺序（照着走）
+
+```
+页面数字是 0
+  ├─ 设备有 energy 吗？ ── 没有 → 查上报链路（第四节 / 第五节）
+  │        │有
+  ├─ 场站/分项有 energy_total 吗？ ── 没有 → 等一轮定时任务，或手工 rebuild
+  │        │有
+  ├─ 部件取数目标是品种资产吗？ ── 是 → 部件版本旧，重新部署 energy_management.*
+  │        │否
+  └─ 数字偏大/偏小？ ── 查日桶边界是否对齐零点（6.5）
+```
+
+一条命令覆盖前两步：
+
+```bash
+python3 scripts/27-customer-surface-probe.py \
+  --base http://127.0.0.1:8090 \
+  --tenant tenant@126.com --tenant-pass 12345678 \
+  --customer customer@126.com --customer-pass 12345678 --strict
+```
+
+它不只判 4xx，还断言两件用户能看见的事：
+
+- **S1** 设备有遥测 → 所属场站的 `energy_total` 必须非空
+- **S2** 看板 alias 不能把品种/字典资产当取数实体
+
+---
+
+## 七、端到端校验清单
 
 新装或新接一批表之后，按顺序跑一遍：
 
@@ -616,7 +852,7 @@ docker logs energy-server 2>&1 | grep -A40 "SQL 埋点" | tail -50
 
 ---
 
-## 七、常见误解对照表
+## 八、常见误解对照表
 
 | 误解 | 实际 | 依据 |
 | --- | --- | --- |
@@ -628,3 +864,7 @@ docker logs energy-server 2>&1 | grep -A40 "SQL 埋点" | tail -50
 | 虚拟表也要有表底 | 虚拟表只有 `energy`，没有 `energy_reading` | `06-customer-menu.md` 3.8 |
 | 峰谷各档数字跳动说明算错了 | 不同时间段命中不同季节方案，档位构成会变 | `03-init.md` 九之三 |
 | 改了规则链脚本，平台自检报错就是坏了 | 自检比对内置版本，自定义脚本必然不符 | 5.5 |
+| 设备有数，页面就该有数 | 资产要另算一遍 `energy_total`，平台不自动汇总 | 6.2 |
+| 页面 0.0 说明没采到数据 | 也可能是部件把品种资产当取数实体，查了空对象 | 6.3 |
+| 「电能」品种资产上应该有遥测 | 它是维度节点，只有 `paramDict` 属性，从不采集 | 6.1 |
+| 日用量偏大是算法错了 | 先看日桶边界有没有对齐零点，否则会混进昨天 | 6.5 |

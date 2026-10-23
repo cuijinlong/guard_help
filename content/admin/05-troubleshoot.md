@@ -453,6 +453,95 @@ WHERE customer_id IS NOT NULL
 
 ---
 
+### 现象 I-2：客户页面部件 403，但看板 config 里查不到租户级 id
+
+**和现象 I 的区别**：现象 I 是**配置泄漏**（看板 JSON 里存了租户级 id）；
+这一条是**代码运行时**才拿到租户级 id —— config 里干干净净，查不出来。
+
+**现象**：客户登录后某些图表空着，Network 里是这些请求：
+
+```
+GET /api/plugins/telemetry/ASSET/<品种id>/values/attributes/SERVER_SCOPE?keys=paramDict   403
+GET /api/relations?fromId=<品种id>&fromType=ASSET&relationType=Contains                    403
+```
+
+报错文本会点名实体：
+
+```json
+{"message":"You don't have permission to perform 'READ_ATTRIBUTES' operation with ASSET '电能'!"}
+```
+
+**先确认这批 id 是谁**（十有八九是租户级主数据）：
+
+```sql
+SELECT a.name, a.type, a.customer_id,
+       CASE WHEN a.customer_id IS NULL OR a.customer_id='13814000-1dd2-11b2-8080-808080808080'
+            THEN '租户级 → 客户必然 403' ELSE '客户级' END AS 归属
+FROM asset a WHERE a.id = '<报错里的 id>';
+```
+
+**根因链**（实测 2026-10-23）：
+
+```
+① 看板部件启动
+      ↓
+② GET /api/energy/metric-params        ← 客户版接口，200，正常
+      ↓  返回 kinds[{id: 租户级品种资产 id, name:'电能', params:[...]}]
+③ 旧版部件不直接用 params，而是拿 kinds[].id 去读那个资产的属性
+      ↓
+④ GET /api/plugins/telemetry/ASSET/<租户级id>/values/attributes/SERVER_SCOPE
+      ↓  客户无权读租户级资产 → 403
+⑤ 部件拿不到 paramDict → 参数下拉为空 / 图表不渲染
+```
+
+**哪些部件会这样**（`controllerScript` 里搜 `values/attributes/SERVER_SCOPE`）：
+
+```
+overview_stats          calendar_heatmap     realtime_kpi
+realtime_trend          ranking_list         asset_stats_chart
+distribution_chart      query_panel（已升级走 metric-params，仅回退路径会）
+```
+
+> `query_panel` 已优先用 `metric-params` 下发的 `params`，只有接口不可用时才回退。
+> 其余 7 个仍是「拿 id 读属性」，所以客户打开就 403。
+
+**修法（代码级，`repair-init` 修不了）**
+
+权限层放行「租户级公共主数据资产」的**只读**：
+
+```java
+// CustomerUserPermissions#isTenantLevelPublicAsset
+// 白名单：energy_type_library / default / rate_template / tou_scheme
+// 条件：customerId 为 null 或 NULL_UUID（租户级）
+```
+
+三个容易踩错的点：
+
+| 坑 | 正确写法 | 后果 |
+| --- | --- | --- |
+| 以为 `getOwnerId()` 能判租户级 | 用 `getCustomerId().isNullUid()` | `Asset.getOwnerId()` 对租户级返回的是 **tenantId**，比 `NULL_UUID` 永远 false |
+| 只放行 `Operation.READ` | 还要放行 `READ_ATTRIBUTES` / `READ_TELEMETRY` | 属性接口用的是 `READ_ATTRIBUTES`，只放 READ 仍然 403 |
+| 只改默认权限集 | 存量库要跑 `repair-init` | 客户角色是**租户级共享的一条**（`customer_id = NULL_UUID`），`findOrCreateCustomerUserRole` 发现存在就不更新权限 |
+
+**验证：跑客户视角探针**
+
+```bash
+cd ~/energy-app
+python3 scripts/27-customer-surface-probe.py   --base http://127.0.0.1:8090   --tenant tenant@126.com --tenant-pass '12345678'   --customer customer@126.com --customer-pass '12345678' --strict
+
+# 期望：失败 0 条，退出码 0
+```
+
+这个探针会以客户身份打 **295 条**请求：自有资产/设备/看板的全部属性与关系、
+看板引用的非自有实体、`metric-params` 下发的品种 id……任何 4xx 都会列出来。
+
+> **为什么必须有这一层**：普通的 API 验收只调「我们认为重要」的接口，
+> 而客户打开页面时是**部件**在发请求。部件会去读租户级主数据 ——
+> 这类 403 在 API 级断言里永远看不见。实测：74 项验收全绿的同时，
+> 客户打开看板有 22 条 403。
+
+---
+
 ### 现象 J：RTU 上报成功（HTTP 200），但报表全空；库里只有 `U` / `I` / `P`
 
 **先看一眼库里存的到底是什么**：
@@ -2709,3 +2798,111 @@ WHERE t.key = k.key_id AND t.entity_id = d.id
 ```
 
 > 判据是「非整点」：演示数据全部落在整点，测试上报落在任意时刻。
+
+---
+
+### 现象 T：客户登录后，仪表板大量部件是 0.0 或「无数据」
+
+```
+今日用电量  0.0
+本月用电量  0.0
+今年用电量  0.0
+总用电量    0.0
+历史用电量详细：所选范围内无数据
+```
+
+而接口全返回 `200`。
+
+**先分清三种情况**，别一上来就怀疑权限：
+
+**① 部件本来就要用户先选范围**
+
+「实时能耗」「我的账单」「抄表功能」等页面上半部分是「查询设置」，
+必须勾选设备（或保持「不勾选 = 看当前品种全部」）后才出数。
+这类页面首次打开是空白的，属于交互设计，不是故障。
+
+判据：页面顶部有「查询设置 / 场站 / 能源品种 / 勾选设备」区块。
+
+**② 设备有数，但资产没有汇总值**
+
+设备列表里能看见数据，场站页和概览页却是 0 —— 这是 `energy_total` 没算。
+
+一条 SQL 定位：
+
+```sql
+-- 场站/分项有没有汇总点
+SELECT a.name, a.type,
+       count(*) FILTER (WHERE kd.key='energy_total') AS 汇总点数
+FROM asset a
+LEFT JOIN ts_kv t ON t.entity_id = a.id
+LEFT JOIN key_dictionary kd ON kd.key_id = t.key
+WHERE a.customer_id = '<客户id>' AND a.type IN ('场站','分项','组织')
+GROUP BY a.name, a.type ORDER BY 汇总点数;
+```
+
+汇总点数为 0 → 等一轮定时任务（默认每小时），或立刻手工重算：
+
+```bash
+curl -s -X POST -H "X-Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:8090/api/energy/asset-totals/rebuild' \
+  -H 'Content-Type: application/json' -d '{"days":2}'
+```
+
+确认定时任务在跑：
+
+```bash
+docker logs energy-server 2>&1 | grep "资产汇总刷新完成"
+# [energy] 资产汇总刷新完成：2 个客户 / 26 个资产，耗时 5172 ms
+```
+
+**③ 部件把「品种资产」当成了取数实体（旧部件才有）**
+
+根规则链和数据库都正常，但部件发的是：
+
+```
+GET /api/plugins/telemetry/ASSET/<品种资产id>/values/timeseries?keys=energy_total
+→ 200 {}
+```
+
+「电能」这类品种资产只有 `paramDict` 属性，**没有任何遥测**。
+
+确认是不是这个原因：
+
+```bash
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+SELECT fqn,
+       (descriptor::jsonb->>'controllerScript') LIKE '%fromKind%' AS 旧逻辑
+FROM widget_type
+WHERE fqn IN ('energy_management.overview_stats',
+              'energy_management.calendar_heatmap',
+              'energy_management.asset_stats_chart');"
+```
+
+`旧逻辑 = t` → 部件版本旧，重新部署 `energy_management.*` 三个部件
+（种子在 `guard-server/src/main/data/json/system/widget_types/`，
+挂载在 `$APP_HOME/data/json/system/widget_types/`，运行库在 `widget_type.descriptor` ——
+**三处都要更新**，否则重启会回退）。
+
+**④ 数字偏大 / 偏小**
+
+先看日聚合桶边界是否对齐零点。起点若是「现在往前推 400 天」这种任意时刻，
+「今天」的桶会跨到昨天，实测多算 16.6 kWh（83.4 vs 66.81）。
+
+详细原理与修复见[⑦ 数据流第六节](/admin/data-pipeline)。
+
+**一条命令覆盖 ②③**：
+
+```bash
+python3 scripts/27-customer-surface-probe.py \
+  --base http://127.0.0.1:8090 \
+  --tenant tenant@126.com --tenant-pass 12345678 \
+  --customer customer@126.com --customer-pass 12345678 --strict
+```
+
+它现在不只判 4xx，还会断言：
+
+- **S1** 设备有遥测 → 所属场站的 `energy_total` 必须非空
+- **S2** 看板 alias 不能把品种/字典资产当取数实体
+
+> 这条断言是 2026-10-23 补的。此前探针只把 `401/403/5xx` 判失败，
+> `200 + {}` 算通过 —— 于是「295 条全通、页面全 0」同时成立，误导了验收。

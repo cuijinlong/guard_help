@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=74
+EXPECTED_PASS=75
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -293,14 +293,17 @@ else
   bad "组织费率保存接口异常（HTTP ${org_ok}，期望 400）" '检查 saveOrgRate 的参数校验'
 fi
 
-# 菜单唯一性：重装/repair-init 不能越跑越多条同名菜单。
-# 根因是早先按 customer_id 判归属，而客户菜单的 customer_id 恒为 NULL_UUID。
-MENU_DUP=$(DASH_DB "SELECT count(*) FROM (
-           SELECT 1 FROM custom_menu
-            WHERE scope='CUSTOMER' AND name LIKE '业务导航%'
-            GROUP BY name HAVING count(*) > 1) t;" | tr -d ' ')
-eq "客户菜单唯一（同名不超过 1 条）" "${MENU_DUP:-0}" "0" \
-   '重装/repair-init 在堆重复菜单：EnergyMenuInstaller.removeCustomerMenu 没生效，跑一次 repair-init 清理'
+# 菜单孤儿：重装/repair-init 不能堆出**没人引用**的同名菜单。
+#
+# ⚠ 判据不能是「同名菜单不超过 1 条」。
+# 客户菜单的 customer_id 恒为 NULL_UUID（见 EnergyMenuInstaller 注释），
+# 归属靠 customer.custom_menu_id 这个指针。所以 N 个客户 = N 条同名菜单，
+# 这是设计如此。真正要防的是「指针丢了、菜单还在」的堆积 —— 那种才越跑越多。
+MENU_DUP=$(DASH_DB "SELECT count(*) FROM custom_menu m
+            WHERE m.scope='CUSTOMER' AND m.name LIKE '业务导航%'
+              AND NOT EXISTS (SELECT 1 FROM customer c WHERE c.custom_menu_id = m.id);" | tr -d ' ')
+eq "客户菜单无孤儿（每条都挂在某个客户上）" "${MENU_DUP:-0}" "0" \
+   '有客户被删但菜单没删：跑一次 repair-init 清理，或检查 EnergyMenuInstaller.removeCustomerMenu'
 
 # 拓扑数据完整性：边不能指向不存在的节点，否则双击下钻会出现「说有却点不进去」
 TOPO_JSON=$(TAPI '/api/energy/topologies')
@@ -886,6 +889,36 @@ if [[ "$RB_OK" == "1" ]]; then
 else
   bad "客户无法重算资产汇总" \
       "看 EnergyDemoDataController.rebuildAssetTotals：客户账号应限定在自己域内并返回 assetsWritten"
+fi
+
+# I-5d. 客户视角权限探针：客户打开页面时部件发的请求不能有 4xx
+#
+#       之前的验收只调「我们认为重要」的接口，而客户打开页面是**部件**在发请求。
+#       部件会去读租户级主数据（能源品种、参数字典），客户没权限 → 403 → 图表空白。
+#       实测 2026-10-23：74 项全绿的同时，客户看板有 22 条 403。
+#
+#       探针脚本 27-customer-surface-probe.py 以客户身份打 295 条请求，
+#       任何 401/403/5xx 都算缺陷。--strict 时有失败会退出码 2。
+PROBE="$APP_HOME/scripts/27-customer-surface-probe.py"
+if [[ -f "$PROBE" ]]; then
+  PROBE_OUT=$(python3 "$PROBE" --base "$BASE" \
+      --tenant "$TENANT" --tenant-pass "$TENANT_PASS" \
+      --customer "$CUST" --customer-pass "$CUST_PASS" \
+      --strict --json 2>/dev/null)
+  PROBE_RC=$?
+  PROBE_FAIL=$(echo "$PROBE_OUT" | jget "print(d.get('failed', 999))" 2>/dev/null)
+  PROBE_TOTAL=$(echo "$PROBE_OUT" | jget "print(d.get('total', 0))" 2>/dev/null)
+  if [[ "${PROBE_FAIL:-999}" == "0" && "$PROBE_RC" == "0" ]]; then
+    ok "客户视角无 4xx（${PROBE_TOTAL:-0} 条请求全通）"
+  else
+    FIRST=$(echo "$PROBE_OUT" | jget "
+bad = [x for x in (d.get('items') or []) if x.get('code') in (401,403) or (x.get('code') or 0) >= 500]
+print((bad[0].get('label','') + ' → ' + str(bad[0].get('code',''))) if bad else '')" 2>/dev/null)
+    bad "客户视角有 ${PROBE_FAIL} 条请求失败（首条：${FIRST}）" \
+        "看 scripts/27-customer-surface-probe.py 的 --json 输出；403 多为部件读租户级主数据，见「现象 I-2」"
+  fi
+else
+  printf '  \033[33m  - 跳过：缺少 scripts/27-customer-surface-probe.py\033[0m\n'
 fi
 
 # I-6. SQL 埋点必须默认开启
