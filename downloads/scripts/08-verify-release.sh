@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=73
+EXPECTED_PASS=74
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -871,6 +871,21 @@ if [[ "${ASSET_TOT:-0}" -gt 0 ]]; then
 else
   bad "资产上没有 energy_total（看板选场站会是空的）" \
       "点「平台自检 → 一键修复初始化」补算，或看 EnergyBootstrapInstaller.seedAssetTotals"
+fi
+
+# I-5c. 客户能给自己重算资产汇总（自建场站/设备后必需）
+#
+#      平台不会在设备上报时自动把电量汇总到资产。客户自建场站后
+#      不重算，看板选场站就是空的。这个端点必须对客户开放且只影响自己。
+REBUILD=$(curl -s --noproxy '*' -m 120 -X POST \
+          -H "X-Authorization: Bearer $CTOK" -H 'Content-Type: application/json' \
+          -d '{"days":7}' "$BASE/api/energy/asset-totals/rebuild" 2>/dev/null)
+RB_OK=$(echo "$REBUILD" | jget "print('1' if d.get('ok') and 'assetsWritten' in d else '0')" 2>/dev/null)
+if [[ "$RB_OK" == "1" ]]; then
+  ok "客户可重算资产汇总（写入了 $(echo "$REBUILD" | jget "print(d.get('assetsWritten'))" 2>/dev/null) 个资产）"
+else
+  bad "客户无法重算资产汇总" \
+      "看 EnergyDemoDataController.rebuildAssetTotals：客户账号应限定在自己域内并返回 assetsWritten"
 fi
 
 # I-6. SQL 埋点必须默认开启
