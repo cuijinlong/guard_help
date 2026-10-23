@@ -49,6 +49,118 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 BASE="${BASE:-http://127.0.0.1:8090}"
 PG_CONTAINER="${PG_CONTAINER:-energy-postgres}"
 PG_DB="${PG_DB:-thingsboard}"
+
+# ---------------------------------------------------------------- 遥测后端
+# 遥测可能在 Postgres（DATABASE_TS_TYPE=sql）或 Cassandra（默认）。
+# 两者的清理方式**完全不同**，判错就会出现「盘点 0 点、实际残留几万点」的假安全：
+#   · sql       → DELETE FROM ts_kv（PG 真表）
+#   · cassandra → 必须走 TB 的 telemetry delete API，且**要在删客户之前**
+#                 （API 需要实体存在 + WRITE_TELEMETRY 权限校验）
+#
+# 实测 2026-10-23：脚本按 sql 写死，Cassandra 后端下盘点显示「0 个数据点」，
+# 因为 PG 里的 ts_kv 只是验收用的**镜像视图**，不代表真实数据 ——
+# 客户销户后 Cassandra 里那几万点会永久残留，正是最该防的「数据污染」。
+TS_BACKEND="${DATABASE_TS_TYPE:-}"
+if [[ -z "$TS_BACKEND" ]]; then
+  # 部署目录的 .env 是唯一可信来源（脚本可能从别处调用）
+  for f in "$HERE/../.env" "$HERE/.env"; do
+    [[ -f "$f" ]] && TS_BACKEND=$(sed -n 's/^DATABASE_TS_TYPE=//p' "$f" | tail -1) && break
+  done
+fi
+TS_BACKEND="${TS_BACKEND:-cassandra}"
+
+# 列出某台设备实际有遥测的 key（跨后端通用：走 TB API，不碰存储层）
+telemetry_keys() {
+  local dev="$1" raw
+  raw=$(api GET "/api/plugins/telemetry/DEVICE/$dev/keys/timeseries" 2>/dev/null || true)
+  echo "$raw" | python3 -c "
+import json,sys
+try:
+    ks=json.load(sys.stdin)
+except Exception:
+    ks=[]
+print(','.join(ks) if isinstance(ks,list) else '')" 2>/dev/null || true
+}
+
+# 有多少台设备真的带遥测（用于盘点，不做精确点数 —— Cassandra 全表 count 会超时）
+devices_with_telemetry() {
+  local n=0 d k
+  for d in ${DEV_IDS:-}; do
+    k=$(telemetry_keys "$d")
+    [[ -n "$k" ]] && n=$((n+1))
+  done
+  echo "$n"
+}
+
+# ---------------------------------------------------------------- Cassandra 索引残留
+#
+# ★ TB 的 delete API 只删 ts_kv_cf，**不删 ts_kv_partitions_cf**。
+#
+# 实测（2026-10-23）：销户后 ts_kv_cf 读到 0 行（tombstone 生效），
+# 但 ts_kv_partitions_cf 里 526 行分区索引原封不动留着。
+# 这是 TB 上游行为（CassandraBaseTimeseriesDao.deleteAsync 只发
+# `DELETE FROM ts_kv_cf`），不是我们的 bug；但对「销户不留痕」是实实在在的残留：
+#   · 占空间（每台表 35 key × 每小时一个分区）
+#   · 重建同 UUID 的实体（导入/迁移）会读到旧分区索引
+#
+# 表主键是 ((entity_type, entity_id, key), partition)，
+# 按 (entity_type, entity_id, key) 整个分区删，比逐 partition 快得多。
+cass_purge_partitions() {
+  local ids="$1" cql=/tmp/purge_partitions_$$.cql
+  [[ -z "$ids" ]] && { echo 0; return; }
+
+  : > "$cql"
+  local dev
+  for dev in ${ids//,/ }; do
+    docker exec energy-cassandra cqlsh -e \
+      "SELECT entity_type, key FROM thingsboard.ts_kv_partitions_cf WHERE entity_id=${dev} ALLOW FILTERING;" \
+      2>/dev/null \
+    | python3 -c "
+import sys
+dev = '${dev}'
+n = 0
+for ln in sys.stdin:
+    if '|' not in ln:
+        continue
+    et, k = ln.split('|', 1)
+    et = et.strip(); k = k.strip()
+    if et not in ('DEVICE', 'ASSET') or not k or k == 'key':
+        continue
+    print(f\"DELETE FROM thingsboard.ts_kv_partitions_cf WHERE entity_type='{et}' AND entity_id={dev} AND key='{k}';\")
+    n += 1
+" >> "$cql"
+  done
+
+  local n
+  n=$(grep -c '^DELETE' "$cql" 2>/dev/null || echo 0)
+  if [[ "${n:-0}" -gt 0 ]]; then
+    docker cp "$cql" energy-cassandra:/tmp/purge.cql >/dev/null
+    docker exec energy-cassandra cqlsh -f /tmp/purge.cql >/dev/null 2>&1 || true
+  fi
+  rm -f "$cql"
+  echo "${n:-0}"
+}
+
+# 目标设备在 Cassandra 里还有多少分区索引（0 = 干净）
+#
+# ⚠ 不能对 cqlsh 输出做 `tr -cd '0-9'`：
+#   cqlsh 会在结果后面打 Warnings（"Read 638 live rows and 3124 tombstone cells"），
+#   那些数字会被一并吞进来，把 0 算成 6383124 之类。实测踩过：明明 0 行，
+#   却报「仍有 21 条残留」，逼着人去查一个不存在的残留。
+#   只认「整行只有一个数字」的那一行（count 的输出行）。
+cass_partitions_left() {
+  local ids="$1" total=0
+  [[ -z "$ids" ]] && { echo 0; return; }
+  local dev c
+  for dev in ${ids//,/ }; do
+    c=$(docker exec energy-cassandra cqlsh -e \
+      "SELECT count(*) FROM thingsboard.ts_kv_partitions_cf WHERE entity_id=${dev} ALLOW FILTERING;" \
+      2>/dev/null \
+      | awk '/^[[:space:]]*[0-9]+[[:space:]]*$/ { v = $1 } END { print v + 0 }')
+    total=$((total + ${c:-0}))
+  done
+  echo "$total"
+}
 NULL_UUID="13814000-1dd2-11b2-8080-808080808080"
 
 EMAIL=""; NAME=""; CID=""
@@ -191,10 +303,17 @@ rows=(json.load(sys.stdin) or {}).get('data',[])
 print(' '.join(d['id']['id'] for d in rows))" 2>/dev/null || true)
 
 TS_N=0
+TS_WITH=0
 if [[ -n "$DEV_IDS" && "$KEEP_TELEMETRY" != "true" ]]; then
-  IDLIST=$(echo "$DEV_IDS" | tr ' ' ',' | sed "s/[^,]*/'&'/g")
-  TS_N=$(psql_q "SELECT count(*) FROM ts_kv WHERE entity_id IN ($IDLIST);")
-  TS_N="${TS_N:-0}"
+  if [[ "$TS_BACKEND" == "cassandra" ]]; then
+    # Cassandra 不能 count(*)（全表扫会 ReadFailure），改为「有遥测的设备数」
+    TS_WITH=$(devices_with_telemetry)
+    TS_WITH="${TS_WITH:-0}"
+  else
+    IDLIST=$(echo "$DEV_IDS" | tr ' ' ',' | sed "s/[^,]*/'&'/g")
+    TS_N=$(psql_q "SELECT count(*) FROM ts_kv WHERE entity_id IN ($IDLIST);")
+    TS_N="${TS_N:-0}"
+  fi
 fi
 
 # ════════════════════════════════════════════════════════════════
@@ -244,6 +363,17 @@ outside_fingerprint() {
 # 注意：不能统计全库总量，遥测是实时写入的，总量一直在涨。
 # 语义：遥测 append-only，目标以外的点数**只能增加或不变**，减少就是越界。
 ts_outside() {
+  # Cassandra 下没有便宜的「非目标点数」查询：
+  #   · 全表 count(*) 会 ReadFailure（默认 10s 读超时）
+  #   · nodetool 的 partition 数是 estimate，且含 tombstone，作为指纹不可靠
+  # 与其拿 PG 镜像快照充数（快照不随销户变化，永远"通过"= 假安全感），
+  # 不如**明确跳过**，把遥测层面的隔离交给两条真正的硬校验：
+  #   ① 非目标客户的实体指纹（outside_fingerprint，强校验）
+  #   ② 目标设备分区索引归零（cass_partitions_left，强校验）
+  if [[ "$TS_BACKEND" == "cassandra" ]]; then
+    echo "skip"
+    return
+  fi
   if [[ -n "${DEV_IDS:-}" ]]; then
     local ids
     ids=$(echo "$DEV_IDS" | tr ' ' ',' | sed "s/[^,]*/'&'/g")
@@ -268,6 +398,8 @@ echo " 看板副本   ${DASH_N}"
 echo " 用户       ${USER_N}"
 if [[ "$KEEP_TELEMETRY" == "true" ]]; then
   echo " 遥测数据   保留（--keep-telemetry）"
+elif [[ "$TS_BACKEND" == "cassandra" ]]; then
+  echo " 遥测数据   ${TS_WITH} 台设备带遥测（Cassandra，一并删除）"
 else
   echo " 遥测数据   ${TS_N} 个数据点（一并删除）"
 fi
@@ -294,6 +426,41 @@ fi
 # 删客户前记下它引用的菜单 id —— 删后按 id 精确清，不靠名字猜
 MENU_ID=$(psql_q "SELECT custom_menu_id FROM customer WHERE id = '$CID';" || true)
 
+# ---------------------------------------------------------------- 先清遥测
+#
+# ★ 顺序：删客户**之前**。
+#
+# TB 的 telemetry delete API 会做权限校验（需要实体存在、当前用户有
+# WRITE_TELEMETRY）。客户一删，设备就没了，API 返回 404，遥测永远删不掉。
+# SQL 后端没有这个约束（可以事后 DELETE FROM ts_kv），但统一放前面更简单，
+# 也让「删完再校验」这一步对两种后端都成立。
+TS_DELETED=0
+TS_PURGED_DEVS=0
+if [[ "$KEEP_TELEMETRY" != "true" && -n "$DEV_IDS" ]]; then
+  log "清理遥测（先于删客户；后端 ${TS_BACKEND}）"
+  for d in $DEV_IDS; do
+    KEYS=$(telemetry_keys "$d")
+    [[ -z "$KEYS" ]] && continue
+    CODE=$(ncurl -o /tmp/cleanup-ts.json -w '%{http_code}' -X DELETE \
+      "$BASE/api/plugins/telemetry/DEVICE/$d/timeseries/delete?keys=${KEYS}&deleteAllDataForKeys=true" \
+      -H "X-Authorization: Bearer $TOKEN")
+    if [[ "$CODE" == "200" ]]; then
+      TS_PURGED_DEVS=$((TS_PURGED_DEVS+1))
+    else
+      warn "设备 $d 遥测删除失败（HTTP ${CODE}）：$(cat /tmp/cleanup-ts.json 2>/dev/null | head -c 200)"
+    fi
+  done
+  TS_DELETED="$TS_PURGED_DEVS"
+  ok "已清 ${TS_PURGED_DEVS} 台设备的遥测"
+
+  # TB 只删 ts_kv_cf，分区索引要自己清（原因见 cass_purge_partitions 注释）
+  if [[ "$TS_BACKEND" == "cassandra" ]]; then
+    IDS_CSV=$(echo "$DEV_IDS" | tr ' ' ',')
+    CASS_IDX_DEL=$(cass_purge_partitions "$IDS_CSV")
+    ok "已清 ${CASS_IDX_DEL} 条 Cassandra 分区索引（ts_kv_partitions_cf）"
+  fi
+fi
+
 # ---------------------------------------------------------------- 删除
 log "删除客户（级联删资产 / 设备 / 用户 / 看板 / 关系 / 属性）"
 CODE=$(ncurl -o /tmp/cleanup-del.json -w '%{http_code}' -X DELETE \
@@ -308,21 +475,35 @@ GONE=$(psql_q "SELECT count(*) FROM customer WHERE id = '$CID';")
 [[ "${GONE:-1}" == "0" ]] || die "异常：接口返回成功，但客户 $CID 仍在库中。请人工核查。"
 ok "确认客户 $CID 已从库中消失"
 
-# ---------------------------------------------------------------- 清遥测
-TS_DELETED=0
-if [[ "$KEEP_TELEMETRY" != "true" && -n "$DEV_IDS" ]]; then
-  log "清理遥测（ts_kv，按删前的设备 id 精确匹配）"
-  IDLIST=$(echo "$DEV_IDS" | tr ' ' ',' | sed "s/[^,]*/'&'/g")
-  EXPECT_TS=$(psql_q "SELECT count(*) FROM ts_kv WHERE entity_id IN ($IDLIST);")
-  # psql 的 DELETE 输出是「DELETE <n>」，但我们统一去了空白，这里只取数字
-  DEL_TS=$(docker exec -i "$PG_CONTAINER" psql -U postgres -d "$PG_DB" -tAc \
-    "DELETE FROM ts_kv WHERE entity_id IN ($IDLIST);" 2>/dev/null || echo '?')
-  DEL_N=$(echo "$DEL_TS" | tr -cd '0-9')
-  if echo "$DEL_TS" | grep -q '^DELETE'; then
-    TS_DELETED=${DEL_N:-0}
-    ok "已删除 ${TS_DELETED} 个数据点（删前计数 ${EXPECT_TS:-?}）"
+# ---------------------------------------------------------------- 校验遥测已清
+#
+# 这是「客户数据不污染系统」的**最后一道闸**。
+# 不能只信 API 返回 200 —— 必须回读**真实存储**。
+#
+# ⚠ Cassandra 后端下绝不能查 PG 的 ts_kv：
+#   那是 scripts/ts-mirror.sh 建的**导出快照**，销户时它还是旧数据，
+#   于是校验永远报「仍有 N 个点未清掉」的假故障（实测 2026-10-23：
+#   误报 122257 点，而 Cassandra 里其实一行都读不到了）。
+if [[ "$KEEP_TELEMETRY" != "true" && -n "$DEV_IDS" && "$TS_DELETED" != "0" ]]; then
+  log "回读校验：目标设备的遥测是否真的清空"
+  if [[ "$TS_BACKEND" == "cassandra" ]]; then
+    IDS_CSV=$(echo "$DEV_IDS" | tr ' ' ',')
+    CASS_LEFT=$(cass_partitions_left "$IDS_CSV")
+    if [[ "${CASS_LEFT:-1}" == "0" ]]; then
+      ok "Cassandra：目标设备已无分区索引（0 条）"
+    else
+      warn "Cassandra：仍有 ${CASS_LEFT} 条分区索引残留（ts_kv_cf 数据已 tombstone）"
+    fi
+    TS_LEFT="$CASS_LEFT"
   else
-    warn "ts_kv 清理结果：${DEL_TS:-未知}（可稍后手工核对）"
+    TS_LEFT=0
+    for d in $DEV_IDS; do
+      KEYS=$(telemetry_keys "$d")
+      [[ -n "$KEYS" ]] && TS_LEFT=$((TS_LEFT+1))
+    done
+    if [[ "$TS_LEFT" == "0" ]]; then
+      ok "目标设备遥测已清空（0 台仍有数据）"
+    fi
   fi
 else
   log "跳过遥测清理（--keep-telemetry 或没有设备）"
@@ -396,7 +577,10 @@ fi
 
 # 目标以外的遥测：只能增加（实时写入）或不变，减少就是误删。
 # 这里不能用「相等」—— 其他客户每分钟都在上报，数字一直在涨。
-if [[ "${TS_AFTER:-0}" -lt "${TS_BEFORE:-0}" ]]; then
+if [[ "$TS_BACKEND" == "cassandra" ]]; then
+  log "遥测：Cassandra 后端跳过「目标以外点数」指纹（全表 count 不可用）"
+  ok "  隔离由实体指纹 + 目标设备索引归零两条硬校验保证"
+elif [[ "${TS_AFTER:-0}" -lt "${TS_BEFORE:-0}" ]]; then
   ISOLATION_OK="false"
   FAIL_MSG="${FAIL_MSG}
 
@@ -408,16 +592,32 @@ else
 fi
 
 # 目标设备的遥测必须归零（除非 --keep-telemetry）
+#
+# 后端决定「归零」怎么判：
+#   cassandra → ts_kv_partitions_cf 必须 0 条（ts_kv_cf 的数据已 tombstone，读不到）
+#   sql       → ts_kv 必须 0 行
 if [[ "$KEEP_TELEMETRY" != "true" && -n "$DEV_IDS" ]]; then
-  IDLIST=$(echo "$DEV_IDS" | tr ' ' ',' | sed "s/[^,]*/'&'/g")
-  TS_LEFT=$(psql_q "SELECT count(*) FROM ts_kv WHERE entity_id IN ($IDLIST);")
-  if [[ "${TS_LEFT:-1}" == "0" ]]; then
-    ok "遥测：目标设备已无残留（0 点）"
+  if [[ "$TS_BACKEND" == "cassandra" ]]; then
+    TS_LEFT=$(cass_partitions_left "$(echo "$DEV_IDS" | tr ' ' ',')")
+    if [[ "${TS_LEFT:-1}" == "0" ]]; then
+      ok "遥测：目标设备已无残留（Cassandra 分区索引 0 条）"
+    else
+      ISOLATION_OK="false"
+      FAIL_MSG="${FAIL_MSG}
+
+  ✗ 目标设备仍有 ${TS_LEFT} 条 Cassandra 分区索引未清掉。"
+    fi
   else
-    ISOLATION_OK="false"
-    FAIL_MSG="${FAIL_MSG}
+    IDLIST=$(echo "$DEV_IDS" | tr ' ' ',' | sed "s/[^,]*/'&'/g")
+    TS_LEFT=$(psql_q "SELECT count(*) FROM ts_kv WHERE entity_id IN ($IDLIST);")
+    if [[ "${TS_LEFT:-1}" == "0" ]]; then
+      ok "遥测：目标设备已无残留（0 点）"
+    else
+      ISOLATION_OK="false"
+      FAIL_MSG="${FAIL_MSG}
 
   ✗ 目标设备仍有 ${TS_LEFT} 个遥测点未清掉。"
+    fi
   fi
 fi
 

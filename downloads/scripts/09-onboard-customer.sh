@@ -228,7 +228,10 @@ cat <<'TABLES'
   device_credentials  每台设备一个接入令牌（默认 ACCESS_TOKEN）
   relation            实体关系，type = 'Contains'（拓扑连线写的就是这张表）
   attribute_kv        属性（SERVER_SCOPE）：分项归属 / 层级 / 站点 id
-  ts_kv               遥测（按月分区）：energy / energy_reading / power …
+  ts_kv               遥测 —— ⚠ 默认后端是 Cassandra，PG 里**没有这张真表**：
+                      数据在 Cassandra 的 ts_kv_cf；
+                      PG 里同名 ts_kv 只是 scripts/ts-mirror.sh 建的验收快照。
+                      要查请先 `bash scripts/ts-mirror.sh`，或直接用 cqlsh。
 
   dashboard           20 个看板副本（customer_id = 该客户，不是 assigned_customers）
   custom_menu         客户菜单 13 项（归属走 customer.custom_menu_id → custom_menu.id）
@@ -266,7 +269,9 @@ SELECT d.name, dc.credentials_id, dc.credentials_type
 FROM device d JOIN device_credentials dc ON dc.device_id = d.id
 WHERE d.customer_id = '<CID>' ORDER BY d.name;
 
--- 遥测数据量（ts_kv 按月分区，必须查分区）
+-- ⚠ 下面两条遥测 SQL 需要先跑 `bash scripts/ts-mirror.sh`
+--   （它把 Cassandra 遥测镜像到 PG 并建同名视图 ts_kv；默认后端是 Cassandra）
+-- 遥测数据量
 SELECT count(*) AS 数据点, min(ts) AS 最早, max(ts) AS 最新
 FROM ts_kv WHERE entity_id IN (SELECT id FROM device WHERE customer_id = '<CID>');
 
@@ -276,6 +281,10 @@ FROM ts_kv
 WHERE entity_id IN (SELECT id FROM device WHERE customer_id = '<CID>')
   AND key = 'energy' AND ts > (extract(epoch from now()) - 86400) * 1000
 ORDER BY ts DESC LIMIT 20;
+
+-- Cassandra 直查（不依赖镜像）：分区索引行数，粗看有没有数据
+-- docker exec energy-cassandra cqlsh -e "SELECT count(*) FROM thingsboard.ts_kv_partitions_cf
+--   WHERE entity_id=<设备id> ALLOW FILTERING;"
 
 -- 拓扑图与它挂的场站
 SELECT id, name, label, additional_info::jsonb->>'siteId' AS 场站ID

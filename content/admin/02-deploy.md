@@ -85,24 +85,48 @@ cd ~/energy-app
 bash docker-01-install.sh
 ```
 
+**它内部做的事（顺序不能反）**：
+
+```
+① up -d postgres        → 等 healthy（首次约 1 分钟）
+② up -d cassandra       → 等 healthy（首次 2~5 分钟，慢是正常的）
+③ install               → Postgres 建表 + 导入部件 + Cassandra 建 keyspace/两张表
+```
+
 **预计输出**：
 
 ```
-[10:13:12] 初始化数据库
+[10:13:12] 启动 PostgreSQL（首次会拉取镜像，约 1 分钟）
+  ✓ 数据库健康（18s）
+[10:13:30] 遥测后端：Cassandra（启动容器，首次 2~5 分钟）
+    仍在启动… 30s（首次建系统表，耐心）
+  ✓ Cassandra 健康（95s）
+[10:15:05] 初始化数据库
   ✓ 112 张表
-[10:13:40] 导入部件
+[10:15:33] 导入部件
   ✓ 726 个部件 / 34 个 bundle
 ```
 
-**验证**：
+> **`DATABASE_TS_TYPE=sql` 时不会起 Cassandra**，这两步合并成一步，
+> 总耗时少 2~4 分钟、少占 2GB 内存。详见[②b Cassandra](/admin/cassandra)。
+
+**验证：两个库都要查**
 
 ```bash
+# Postgres：实体表 + 部件
 docker compose --profile split exec -T postgres \
   psql -U postgres -d thingsboard -tAc \
   "select count(*) from information_schema.tables where table_schema='public'"
+# 期望 112 或更多
+
+# Cassandra：遥测表（默认后端才有）
+docker compose --profile split --profile cassandra exec -T cassandra cqlsh -e \
+  "SELECT table_name FROM system_schema.tables WHERE keyspace_name='thingsboard';"
+# 期望 ts_kv_cf / ts_kv_partitions_cf 两张
 ```
 
-输出 `112` 或更多即可。
+> Postgres 里**查不到 `ts_kv` 表是正常的** —— 遥测在 Cassandra。
+> 需要用它跑 SQL 时先 `bash scripts/ts-mirror.sh`，见[②b · 四之二](/admin/cassandra)。
 
 ---
 

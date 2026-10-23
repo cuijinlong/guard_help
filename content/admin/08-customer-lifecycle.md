@@ -427,8 +427,34 @@ ts_kv                        遥测（默认删；--keep-telemetry 保留）
 ```
 
 > ThingsBoard 删设备**不会**删遥测 —— 数据按 `entity_id` 存在分区表里。
-> 所以脚本要在删客户**之前**先记下设备 id，删完再按 id 精确清 `ts_kv`。
-> 不清理会一直占盘（实测 3 台已删设备残留 228 点）。
+> 所以脚本要在删客户**之前**先记下设备 id，删完再按 id 精确清。
+> 不清理会一直占盘。
+
+#### 遥测清理按后端走两条路（2026-10-24 修）
+
+默认后端是 Cassandra，这件事比看起来关键 —— 删错地方会「报表说清完了、实际一点没删」。
+
+| 后端 | 清理方式 | 校验方式 |
+| --- | --- | --- |
+| `sql` | `DELETE FROM ts_kv` | 目标设备点数归零 |
+| `cassandra`（默认） | TB 的 telemetry delete API + **补删分区索引** | 目标设备 `ts_kv_partitions_cf` 归零 |
+
+**为什么必须补删索引**：TB 的 `CassandraBaseTimeseriesDao.deleteAsync()`
+只发 `DELETE FROM ts_kv_cf`，**不碰 `ts_kv_partitions_cf`**。
+数据行变成 tombstone（读不到了），但分区索引原封不动留着：
+
+```
+销户前：526 条索引
+TB API 删完：ts_kv_cf 读到 0 行，但 ts_kv_partitions_cf 仍 526 条
+补删索引后：0 条
+```
+
+残留的代价：每台表 35 个 key × 每小时一个分区，长期占用空间；
+导入/迁移复用同一 UUID 时会读到旧索引。所以脚本会显式清掉它。
+
+**顺序也有讲究**：必须先删遥测、再删客户。
+TB 的 delete API 要校验实体存在 + 写权限，客户一删设备就没了，API 返回 404，
+遥测就永远删不掉。
 
 ### 5.4 三道安全闸
 
@@ -439,13 +465,30 @@ ts_kv                        遥测（默认删；--keep-telemetry 保留）
 3. **删后校验**：其他客户与租户级数据的指纹（实体数 + 全库 id 的 md5）必须逐位相同；
    遥测满足「删后总数 = 删前总数 − 实删点数」
 
-实测（2026-10-23）：
+实测（Cassandra 后端，2026-10-24）：
 
 ```
-✓ 遥测：目标以外 149252 → 149258 点（本次删了 127759 点，未波及他人）
-✓ 遥测：目标设备已无残留（0 点）
+✓ 已清 21 台设备的遥测
+✓ 已清 526 条 Cassandra 分区索引（ts_kv_partitions_cf）
+✓ 客户已删除
+✓ Cassandra：目标设备已无分区索引（0 条）
+✓ 已彻底清理（客户 / 资产 / 设备 / 看板 / 用户 全为 0）
 ✓ 隔离校验通过：其他客户 131 个实体与租户级数据均未受影响
 ```
+
+**零污染是逐项对过数的**（删前 → 删后）：
+
+```
+asset       69 → 69      device      21 → 21
+dashboard   40 → 40      customer     1 → 1
+tb_user      3 →  3      widget_type 726 → 726
+rule_chain   2 →  2      custom_menu   5 → 5
+```
+
+> Cassandra 后端下，「目标以外的遥测点数」这一项**明确跳过**：
+> 全表 `count(*)` 会读超时，`nodetool` 的 partition 数是估算值且含 tombstone，
+> 拿它当指纹只会给虚假安全感。隔离由两条硬校验保证 ——
+> 实体指纹（强）+ 目标设备索引归零（强）。
 
 ### 5.5 销户之后
 
@@ -513,6 +556,11 @@ bash shiyongshouce/downloads/deploy/docker-98-rebuild.sh \
 
 # ── 2. 验收（这一步决定能不能交给客户）
 cd ~/energy-app
+
+# 2a. Cassandra 后端先把遥测镜像到 PG（否则 04/08 会误报 0）
+bash scripts/ts-mirror.sh
+
+# 2b. 四套验收
 bash scripts/03-verify.sh --base http://127.0.0.1:8090 \
   --tenant tenant@your.com --tenant-pass 'Tenant@123' \
   --customer demo@your.com --customer-pass 'Demo@123'
@@ -523,14 +571,145 @@ bash scripts/06-verify-e2e.sh --base http://127.0.0.1:8090 \
 bash scripts/08-verify-release.sh --base http://127.0.0.1:8090 \
   --tenant tenant@your.com --tenant-pass 'Tenant@123' \
   --customer demo@your.com --customer-pass 'Demo@123'
-# 期望：18/0、35/0、53/0、74/74
+# 期望：18/0、35/0、53/0、75/75
+
+# 2c. 客户视角探针（HTTP + 语义断言，探不到渲染）
+python3 scripts/27-customer-surface-probe.py --base http://127.0.0.1:8090 \
+  --tenant tenant@your.com --tenant-pass 'Tenant@123' \
+  --customer demo@your.com --customer-pass 'Demo@123' --strict
+# 期望：失败 0 条
+
+# 2d. 浏览器实测（推荐，探针看不到图形）
+#     客户账号登录 → 能耗概览 → 四张卡有数字、日历有热力
+#     综合能耗 → 综合能源消费量 > 0
 
 # ── 3. 开第一家真客户
 bash scripts/09-onboard-customer.sh \
   --email customer1@partner.com --password 'Cust@123456' --name '第一家合作企业'
 
+# 3a. 核对它真的可用（不能只看「创建成功」）
+curl --noproxy '*' -s -H "X-Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8090/api/energy/demo-data?customerId=<上一步输出的客户ID>"
+# 期望：assets 25 / devices 21
+
 # ── 4. 把账号发给客户，按第四节的顺序建自己的东西
+
+# ── 5. 演练一次销户（建议新装时做一遍，确认隔离有效）
+bash scripts/10-cleanup-customer.sh --name '第一家合作企业' --dry-run
+bash scripts/10-cleanup-customer.sh --name '第一家合作企业' --yes
+# 期望结尾：
+#   ✓ 隔离校验通过：其他客户 N 个实体与租户级数据均未受影响
 ```
 
 **第 2 步不能跳。** 全新库如果验收不过，问题在平台不在客户 ——
 交给客户只会变成「他们的数据不对」，排查成本翻十倍。
+
+**第 5 步也别省。** 销户是不可逆操作，新装时演练一遍能提前发现
+「遥测删不干净」「误伤别人」这类问题；等真要销户时才发现就晚了。
+
+---
+
+## 九、客户之间为什么不会互相污染
+
+这一节回答一个运维一定会问的问题：**「我删 A 客户，B 客户会不会受影响？」**
+
+答案是：不会，隔离靠四层机制，每一层都能单独验证。
+
+### 9.1 四层隔离
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ ① 实体层：每一行都有 customer_id                                     │
+│    asset / device / dashboard / tb_user / entity_group …            │
+│    租户级主数据（字典、费率模板、分时方案）customer_id = NULL_UUID   │
+│    → 查询天然带 customer_id 过滤，不可能读到别家                     │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ ② 权限层：客户用户只对自有实体有 READ/WRITE                          │
+│    CustomerUserPermissions 按 owner 校验                            │
+│    例外：只读白名单（品种/字典/费率模板）—— 见下方 9.3               │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ ③ 看板层：**复制**，不是共享                                         │
+│    每家客户拿到 20 份独立副本（customer_id = 该客户）                 │
+│    alias 里的实体 id 是开户时按占位符替换进去的                       │
+│    → 客户甲改配色不影响乙；销户只删甲那 20 份                        │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ ④ 遥测层：entity_id 隔离 + 销户显式清理                              │
+│    设备/资产的 UUID 全局唯一，Customer A 的查询只带 A 的 entity_id    │
+│    销户时按设备 id 精确删除（含 Cassandra 分区索引）                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 全局配置不随客户变化
+
+以下这些东西**开户不加、销户不减**，是平台的公共底座：
+
+| 对象 | 数量 | 销户时 |
+| --- | --- | --- |
+| `widget_type` 部件 | 726 | 不动 |
+| `rule_chain` 规则链 | 2 | 不动 |
+| `device_profile` 设备档案 | 7 | 不动 |
+| `asset_profile` 资产档案 | 14 | 不动 |
+| 能源参数字典 / 费率模板 / 分时方案 | 租户级 | 不动 |
+
+实测销户前后对过数（2026-10-24）：
+
+```
+widget_type  726 → 726      rule_chain   2 → 2
+custom_menu    5 →  4   ← 只少了该客户那一条
+```
+
+### 9.3 唯一的共享点：租户级只读主数据
+
+「能源参数字典」「电能品种」「费率模板」是**租户级**资产（`customer_id = NULL_UUID`），
+所有客户共用同一份。这是**设计如此**，不是隔离漏洞：
+
+- 它们是**参考数据**（指标名、单位、峰平谷时段定义），本来就该统一
+- 客户只能**读**，不能改（`CustomerUserPermissions.isReadOnly` 要求只读操作）
+- 客户看板里的 alias 保留占位符 `00000000-…`，不发实体查询，
+  改走 `/api/energy/metric-params`（该接口对客户与租户都返回 200）
+- 若把占位符换成真实 id，客户去读会 403 —— 这正是 `repairTenantAssetLeaks` 要防的
+
+> **判断口径**：客户**业务数据**（场站、设备、账单、看板）必须带 `customer_id`；
+> 客户**只读参考数据**才允许是租户级。两者混了才是污染。
+
+### 9.4 自己验一遍隔离（不用等出事）
+
+**开户后**：确认新客户的看板指向它自己的实体
+
+```sql
+-- 悬空引用必须是 0
+SELECT count(*) FROM dashboard d,
+  LATERAL jsonb_each(d.configuration::jsonb->'entityAliases') a
+WHERE d.customer_id = '<新客户id>'
+  AND (a.value->'filter'->'singleEntity'->>'id') IS NOT NULL
+  AND (a.value->'filter'->'singleEntity'->>'id') NOT LIKE '00000000-%'
+  AND NOT EXISTS (SELECT 1 FROM asset x
+                   WHERE x.id = (a.value->'filter'->'singleEntity'->>'id')::uuid);
+```
+
+**销户前**：拍指纹（脚本会自动做，也可手工）
+
+```sql
+-- 其他客户的实体指纹：销户后必须逐位相同
+SELECT md5(string_agg(id::text, ',' ORDER BY id))
+  FROM asset WHERE customer_id <> '<待删客户id>';
+```
+
+**销户后**：确认目标归零、全局配置未变
+
+```sql
+SELECT
+  (SELECT count(*) FROM customer WHERE id = '<待删客户id>') AS 客户,
+  (SELECT count(*) FROM asset    WHERE customer_id = '<待删客户id>') AS 资产,
+  (SELECT count(*) FROM device   WHERE customer_id = '<待删客户id>') AS 设备,
+  (SELECT count(*) FROM widget_type) AS 全局部件数;   -- 应为 726
+```
+
+三条都对得上，才算「干净销户」。脚本的退出码：
+`0` 成功 / `1` 参数或前置失败 / `2` 隔离校验不通过（需人工介入）。
