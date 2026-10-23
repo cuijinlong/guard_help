@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=68
+EXPECTED_PASS=70
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -706,6 +706,46 @@ elif [[ "${BILL_N:-0}" -eq 0 ]]; then
   bad "出账试算没有任何明细" "检查 /api/energy/billing/generate 返回的 items 与失败原因"
 else
   bad "账单金额与四项费用之和对不上" "看 EnergyBillingService.billOne：energyFee+basicFee+powerFactorFee+surchargeFee 应等于 amount"
+fi
+
+# I-3b-2. 虚拟表（手工填报）也必须出账。
+#
+#          虚拟表没有 energy_reading，用量只存在于「月首 00:00 的 energy 点」。
+#          曾因判定读错位置（查 SERVER_SCOPE 属性而不是 device.additionalInfo），
+#          2 台虚拟表被当成实表，报「读数不足两点」→ 永远不进账单，
+#          客户对出来「账单用量 < 实际用电」却查不出原因。
+VBAD=$(echo "$BILL" | jget "
+vs = [x for x in (d.get('items') or []) if x.get('usageSource') == 'manual']
+bad = [x.get('deviceName') for x in vs if not x.get('usable')]
+print(len(vs))
+print('|'.join(bad))" 2>/dev/null)
+VS_N=$(echo "$VBAD" | sed -n 1p)
+VS_BAD=$(echo "$VBAD" | sed -n 2p)
+if [[ "${VS_N:-0}" -eq 0 ]]; then
+  [[ "$QUIET" == "true" ]] || printf '\033[33m  - 跳过：本库没有虚拟表（手工填报设备）\033[0m\n'
+elif [[ -z "${VS_BAD:-}" ]]; then
+  ok "虚拟表也出账（${VS_N} 台，usageSource=manual）"
+else
+  bad "虚拟表未出账：${VS_BAD}" "看 MeteringMath.isVirtual：判定依据是 device.additionalInfo.deviceVirtual，不是 SERVER_SCOPE 属性"
+fi
+
+# I-3b-3. 台账不能漏掉虚拟表。
+#
+#          台账主体来自 meter_reading_record，虚拟表没有抄表记录。
+#          不补这段时：账单有金额、台账看不到这台表，客户以为多收钱。
+VLED=$(CAPI '/api/energy/meter-reading/ledger' | jget "
+vs = [x for x in (d.get('items') or []) if x.get('quality') == 'manual' or x.get('source') == 'manual']
+bad = [x.get('deviceName') for x in vs if x.get('usage') is None]
+print(len(vs))
+print('|'.join(bad))" 2>/dev/null)
+VL_N=$(echo "$VLED" | sed -n 1p)
+VL_BAD=$(echo "$VLED" | sed -n 2p)
+if [[ "${VS_N:-0}" -gt 0 && "${VL_N:-0}" -eq 0 ]]; then
+  bad "台账漏掉虚拟表（出账 ${VS_N} 台，台账 0 台）" "看 EnergyMeterReadingController.appendVirtualRows：虚拟表要补成台账行"
+elif [[ -z "${VL_BAD:-}" ]]; then
+  ok "台账包含虚拟表行（${VL_N} 台）"
+else
+  bad "虚拟表在台账里没有用量：${VL_BAD}" "已出账时台账应取 billUsage；未出账时读手工填报的月首值"
 fi
 
 # I-3c. 账单号必须含表码，否则同客户同品种的多块表会互相覆盖。

@@ -361,7 +361,7 @@ bash scripts/08-verify-release.sh \
   --customer customer@126.com --customer-pass '12345678'
 ```
 
-**期望**：`通过 68 项` / `这一版的功能点全部到位`。
+**期望**：`通过 70 项` / `这一版的功能点全部到位`。
 
 这个脚本把**这一版每一处改动**变成断言，重装后跑一遍就知道有没有漏：
 
@@ -1806,7 +1806,20 @@ HAVING sp.delta < SUM(sc.delta) - 0.5;
 | 设备档案声明品种 | `energyTypeCode` = elec / water / gas / steam | 跳过，原因写在返回的 `reason` 里 |
 | 已配电价 | 场站自定义 / 组织 / 客户兜底任一处有该品种 | 跳过，「未配置电价」 |
 
-虚拟设备（`deviceVirtual=true`，如空调虚拟表）不出账 —— 它的数来自手工填报，不是采集。
+虚拟设备（`deviceVirtual=true`，如空调虚拟表）**同样出账**。
+
+- 用量取「该月手工填报的月首 `energy` 点」，不走遥测差分；
+- 返回 `usageSource=manual`；
+- 时段制（tou）账单会多一个 `touAssumedFlat=true` —— 人工填的是整月总量，
+  没有小时分布，只能整月归「平」档。这是估算口径，不是漏数。
+
+判定依据是 `device.additionalInfo.deviceVirtual`，**不是** SERVER_SCOPE 属性。
+早期代码在属性表里查这个键，结果永远查不到，虚拟表被当成实表，
+报「本账期读数不足两点」，两台虚拟表因此永远不进账单 ——
+客户对出来「账单用量 < 实际用电」，却查不出原因。
+
+台账（用能台账）也会把这批表补成行：用量优先取账单的计费口径，
+没有账单时读手工填报值，`quality=manual`。否则会出现「账单有金额、台账看不到这台表」。
 
 ### 在页面上出账
 

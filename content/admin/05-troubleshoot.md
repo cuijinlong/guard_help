@@ -669,6 +669,7 @@ curl ... -d '{"period":"2026-10","dryRun":true}' /api/energy/billing/generate \
 | 未配置「elec」的电价 | 三级费率都没配 | 场站/组织/客户任一处配价 |
 | 设备未归属任何客户 | 账单要开给客户 | 把设备分配给客户 |
 | 本账期读数不足两点 | 新接入或设备离线 | 等上报；或用 20-rtu-simulator.py |
+| 本账期读数不足两点（**虚拟表**） | 判定读错位置，被当成实表；或该月未填报 | 确认 `device.additionalInfo.deviceVirtual`；到「手工填报」页录入该月值 |
 
 **账单数比表少很多（例如 17 台只剩 4 张）** → 账单号重复，后一张覆盖前一张。
 账单号必须带表码：`BILL-<客户码>-<账期>-<品种>-<表码>`。
@@ -682,6 +683,20 @@ curl ... "/api/energy/billing/summary?period=2026-10" | jq '.items[].billingNo' 
 
 - 电度费 0 → 单价没配到该品种，或 `fixedPrice` 写成了 `prices.flat`（错误结构）
 - 只有基本电费 → 该表没用量（表底没变或读数不足）
+
+**虚拟表（手工填报）出不来** → 先看 dry-run 里的 `usageSource`：
+
+- `manual` 且 `usable=true`：正常，用量来自该月 1 日 00:00 的填报值；
+- `manual` 且 `usable=false`：该月没填报，去「手工填报」页录入；
+- `telemetry`：判定错了 —— 虚拟标记必须在 `device.additionalInfo.deviceVirtual`，
+  不在 SERVER_SCOPE 属性里。平台只认 `MeteringMath.isVirtual`，不要再各写一份。
+
+虚拟表如果是时段制（tou），账单会带 `touAssumedFlat=true`：整月归「平」档。
+这是估算口径，不是漏数。
+
+**台账里看不到虚拟表** → 台账主体来自抄表记录，虚拟表没有抄表行，
+由 `appendVirtualRows` 补进来。缺了说明该版本未包含这段（对着 08 验收脚本看
+「台账包含虚拟表行」这一项）。
 
 **基本电费被重复收了很多次** → 检查 `meterLevel`。
 基本电费/力调电费只计入线总表（`meterLevel=1`）。
