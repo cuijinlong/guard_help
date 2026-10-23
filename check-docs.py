@@ -295,9 +295,22 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
     if probe.returncode != 0:
         return 0, 0, ['跳过：energy-postgres 未运行']
 
-    src = _read(DOCS / '05-troubleshoot.md')
-    tail = src[src.find('## 14. 运维常用 SQL'):]
-    blocks = re.findall(r'```sql\n(.*?)```', tail, re.S)
+    # 校验范围：故障排查页的「运维常用 SQL」+ 两页功能/数据流文档的全部 SQL。
+    #
+    # ★ 为什么把新页面也纳进来（2026-10-23）：
+    #   06/07 两页给的 SQL 是「用户拿去和页面数字对照」的，写错一条就等于
+    #   给出一个错误的核对方法 —— 比没有更糟。让它们进自动化校验，
+    #   表名/列名一改就会被抓出来，而不是等用户复制执行时才发现。
+    sql_docs = [
+        ('05-troubleshoot.md', '## 14. 运维常用 SQL'),
+        ('06-customer-menu.md', None),
+        ('07-data-pipeline.md', None),
+    ]
+    blocks: list[str] = []
+    for fname, marker in sql_docs:
+        src = _read(DOCS / fname)
+        tail = src[src.find(marker):] if marker else src
+        blocks.extend(re.findall(r'```sql\n(.*?)```', tail, re.S))
 
     # 取一个真实客户 id，用来**验证带占位符的 SQL**。
     #
@@ -335,11 +348,18 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
                           f'（中文别名不能含空格，加双引号或去掉空格）')
             continue
         body = sql
-        if re.search(r'<[^>]*id>', body):
+        # ★ 占位符识别必须排除比较运算符（2026-10-23 踩过）：
+        #   原来的 `<[^>]*id>` 会把 `ts <= 1792... AND ... '<设备id>'` 整段吞掉，
+        #   因为从 `<=` 那个 `<` 开始、一直到 `'<设备id>'` 的 `id>` 全符合
+        #   「不含 > 且以 id> 结尾」—— 结果 SQL 被替换成非法内容，
+        #   报 `trailing junk after numeric literal`，而真凶是校验器自己。
+        #   现在要求 `<` 后面不是 `=` 或 `<`，且占位符内部不含空白。
+        PLACEHOLDER = re.compile(r'<(?![=<])[^<>\s]{1,40}id>')
+        if PLACEHOLDER.search(body):
             if not sample_cid:
                 continue          # 库里没客户，无从替换
-            # 把 <客户id> / <CID> / <xxx id> 统一换成真实客户 id
-            body = re.sub(r'<[^>]*id>', sample_cid, body)
+            # 把 <客户id> / <CID> / <设备id> 统一换成真实客户 id
+            body = PLACEHOLDER.sub(sample_cid, body)
         with tempfile.NamedTemporaryFile('w', suffix='.sql', delete=False, encoding='utf-8') as f:
             f.write(body)
             path = f.name
@@ -353,8 +373,11 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
         ran += 1
         if r.returncode != 0:
             first = next((l for l in r.stderr.splitlines() if 'ERROR' in l), r.stderr[:80])
-            tag = '（占位符已替换为真实客户 id）' if body != sql else ''
-            errors.append(f'第 {i} 条 SQL 失败{tag}：{first.strip()[:90]}')
+            tag = '（占位符已替换）' if body != sql else ''
+            # 带上 SQL 首行非注释内容：只报「第 N 条」时根本定位不到是哪段
+            head = next((l.strip() for l in sql.splitlines()
+                         if l.strip() and not l.strip().startswith('--')), '')[:50]
+            errors.append(f'第 {i} 条 SQL 失败{tag}［{head}］：{first.strip()[:80]}')
     return ran, len(blocks), errors
 
 

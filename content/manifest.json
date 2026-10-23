@@ -82,6 +82,16 @@
           "id": "troubleshoot",
           "title": "⑤ 常见问题",
           "file": "admin/05-troubleshoot.md"
+        },
+        {
+          "id": "customer-menu",
+          "title": "⑥ 客户菜单功能（架构+统计SQL）",
+          "file": "admin/06-customer-menu.md"
+        },
+        {
+          "id": "data-pipeline",
+          "title": "⑦ 数据流处理（计量/倍率/增量/映射）",
+          "file": "admin/07-data-pipeline.md"
         }
       ],
       "description": "给平台方的：怎么部署、开租户、导入数据、排障"

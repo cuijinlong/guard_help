@@ -1,0 +1,630 @@
+# 数据流处理：从 RTU 上报到页面数字
+
+这一页回答运维最常问的四个问题：
+
+1. **一级 / 二级 / 三级计量**——怎么配、怎么生效、配错了什么后果
+2. **倍率（CT × PT）**——存在哪、怎么算、什么情况会算错
+3. **「表的总数」还是「增量」**——两个键的语义，为什么不能混用
+4. **各厂家指标名不一样**——怎么转成平台标准名
+
+最后给出完整的**端到端数据流**，以及每一步的**校验 SQL**。
+
+---
+
+## 一、全景：一条数据从 RTU 到页面的七步
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ ① RTU / 网关                                                        │
+│    上报厂家原始代号：{"U":220.1,"I":15.2,"P":3.3,"Ep":33705.42}      │
+│    走 MQTT:1883 或 HTTP:8090/api/v1/<token>/telemetry                │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ ② 规则链「电表Key标准化」节点                                        │
+│    U→voltage_a  I→current_a  P→power_total  Ep→energy_reading        │
+│    原始键名留在 metadata.rawKeys 里（可追溯）                         │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ ③ ts_kv 落库                                                        │
+│    key   = key_dictionary.key_id（整数！）                           │
+│    ts    = 毫秒时间戳                                                │
+│    dbl_v = 数值（绝大部分遥测）                                       │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ ④ 计算字段（设备档案上，同档案设备自动继承）                          │
+│    energy_day / energy_flat / load_rate / voltage_unbalance /        │
+│    carbon / idle_exceed → 再写回 ts_kv 或触发告警                    │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ ⑤ 统计接口（guard-server /api/energy/*）                             │
+│    读 ts_kv + device 属性（倍率、层级）→ 聚合 → 返回                 │
+│    每次调用输出 SQL 埋点（日志里可复制）                              │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ ⑥ 页面（看板 / 自建页面 / AI 页面）                                  │
+│    看板部件直接查 ts_kv；自建页面调 /api/energy/*                     │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ ⑦ 账（可选）：抄表记录 → 账单资产                                    │
+│    meter_reading_record（凭证）→ energy_bill 资产（客户可见）         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键点**：③ 之后所有环节都**只读 ts_kv**，不再碰原始上报报文。
+所以「页面数字不对」时，先确认 ③ 里到底存了什么（用第一节的 SQL），
+再往上查 ④⑤。
+
+---
+
+## 二、问题一：一级 / 二级 / 三级计量
+
+### 2.1 平台怎么表达层级
+
+**一个属性：`meterLevel`**，写在 `device` 的 SERVER_SCOPE：
+
+| 值 | 含义 | 典型设备名 |
+| --- | --- | --- |
+| `1` | 进线总表（关口表） | 「1#进线总表」「综合配电表」 |
+| `2` | 分项总表 | 「车间动力总表」「照明分项总表」 |
+| `3` | 回路（末端） | 「空压机组」「A栋照明回路」 |
+| `0` / 未设置 | 未声明 | —— |
+
+**存储**：
+
+```sql
+-- 看某台设备的层级
+SELECT d.name AS 设备,
+       (SELECT coalesce(ak.dbl_v, ak.long_v, ak.str_v::numeric)
+          FROM attribute_kv ak
+          JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+         WHERE ak.entity_id = d.id
+           AND ak.attribute_type = 2          -- 2 = SERVER_SCOPE
+           AND kd.key = 'meterLevel') AS 层级
+FROM device d
+WHERE d.name = '单相园-1#进线总表·星河工业园';
+```
+
+### 2.2 它在哪些地方生效
+
+| 场景 | 规则 | 不配的后果 |
+| --- | --- | --- |
+| 账单·基本电费 | 只对 `level=1` 收 | 11 台表各收 1600 元，高一个数量级 |
+| 账单·力调电费 | 只对 `level=1` 算 | 同上 |
+| 台账汇总 | 有 `level=1` 时只汇总进线 | 总表 + 分表相加，同一度电算两遍 |
+| 账单汇总 `totalAmount` | 同上 | 应付金额虚高（实测 2.8 倍） |
+| 闲时能耗合计 | 只取「集合里没有上级」的表 | 场站合计翻倍 |
+
+### 2.3 怎么配
+
+**方式一：页面**（推荐）
+
+组织与场站 → 选中场站 → 设备面板 → 「计量层级」下拉。
+
+**方式二：接口**
+
+```bash
+# 读
+curl --noproxy '*' -s -H "X-Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8090/api/energy/device-config?deviceId=<设备id>"
+
+# 写（只传要改的字段，未传的不动）
+curl --noproxy '*' -s -X POST \
+  -H "X-Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"deviceId":"<设备id>","meterLevel":1}' \
+  http://127.0.0.1:8090/api/energy/device-config
+```
+
+返回里带 `meterLevelName` 和 `effectiveRatio`，配完立刻能看到生效值。
+
+### 2.4 怎么验证层级配对了
+
+**方法一：看守恒**——父表电量必须 ≥ 子表之和（差额 = 线损 + 未装表）：
+
+```sql
+WITH meter AS (
+    SELECT d.id, d.name,
+           (SELECT coalesce(ak.dbl_v, ak.long_v)
+              FROM attribute_kv ak JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+             WHERE ak.entity_id = d.id AND ak.attribute_type = 2 AND kd.key = 'meterLevel') AS lvl
+    FROM device d WHERE d.tenant_id = '<租户id>'
+), inc AS (
+    SELECT t.entity_id,
+           max(coalesce(t.dbl_v, t.long_v)) - min(coalesce(t.dbl_v, t.long_v)) AS delta
+    FROM ts_kv t
+    WHERE key = (SELECT key_id FROM key_dictionary WHERE key = 'energy_reading')
+      AND t.ts >= 1790784000000 AND t.ts < 1793462400000   -- 2026-10，按需改
+    GROUP BY t.entity_id
+)
+SELECT parent.name AS 上级表,
+       round(p.delta::numeric, 2) AS 上级增量,
+       round(sum(ci.delta)::numeric, 2) AS 下级合计,
+       round((p.delta - sum(ci.delta))::numeric, 2) AS 差额
+FROM relation r
+JOIN meter parent ON parent.id = r.from_id
+JOIN meter c ON c.id = r.to_id
+JOIN inc p ON p.entity_id = parent.id
+JOIN inc ci ON ci.entity_id = c.id
+WHERE r.relation_type = 'Contains'
+GROUP BY parent.name, p.delta
+ORDER BY 差额;
+```
+
+- **差额为正**：正常（线损 + 未装表负荷）
+- **差额为负**：父子关系配错，或某台表被重复计算 → 立刻查
+- **差额为 0 且比例恰好等于配置系数**：演示数据的正常表现
+
+**方法二：看汇总口径**
+
+```sql
+-- 台账汇总（应等于页面 totals）
+WITH bill AS (
+    SELECT a.id,
+           max(CASE WHEN kd.key='energy'     THEN ak.str_v END) AS energy,
+           max(CASE WHEN kd.key='meterLevel' THEN coalesce(ak.dbl_v, ak.str_v::numeric) END) AS lvl,
+           max(CASE WHEN kd.key='usage'      THEN coalesce(ak.dbl_v, ak.str_v::numeric) END) AS usage,
+           max(CASE WHEN kd.key='amount'     THEN coalesce(ak.dbl_v, ak.str_v::numeric) END) AS amount
+    FROM asset a
+    JOIN attribute_kv ak ON ak.entity_id = a.id AND ak.attribute_type = 2
+    JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+    WHERE a.type = 'energy_bill' AND a.tenant_id = '<租户id>'
+      AND a.name LIKE 'BILL-%<账期>%'
+    GROUP BY a.id
+), top AS (SELECT DISTINCT energy FROM bill WHERE lvl = 1)
+SELECT b.energy AS 品种,
+       count(*) AS 表数,
+       round(sum(b.usage)::numeric, 4) AS 全表用量,
+       round(sum(CASE WHEN b.lvl = 1 OR t.energy IS NULL THEN b.usage ELSE 0 END)::numeric, 4) AS 汇总用量
+FROM bill b LEFT JOIN top t ON t.energy = b.energy
+GROUP BY b.energy;
+```
+
+---
+
+## 三、问题二：倍率（CT × PT）
+
+### 3.1 四个字段
+
+| 属性 | 例 | 含义 |
+| --- | --- | --- |
+| `ctRatio` | `200/5` | 电流互感器变比 |
+| `ptRatio` | `10000/100` | 电压互感器变比 |
+| `meterRatio` | `4000` | 综合倍率（**兜底**，CT/PT 都空时才用） |
+| `ratioApplied` | `false` | 遥测是否**已经是折算值** |
+
+**存储**：`device` 的 SERVER_SCOPE 属性。
+
+### 3.2 计算规则（`MeteringMath.effectiveRatio`）
+
+```
+ratioApplied = true   →  计算系数 = 1
+                          （RTU 已经乘过倍率，再乘就重复）
+
+CT/PT 都为空          →  计算系数 = meterRatio（综合倍率）
+                          否则填了综合倍率却不生效
+
+其余情况              →  计算系数 = CT × PT
+                          例：200/5 × 10000/100 = 40 × 100 = 4000
+```
+
+**为什么 CT/PT 优先于 `meterRatio`**：CT/PT 信息更完整（能看出变比来源与用途），
+且是「基础配置中心 › 设备倍率」与「组织与场站 › 设备档案」共同填的那两个字段。
+两者都填时以变比为准，避免两个来源打架。
+
+### 3.3 用量怎么算
+
+```
+用量 = (本期表底 − 上期表底) × 计算系数
+```
+
+**不是** `表底 × 系数`。表底本身是「二次侧累计读数」，乘系数才是一次侧电量。
+
+```sql
+-- 验算：某设备某段区间的用量（含倍率）
+--
+-- 注意：倍率三个字段都可能是空串（没配）。直接 ::numeric 会报
+--       `invalid input syntax for type numeric: ""`，所以先用正则守卫。
+WITH dev AS (
+    SELECT id, name FROM device WHERE name = '单相园-1#进线总表·星河工业园'
+), cfg AS (
+    SELECT d.id,
+           (SELECT coalesce(ak.str_v,'') FROM attribute_kv ak
+              JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+             WHERE ak.entity_id = d.id AND ak.attribute_type = 2 AND kd.key = 'ctRatio') AS ct,
+           (SELECT coalesce(ak.str_v,'') FROM attribute_kv ak
+              JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+             WHERE ak.entity_id = d.id AND ak.attribute_type = 2 AND kd.key = 'ptRatio') AS pt,
+           (SELECT coalesce(ak.str_v,'') FROM attribute_kv ak
+              JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+             WHERE ak.entity_id = d.id AND ak.attribute_type = 2 AND kd.key = 'meterRatio') AS mr,
+           (SELECT coalesce(ak.bool_v,false) FROM attribute_kv ak
+              JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+             WHERE ak.entity_id = d.id AND ak.attribute_type = 2 AND kd.key = 'ratioApplied') AS applied
+    FROM dev d
+), ratio AS (
+    SELECT ct, pt, mr, applied,
+           CASE
+             WHEN applied THEN 1::numeric
+             -- 综合倍率兜底：CT/PT 都空时才用
+             WHEN ct = '' AND pt = '' AND mr ~ '^[0-9]+(\.[0-9]+)?$' THEN mr::numeric
+             ELSE
+               -- CT/PT 都按 "一次/二次" 解析；缺项按 1 处理
+               (CASE WHEN split_part(ct,'/',1) ~ '^[0-9]+(\.[0-9]+)?$'
+                      AND split_part(ct,'/',2) ~ '^[0-9]+(\.[0-9]+)?$'
+                     THEN split_part(ct,'/',1)::numeric / nullif(split_part(ct,'/',2),'0')::numeric
+                     ELSE 1 END)
+             * (CASE WHEN split_part(pt,'/',1) ~ '^[0-9]+(\.[0-9]+)?$'
+                      AND split_part(pt,'/',2) ~ '^[0-9]+(\.[0-9]+)?$'
+                     THEN split_part(pt,'/',1)::numeric / nullif(split_part(pt,'/',2),'0')::numeric
+                     ELSE 1 END)
+           END AS 计算系数
+    FROM cfg
+), pts AS (
+    SELECT max(coalesce(t.dbl_v, t.long_v)) - min(coalesce(t.dbl_v, t.long_v)) AS delta
+    FROM ts_kv t
+    WHERE t.entity_id = (SELECT id FROM dev)
+      AND t.key = (SELECT key_id FROM key_dictionary WHERE key = 'energy_reading')
+      AND t.ts >= 1790784000000 AND t.ts < 1793462400000
+)
+SELECT ct, pt, mr, applied, 计算系数,
+       round(p.delta::numeric, 4) AS 表底差,
+       round((p.delta * 计算系数)::numeric, 4) AS 用量
+FROM ratio, pts p;
+```
+
+> **SQL 写法坑（实测 2026-10-23）**：`nullif(x,'')::numeric` 会报
+> `invalid input syntax for type numeric: ""` —— 因为 `::` 只绑定到 nullif 的
+> **第二个参数** `''`，等价于 `nullif(x, ''::numeric)`。
+> 必须写成 `(nullif(x,''))::numeric`（把 nullif 整个括起来）。
+> 空字符串转数值是现场数据最常见的脏数据形态，这个坑值得记牢。
+
+### 3.4 三种典型错误
+
+| 错误 | 表现 | 怎么发现 |
+| --- | --- | --- |
+| 该乘没乘 | 用量偏小 4000 倍（几乎为 0） | 抄表台账用量与现场电表读数差一个数量级 |
+| 乘了两次 | 用量偏大 4000 倍（天文数字） | RTU 已乘过 + `ratioApplied` 还是 `false` |
+| CT/PT 填反 | 偏差 40/100 倍 | 检查是否把 `10000/100` 填进了 `ctRatio` |
+
+**自查 SQL**（找出没配倍率但明显是大表的设备）:
+
+```sql
+SELECT d.name AS 设备,
+       (SELECT coalesce(ak.str_v,'') FROM attribute_kv ak
+          JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+         WHERE ak.entity_id = d.id AND ak.attribute_type = 2 AND kd.key = 'ctRatio') AS ct,
+       (SELECT coalesce(ak.str_v,'') FROM attribute_kv ak
+          JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+         WHERE ak.entity_id = d.id AND ak.attribute_type = 2 AND kd.key = 'meterRatio') AS 综合倍率
+FROM device d
+WHERE d.tenant_id = '<租户id>'
+  AND d.name LIKE '%进线%'
+ORDER BY d.name;
+```
+
+进线表如果 CT/PT 和综合倍率都为空 → 基本可以确定没配倍率（大表不可能没有互感器）。
+
+---
+
+## 四、问题三：「表的总数」还是「增量」
+
+### 4.1 两个键，两个语义
+
+平台用**两个不同的键**表达两件事，绝不能混用：
+
+| 键 | 语义 | 示例值 | 特点 |
+| --- | --- | --- | --- |
+| `energy` | **本小时用电量（增量）** | 0.5 / 0.5049 / 1.0195 | 与 `power_total` 同量级 |
+| `energy_reading` | **累积表底（单调递增）** | 33705.42 / 33705.93 / 33706.43 | 只增不减 |
+
+**恒等式**（演示数据与真实设备都必须满足）：
+
+```
+energy_reading[n] − energy_reading[n−1] == energy[n]
+```
+
+### 4.2 为什么必须两个都存
+
+- 只存 `energy`：能算区间电量，但**算不出账期累计**（边界受查询范围影响）
+- 只存 `energy_reading`：能算差值，但**看不出每小时分布**（峰谷拆不出来）
+- 两个都存：互相校验，任一个出错都能被发现
+
+### 4.3 用量一律用「表底差」，不用 `sum(energy)`
+
+| 口径 | 公式 | 用在哪 |
+| --- | --- | --- |
+| 表底差 | `末点 − 首点` × 系数 | 台账、账单、峰谷总量 |
+| 增量累加 | `Σ energy` | 页面逐小时柱状图 |
+
+**为什么主口径选表底差**：
+
+- `energy[t]` 覆盖 `(t−1h, t]`，用 `>= from` 取点会把账期首小时多算进来
+- 表底差与峰谷分析、账单同源，三个页面的数天然对得上
+- 换表/补录时表底差仍然自洽（只要新表底是接着涨的）
+
+**什么时候两者会差**：表底倒走（换表 / 归零 / 报错值）。
+算法跳过倒走段，于是 `Σ正增量 < 首末差`。
+
+```sql
+-- 一次看清两个口径 + 倒走段数
+WITH pts AS (
+    SELECT (ts / 3600000) * 3600000 + 1800000 AS bucket_center_ms,
+           max(coalesce(dbl_v, long_v))       AS reading
+    FROM ts_kv
+    WHERE entity_id = '<设备id>'
+      AND key = (SELECT key_id FROM key_dictionary WHERE key = 'energy_reading')
+      AND ts > 1790780400000 AND ts <= 1793462400000   -- 起点前一小时 ~ 期末
+    GROUP BY ts / 3600000
+), diff AS (
+    SELECT bucket_center_ms, reading,
+           reading - lag(reading) OVER (ORDER BY bucket_center_ms) AS inc
+    FROM pts
+)
+SELECT count(*) AS 点数,
+       min(reading) AS 首表底, max(reading) AS 末表底,
+       round((max(reading)-min(reading))::numeric, 4)                          AS 首末差,
+       round(sum(CASE WHEN inc >= 0 THEN inc ELSE 0 END)::numeric, 4)          AS 正增量累加,
+       count(*) FILTER (WHERE inc < 0)                                         AS 倒走段数
+FROM diff;
+```
+
+### 4.4 自检：两个键必须逐点自洽
+
+```sql
+-- 找出不自洽的点（期望 0 行）
+WITH e AS (
+    SELECT ts, coalesce(dbl_v, long_v) AS v
+    FROM ts_kv
+    WHERE entity_id = '<设备id>'
+      AND key = (SELECT key_id FROM key_dictionary WHERE key = 'energy')
+), r AS (
+    SELECT ts, coalesce(dbl_v, long_v) AS v,
+           coalesce(dbl_v, long_v) - lag(coalesce(dbl_v, long_v)) OVER (ORDER BY ts) AS delta
+    FROM ts_kv
+    WHERE entity_id = '<设备id>'
+      AND key = (SELECT key_id FROM key_dictionary WHERE key = 'energy_reading')
+)
+SELECT to_char(to_timestamp(e.ts/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 时间,
+       e.v AS energy,
+       round(r.delta::numeric, 4) AS 表底差
+FROM e JOIN r ON r.ts = e.ts
+WHERE r.delta IS NOT NULL
+  AND abs(e.v - r.delta) > 0.01;
+-- 说明：lag() 是窗口函数，不能直接写在 WHERE 里，
+--       所以在 CTE 里先算好 delta 再过滤。
+```
+
+### 4.5 各厂家上报的可能是哪一种
+
+| 厂家习惯 | 上报内容 | 接入时怎么办 |
+| --- | --- | --- |
+| 上报累积表底（Ep） | 33705.42 递增 | 直接映射到 `energy_reading`；`energy` 由计算字段或平台算 |
+| 上报小时增量 | 0.5 / 0.51 | 映射到 `energy`；**不要**映射到 `energy_reading` |
+| 两者都报 | 都有 | 各归各位，然后用 4.4 的 SQL 验自洽 |
+
+**判定方法**：看一台设备连续几个点，数值一直涨 → 累积；上下波动 → 增量。
+
+```sql
+-- 判定某键是累积还是增量
+SELECT to_char(to_timestamp(ts/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 时间,
+       coalesce(dbl_v, long_v) AS 值
+FROM ts_kv
+WHERE entity_id = '<设备id>'
+  AND key = (SELECT key_id FROM key_dictionary WHERE key = '<键名>')
+ORDER BY ts DESC LIMIT 20;
+```
+
+---
+
+## 五、问题四：各厂家指标名不一样
+
+### 5.1 平台标准名（真相源是字典）
+
+标准键名定义在**能源参数字典**里（租户级资产 `type='default'` 的子节点）。
+报表、看板、统计接口全部按这些名字取数。
+
+常用电能键：
+
+| 标准键 | 含义 | 单位 |
+| --- | --- | --- |
+| `voltage_a/b/c`、`voltage_avg` | 分相/平均电压 | V |
+| `current_a/b/c`、`current_avg` | 分相/平均电流 | A |
+| `power_total` | 有功总功率 | kW |
+| `reactive_power_total` | 无功总功率 | kvar |
+| `apparent_power_total` | 视在功率 | kVA |
+| `power_factor_total` | 功率因数 | — |
+| `frequency` | 频率 | Hz |
+| `energy` | 小时电量（增量） | kWh |
+| `energy_reading` | 累积表底 | kWh |
+| `load_rate` | 负荷率 | % |
+| `voltage_unbalance` | 三相不平衡度 | % |
+
+完整清单见 `admin/03-init.md`「三、能源参数字典」。
+
+### 5.2 转换机制：规则链节点
+
+**位置**：根规则链 → `Message Type Switch` → **`电表Key标准化`** → `Save Timeseries`
+
+**脚本**（平台内置，随建客户自动部署）：
+
+```javascript
+var MAP = {
+  "U":    "voltage_a",
+  "I":    "current_a",
+  "P":    "power_total",
+  "Q":    "reactive_power_total",
+  "S":    "apparent_power_total",
+  "PF":   "power_factor_total",
+  "Freq": "frequency",
+  "Ep":   "energy_reading"
+};
+// 未命中 MAP 的键原样保留（不会丢数据）
+// 发生改名时，原始键名写进 metadata.rawKeys
+```
+
+### 5.3 存储位置（三处，别找错）
+
+| 内容 | 存在哪 |
+| --- | --- |
+| 转换脚本 | `rule_node` 表，节点名「电表Key标准化」，`configuration.jsScript` |
+| 标准键定义 | 能源参数字典（`asset` + `relation`），`type='default'` 的子节点 |
+| 设备实际上报的键 | `ts_kv` + `key_dictionary` |
+
+```sql
+-- 看转换脚本当前内容
+SELECT n.name AS 节点, n.type AS 类型,
+       n.configuration::jsonb->>'jsScript' AS 脚本
+FROM rule_node n
+JOIN rule_chain rc ON rc.id = n.rule_chain_id
+WHERE n.name = '电表Key标准化';
+
+-- 看某设备上报了哪些键（用来判断映射是否生效）
+SELECT kd.key AS 键名, count(*) AS 点数,
+       to_char(to_timestamp(max(t.ts)/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 最后上报
+FROM ts_kv t
+JOIN key_dictionary kd ON kd.key_id = t.key
+WHERE t.entity_id = '<设备id>'
+GROUP BY kd.key ORDER BY 点数 DESC;
+```
+
+### 5.4 怎么发现「映射没生效」
+
+**症状**：`ts_kv` 里存的是 `U` / `I` / `P` / `Ep` 这种原始代号，报表全空。
+
+```sql
+-- 找字典里没有的键（大概率是没映射的原始代号）
+SELECT kd.key AS 可疑键, count(*) AS 点数,
+       count(DISTINCT t.entity_id) AS 设备数
+FROM ts_kv t
+JOIN key_dictionary kd ON kd.key_id = t.key
+WHERE kd.key !~ '^(voltage|current|power|energy|reactive|apparent|frequency|load_rate|carbon|idle|demand|temperature|humidity|co2|pressure|flow|level|status|alarm|lastReading|manualEntry|meterLevel|ct|pt|ratio)'
+  AND length(kd.key) <= 12
+GROUP BY kd.key ORDER BY 点数 DESC LIMIT 30;
+```
+
+**修法**：
+
+1. 打开「平台自检」→ 看「电表 Key 标准化节点」是否 OK
+2. 不 OK 就点「一键修复初始化」（幂等，不会重复加节点）
+3. 节点在但仍不生效 → 检查连线：`Switch --Post telemetry--> 标准化 --Success--> Save Timeseries`，
+   且**不能**有 `Switch --Post telemetry--> Save Timeseries` 直连（会让原始代号照样落库）
+
+```bash
+# 节点与连线的完整判定由平台自检接口给出（节点在 / 脚本最新 / 两条连线 / 无直连）
+curl --noproxy '*' -s -H "X-Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8090/api/energy/self-check" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); \
+      print([x for x in d['items'] if 'Key' in x['name'] or 'key' in x['code']])"
+```
+
+> 更可靠的做法是看「平台自检」接口，它用 `isMeterKeyTransformReady()` 一次判全：
+> 节点在、脚本是最新版、两条连线齐全、无直连。
+
+### 5.5 厂家映射表怎么加
+
+现场厂家代号不在内置 8 个里（比如 `VolA` / `Ia` / `kWh`）：
+
+**方式一：改设备的「测点管理」（推荐，按设备配）**
+
+组织与场站 → 选中场站 → 设备面板 → 测点管理，把厂家字段映射到标准键。
+存在设备 SERVER_SCOPE 属性里，只影响这台设备。
+
+**方式二：改规则链脚本（按租户配，影响所有设备）**
+
+规则链 → 根规则链 → `电表Key标准化` → 编辑脚本 → 在 `MAP` 里加一行：
+
+```javascript
+var MAP = {
+  "VolA": "voltage_a",     // ← 新增
+  "kWh":  "energy_reading",// ← 新增
+  "U": "voltage_a", /* …原有… */
+};
+```
+
+保存后运行时立即重载，**不用重启**。
+
+> ⚠ 改了脚本后，**平台自检会报「节点脚本不是最新版」** ——
+> 因为自检比对的是平台内置版本。这是预期的：
+> 自检的「一键修复」会把脚本改回内置版，覆盖你的自定义。
+> 所以：**按租户改脚本后，不要再点一键修复**；要保留自定义就改用「测点管理」按设备配。
+
+---
+
+## 六、端到端校验清单
+
+新装或新接一批表之后，按顺序跑一遍：
+
+### 第 1 步：原始数据到了吗
+
+```sql
+SELECT kd.key AS 键, count(*) AS 点数,
+       to_char(to_timestamp(min(t.ts)/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 最早,
+       to_char(to_timestamp(max(t.ts)/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 最新
+FROM ts_kv t JOIN key_dictionary kd ON kd.key_id = t.key
+WHERE t.entity_id = '<设备id>'
+GROUP BY kd.key ORDER BY 点数 DESC;
+```
+
+- 只有 `U`/`I`/`P` → **映射没生效**（第五节）
+- 有标准键但点数很少 → 设备离线或上报间隔太长
+
+### 第 2 步：两个电量键自洽吗
+
+跑第 4.4 节的 SQL，期望 0 行。
+
+### 第 3 步：倍率配了吗
+
+跑第 3.4 节的自查 SQL。进线表的 CT/PT 不该为空。
+
+### 第 4 步：层级配了吗
+
+```sql
+SELECT count(*) FILTER (WHERE lvl = 1) AS 进线表数,
+       count(*) FILTER (WHERE lvl = 2) AS 分项表数,
+       count(*) FILTER (WHERE lvl = 3) AS 回路数,
+       count(*) FILTER (WHERE lvl IS NULL OR lvl = 0) AS 未配数
+FROM (
+    SELECT (SELECT coalesce(ak.dbl_v, ak.long_v)
+              FROM attribute_kv ak JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+             WHERE ak.entity_id = d.id AND ak.attribute_type = 2 AND kd.key = 'meterLevel') AS lvl
+    FROM device d WHERE d.tenant_id = '<租户id>'
+) t;
+```
+
+- 有进线但分项/回路全是「未配」→ 汇总会重复计算
+- 全都没配 → 只能按「全部相加」出账，金额会虚高
+
+### 第 5 步：页面数字能用 SQL 复现吗
+
+打开「能耗优化 → …」或任一统计页，然后：
+
+```bash
+docker logs energy-server 2>&1 | grep -A40 "SQL 埋点" | tail -50
+```
+
+把日志里的 SQL 复制到 psql 执行，逐项对比页面数字。
+对不上时看第 4.3 节（两个口径）与 `06-customer-menu.md` 各节的「口径提示」。
+
+### 第 6 步：层级守恒吗
+
+跑第 2.4 节的守恒 SQL。差额为负 → 立刻排查。
+
+---
+
+## 七、常见误解对照表
+
+| 误解 | 实际 | 依据 |
+| --- | --- | --- |
+| 「表的总数」就是用量 | `energy_reading` 是表底，用量要算差值 | 第四节 |
+| `sum(energy)` 就是账期用量 | 边界差 1 小时；主口径用表底差 | 4.3 |
+| 倍率是「表底 × 系数」 | 是「表底差 × 系数」 | 3.3 |
+| RTU 已经乘过倍率了，平台不用管 | 要设 `ratioApplied=true`，否则再乘一次 | 3.2 |
+| 分项电表加起来就是总电量 | 总表含分表，直接加会翻倍 | 第二节 |
+| 虚拟表也要有表底 | 虚拟表只有 `energy`，没有 `energy_reading` | `06-customer-menu.md` 3.8 |
+| 峰谷各档数字跳动说明算错了 | 不同时间段命中不同季节方案，档位构成会变 | `03-init.md` 九之三 |
+| 改了规则链脚本，平台自检报错就是坏了 | 自检比对内置版本，自定义脚本必然不符 | 5.5 |
