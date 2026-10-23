@@ -92,6 +92,11 @@
           "id": "data-pipeline",
           "title": "⑦ 数据流处理（计量/倍率/增量/映射）",
           "file": "admin/07-data-pipeline.md"
+        },
+        {
+          "id": "customer-lifecycle",
+          "title": "⑧ 客户生命周期（开户/演示数据/销户）",
+          "file": "admin/08-customer-lifecycle.md"
         }
       ],
       "description": "给平台方的：怎么部署、开租户、导入数据、排障"

@@ -133,6 +133,24 @@ else
   # 异步那一步失败时脚本只说成功，用户登录后才发现页面空着。
   api POST /api/energy/demo-data "{\"customerId\":\"$CID\",\"customerName\":\"$NAME\"}" \
     > /tmp/onboard-demo.json 2>&1 || warn "演示数据接口调用失败，看 /tmp/onboard-demo.json"
+
+  # 资产汇总遥测（energy_total / water_total / …）。
+  #
+  # 看板在「选场站 / 选分项」时读的是**资产**上的汇总遥测，
+  # 不是设备的 energy。建客户流程里已经写了一次，这里**再显式补一次**：
+  #   · 演示数据是幂等跳过时，说明之前建过 —— 但期间库里可能被动过；
+  #   · 客户自己加过设备后再跑本脚本，也需要刷新汇总。
+  # 不补的话，运营看到「开通成功」，客户登录选场站却是空的。
+  api POST /api/energy/asset-totals/rebuild "{\"customerId\":\"$CID\",\"days\":60}" \
+    > /tmp/onboard-totals.json 2>&1 || warn "资产汇总重算失败，看 /tmp/onboard-totals.json"
+  ASSET_N=$(python3 -c "
+import json
+try:
+    print(json.load(open('/tmp/onboard-totals.json')).get('assetsWritten', 0))
+except Exception:
+    print(0)" 2>/dev/null)
+  [[ "${ASSET_N:-0}" -gt 0 ]] && ok "资产汇总已写入（${ASSET_N} 个资产，看板场站维度可用）" \
+      || warn "资产汇总写入 0 个（看板选场站可能为空）"
 fi
 
 # ---------------------------------------------------------------- 3. 验证
