@@ -266,12 +266,41 @@ fi
 # ---------------------------------------------------------------- 3. 数据上报
 C "3. 数据上报（HTTP / MQTT）"
 
-# 取一台实时电表
-RD=$(TAPI '/api/tenant/devices?pageSize=200&page=0' | python3 -c "
+# 上报测试用**临时设备**，不碰演示数据。
+#
+# 为什么要一台新的：往演示设备写 {"energy":1.23} 只写总电量、没有峰谷分量，
+# 04-verify-data 的「Σ(尖/峰/平/谷/深谷) == energy」守恒检查会立刻报不符
+# （实测 2026-10-23：先跑 06 再跑 04 必失败）。产品没坏，是验收自己污染了数据。
+#
+# 没有可用电表档案时回退到演示进线表（并告警），保证上报链路本身仍被验证。
+TPROFILE=$(TAPI '/api/deviceProfiles?pageSize=100&page=0' | python3 -c "
+import json,sys
+for p in json.load(sys.stdin)['data']:
+    if '电能' in p['name'] or '电表' in p['name']: print(p['id']['id']); break" 2>/dev/null)
+TD_ID=""
+if [[ -n "$TPROFILE" ]]; then
+  TD_ID=$(ncurl -X POST -H "X-Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+      -d "{\"name\":\"E2E上报测试表-$(date +%s)\",\"deviceProfileId\":{\"entityType\":\"DEVICE_PROFILE\",\"id\":\"$TPROFILE\"}}" \
+      "$BASE/api/device" | jget "d.get('id',{}).get('id','')")
+fi
+if [[ -n "$TD_ID" ]]; then
+  RD_ID="$TD_ID"
+  printf '  \033[90m（上报测试使用临时设备，不改演示数据）\033[0m\n'
+else
+  printf '  \033[33m  ! 无可用电表档案，回退到演示设备做上报测试（会留下无峰谷分量的 energy 点）\033[0m\n'
+  RD=$(TAPI '/api/tenant/devices?pageSize=200&page=0' | python3 -c "
 import json,sys
 for d in json.load(sys.stdin)['data']:
     if '进线总表' in d['name']: print(d['id']['id'], d['name']); break" 2>/dev/null)
-RD_ID=$(echo "$RD" | cut -d' ' -f1)
+  RD_ID=$(echo "$RD" | cut -d' ' -f1)
+fi
+
+# 报表核对用**演示进线表**：它挂在场站下，能解析到时段方案。
+# 临时设备没有场站，峰谷只能全算「平」—— 那是缺 context，不是报表算错。
+DEMO_ID=$(TAPI '/api/tenant/devices?pageSize=200&page=0' | python3 -c "
+import json,sys
+for d in json.load(sys.stdin)['data']:
+    if '进线总表' in d['name']: print(d['id']['id']); break" 2>/dev/null)
 if [[ -n "$RD_ID" ]]; then
   AA=$(TAPI "/api/device/$RD_ID/credentials" | jget "d.get('credentialsId','')")
   [[ -n "$AA" ]] && ok_ "设备访问令牌可读" || bad_ "设备令牌读取失败"
@@ -433,7 +462,7 @@ if [[ -n "$CTOK" && -n "${CID:-}" ]]; then
 fi
 
 # 报表数值必须与原始遥测一致：这是「数据准不准」的最终判据
-if [[ -n "$RD_ID" ]]; then
+if [[ -n "${DEMO_ID:-}" ]]; then
   # 上界取「1 小时前」：本脚本刚注入了几条 HTTP/MQTT 上报点，
   # 那些点没有表底配对，会让「库内 SUM」比「按表底差值算的报表」多出来。
   # 报表本身的口径是表底差值，所以窗口要和它的输入对齐。
@@ -446,7 +475,7 @@ if [[ -n "$RD_ID" ]]; then
   # 验收脚本要的是可复现、无歧义，所以直接把边界对齐到整点。
   FROM=$(python3 -c "import time;t=int((time.time()-13*86400)*1000);print(t-t%3600000)")
   TO=$(python3 -c "import time;t=int((time.time()-3600)*1000);print(t-t%3600000)")
-  TOU=$(TAPI "/api/energy/tou-analysis?deviceId=$RD_ID&granularity=day&from=$FROM&to=$TO")
+  TOU=$(TAPI "/api/energy/tou-analysis?deviceId=$DEMO_ID&granularity=day&from=$FROM&to=$TO")
 
   RES=$(echo "$TOU" | python3 -c "
 import json,sys
@@ -487,7 +516,7 @@ print(round(tot,2), round(sum(agg.values()),2), (d.get('scheme') or '-'))" 2>/de
       "SELECT round((max(dbl_v) - min(dbl_v))::numeric,2) FROM ts_kv t
        JOIN key_dictionary k ON k.key_id=t.key
        JOIN device d ON d.id=t.entity_id
-       WHERE d.id='$RD_ID'::uuid AND k.key='energy_reading' AND t.ts >= $FROM AND t.ts <= $TO" 2>/dev/null | tr -d ' ')
+       WHERE d.id='$DEMO_ID'::uuid AND k.key='energy_reading' AND t.ts >= $FROM AND t.ts <= $TO" 2>/dev/null | tr -d ' ')
     if [[ "${DBV:-0}" == "0" || -z "$DBV" ]]; then
       warn_ "库内没有整点遥测（演示数据可能缺失），跳过与报表的交叉核对"
     elif [[ -n "$T1" ]]; then
@@ -549,6 +578,18 @@ fi
 # 本脚本会新建一个「E2E验收场站」来验客户的自建能力。
 # 跑完必须删掉：否则反复执行会攒一堆空场站，客户在场站列表里看到它们
 # 会以为是自己建的，也会让「维度容器齐备率」这类统计永远偏低。
+if [[ -n "${TD_ID:-}" ]]; then
+  # 先删遥测（删设备不会删 ts_kv，会留孤儿数据），再删设备
+  ncurl -X DELETE -H "X-Authorization: Bearer $TOK" \
+    "$BASE/api/plugins/telemetry/DEVICE/$TD_ID/timeseries/delete?keys=energy,power_total,voltage_a&deleteAllDataForKeys=true" >/dev/null 2>&1 || true
+  DELC=$(ncurl -o /dev/null -w '%{http_code}' -X DELETE -H "X-Authorization: Bearer $TOK" "$BASE/api/device/$TD_ID")
+  if [[ "$DELC" == "200" ]]; then
+    printf '  \033[90m（已清理上报测试临时设备）\033[0m\n'
+  else
+    printf '  \033[90m（临时设备 %s 未删除，HTTP %s）\033[0m\n' "$TD_ID" "$DELC"
+  fi
+fi
+
 if [[ -n "${E2E_SITE:-}" ]]; then
   CODE=$(ncurl -o /dev/null -w '%{http_code}' -X DELETE \
     -H "X-Authorization: Bearer $CTOK" "$BASE/api/asset/$E2E_SITE")

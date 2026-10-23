@@ -2605,3 +2605,107 @@ WHERE ts > (extract(epoch from now()) - 3600) * 1000;
 
 > 只看「有没有」而不看「多少」时，用 `count(*) > 0` 而不是精确值 ——
 > 演示数据会随时间增长，写死数字的断言迟早会红。
+
+### 现象 P：全新库安装到「建库」就失败，容器起不来
+
+**报错**（`/tmp/energy-install.log`）：
+
+```
+Parameter N of constructor in com.guard.server.service.energy.XxxService
+required a bean of type 'com.guard.server.service.security.permission.OwnersCacheService'
+that could not be found.
+APPLICATION FAILED TO START
+```
+
+**为什么只有全新库会这样**：install 阶段的 `ThingsboardInstallApplication`
+只扫描少数包（含 `service.energy`，因为要用 `EnergyBootstrapInstaller`），
+**不含** `service.security.permission`。库里已经装好的环境跑的是运行时应用
+（扫描范围全），所以永远看不到这个错 —— 一清库就必失败。
+
+**判定**：报错里出现 `required a bean of type` 且类型不在下面这几个包内，
+就是这个问题：
+
+```
+com.guard.server.dao.*            ✓ 在扫描范围
+com.guard.server.service.energy.*  ✓ 在扫描范围（同包互相依赖没问题）
+其它 service.*                     ✗ 不在范围
+```
+
+**修法**（改代码，不是改配置）：把该依赖改成可选，并在用到的地方显式判空：
+
+```java
+@Autowired(required = false)
+private OwnersCacheService ownersCacheService;
+
+if (ownersCacheService == null) {
+    throw new IllegalStateException("OwnersCacheService 未装配，当前环境不应执行出账");
+}
+```
+
+**不要**把缺的包直接加进 `@ComponentScan` —— 那些包里的组件依赖运行时缓存/队列，
+install 阶段装不起来，会变成一串新的报错。
+
+> 这条已写进代码注释。往 `service.energy` 加新类时，先看它的字段：
+> 有没有非 `dao` / 非本包的 Service。
+
+### 现象 Q：重装脚本自己崩了，`APP_HOME: unbound variable`
+
+```
+docker-00-prepare.sh: line 291: APP_HOME: unbound variable
+✗ 组装部署目录失败
+```
+
+脚本开了 `set -u`，而写 `.env` 的 heredoc 里有一行注释含 `${APP_HOME}` ——
+bash 在写文件前就展开了它，而这个变量只存在于**生成出来的** .env 里。
+
+**修法**：heredoc 里想输出字面量变量一律转义：`\${APP_HOME}`。
+
+**自查**：改完任何 `docker-0*.sh` 后跑一次 `bash -n`，再走一遍全新重装。
+
+### 现象 R：装完自检 `missing=2`（费率 + 电表 Key 节点）
+
+全新库装完，自检报：
+
+```
+MISSING  费率配置（出账前提）   0 / 1
+MISSING  电表 Key 标准化节点    0 / 1
+```
+
+**先确认版本**：这两项现在由「建客户」自动完成（`onCreateCustomer`）。
+如果装完仍是 MISSING，说明 jar 是旧版本 —— 换成新 jar 后点一次
+「平台自检 → 一键修复初始化」即可补齐，不用重装。
+
+**这两项缺失的实际后果**：
+
+- 缺费率 → 出账每一台都「未配置电价」跳过，**账单页永远空**
+- 缺 Key 节点 → RTU 发的 `U`/`I`/`P`/`Ep` 原样落库，报表「只是没数据」
+
+**验证**（租户账号）：
+
+```bash
+curl --noproxy '*' -s -H "X-Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8090/api/energy/self-check | jq '.summary'
+# 期望 {"missing":0,"partial":0,"healthy":true}
+```
+
+### 现象 S：跑完 06 验收再跑 04，报「Σ峰谷 == energy 不符」
+
+```
+✗ 1 处不符：('单相园-1#进线总表', 1792721470731, 0.0, 1.23)
+```
+
+`1.23` 是 06 的「数据上报」节写进演示设备的测试值 —— 它有 `energy` 但没有
+`energy_tip/peak/flat/...` 分量，破坏了演示数据的守恒关系。
+
+**产品没坏，是验收污染了数据**。新版本 06 已改用临时设备（用完即删），
+不会再出现。旧版本留下点的话，按下面清掉：
+
+```sql
+DELETE FROM ts_kv t USING key_dictionary k, device d
+WHERE t.key = k.key_id AND t.entity_id = d.id
+  AND d.name LIKE '%进线总表%'
+  AND k.key IN ('energy','power_total','voltage_a')
+  AND mod(t.ts, 3600000) <> 0;      -- 非整点 = 手工注入的测试点
+```
+
+> 判据是「非整点」：演示数据全部落在整点，测试上报落在任意时刻。

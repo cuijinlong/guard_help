@@ -305,7 +305,7 @@ DB_PORT=$ENV_DB_PORT
 MQTT_PORT=$ENV_MQTT_PORT
 SERVER_HEAP=2g
 SERVER_HEAP_MB=2048
-# dev = 只有控制台日志；pro = 生产，日志按天落盘到 ${APP_HOME}/logs/
+# dev = 只有控制台日志；pro = 生产，日志按天落盘到 \${APP_HOME}/logs/
 SPRING_PROFILE=dev
 AI_IMAGE=energy/ngxai-backend:4.4.0
 ALLINONE_IMAGE=energy/allinone:4.4.0

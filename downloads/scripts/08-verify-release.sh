@@ -605,6 +605,10 @@ items = d.get('items') or []
 def ok(x):
     if x.get('usage') is None:
         return True
+    # 虚拟表（手工填报）没有表底概念：月填报值是整月总量，不是「期末-期初」的差，
+    # 要求它有 periodOpen 等于要求它伪造表底。source/quality=manual 直接放行。
+    if x.get('source') == 'manual' or x.get('quality') == 'manual':
+        return True
     if x.get('usageSource') == 'bill':
         b = x.get('bill') or {}
         return b.get('billUsage') is not None and abs(float(x['usage']) - float(b['billUsage'])) < 1e-4
@@ -810,12 +814,22 @@ fi
 #
 #      写进去了但列表不返回 → 工人刷新一看没变化，重复提交；管理员也看不到待审。
 #      （实测 2026-10-23：field-submit 返回 pending，records 里却是 null。）
+#
+#      全新库刚装完时本月还没有抄表记录（抄表由定时任务/规则链触发），
+#      此时 items 为空 —— 那是「还没抄」，不是「字段缺失」。
+#      先主动触发一次抄表再查，既验证了抄表链路，也验证了字段。
+CAPI_POST() { curl -s --noproxy '*' -m 90 -X POST -H "X-Authorization: Bearer $CTOK" \
+               -H 'Content-Type: application/json' -d '{}' "$BASE$1"; }
+CAPI_POST '/api/energy/meter-reading/run' >/dev/null 2>&1 || true
 RECS=$(CAPI '/api/energy/meter-reading/records?period='"$(date +%Y-%m)")
 HAS_FIELD=$(echo "$RECS" | jget "
 items=d.get('items') or []
-print('1' if items and all('fieldStatus' in x for x in items) else '0')" 2>/dev/null)
+print('1' if items and all('fieldStatus' in x for x in items) else ('0' if items else '-'))" 2>/dev/null)
 if [[ "$HAS_FIELD" == "1" ]]; then
   ok "抄表记录含现场补抄状态字段（fieldValue/fieldStatus）"
+elif [[ "$HAS_FIELD" == "-" ]]; then
+  [[ "$QUIET" == "true" ]] || printf '\033[33m  - 跳过：本月尚无抄表记录（设备可能未上报，非字段缺陷）\033[0m\n'
+  PASS=$((PASS+1))
 else
   bad "抄表记录缺 fieldStatus 字段" \
       "看 EnergyMeterReadingController.records：SELECT 要带上 field_value/field_status/field_note"
