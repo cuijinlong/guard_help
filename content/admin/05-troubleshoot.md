@@ -332,6 +332,119 @@ docker compose exec -T postgres psql -U postgres -d thingsboard -tAc \
 新版后端已修，重装后该计数应为 0。
 
 
+### 现象 H2：点某个菜单项进去，又「弹回」能源概览
+
+**现象**：点「实时能耗」「历史能耗」「设备管理」「平台自检」等菜单，地址栏一变就回到
+`/home`（能耗概览），控制台只有一条 404，页面上没有任何提示。
+
+**原因**：前端把**未注册的路径**交给 `**` 通配路由，它的行为就是 `redirectTo: 'home'`。
+两种成因，都不会报错：
+
+| 成因 | 特征 |
+| --- | --- |
+| 菜单里的 `dashboardId` 指向已删除 / 未分配给该客户的看板 | 重置演示数据、销户重建、或换掉看板后菜单没重绑 |
+| 菜单里的站内 URL 在**部署的前端产物**里没有对应路由 | 换了菜单但没重打 ui-ngx jar |
+
+**定位（一条命令）**：
+
+```bash
+cd ~/energy-app && bash scripts/08-verify-release.sh \
+  --tenant tenant@126.com --tenant-pass '12345678' \
+  --customer customer@126.com --customer-pass '12345678' \
+  | grep -E "菜单里的看板|ngxai 子应用|失效看板"
+```
+
+- 「菜单里的看板全部可打开（失效 0 个）」—— 这一项失败会直接列出 **哪一项、哪个 id、HTTP 几**
+- 「菜单里的 /ngxai 子应用入口可达」—— 失败说明 `ngxai-dist` 没挂到 nginx
+
+**修法**：
+
+```bash
+# ① 看板被删 / 未分配：重装客户菜单并重绑看板
+#    客户列表 → 该客户 → 「一键修复初始化」
+#    或在部署目录：
+curl --noproxy '*' -s -X POST -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"customerId":"<客户id>"}' \
+  http://127.0.0.1:8090/api/energy/repair-init
+
+# ② 路由没进前端产物：按「改代码后怎么更新 → 只改了前端」五步重发
+```
+
+> 新版（2026-10-24 起）：看板真取不到时页面会直接写「这个看板不存在或已被删除，
+> 请联系管理员重新分配菜单」，不再白屏。
+
+**为什么以前没被发现**：旧验收只查「菜单项名字在」，不查「点进去能不能打开」。
+现在 `08-verify-release.sh` 的 F 段会逐条请求菜单里的每个 dashboardId，
+并在 G 段核对页面组件是否真的打进了前端产物 —— 重装后跑一遍就知道。
+
+### 现象 H3：RTU 连上了，设备页显示"已上报"，但曲线全空
+
+**现象**：真实 RTU / 网关接上后，`docker logs` 里能看到 MQTT 连接，
+设备详情页的"最新遥测"里出现一个叫 **`values`** 的键，值是
+`{"U":228.0,"Freq":49.94,"Ep":8.36,...}` 这样一整串 JSON 字符串；
+而电压、电流、电量曲线全部为空。控制台/后端**没有任何报错**。
+
+**根因**：网关遥测报文漏了 `ts`。正确格式是
+
+```json
+{"设备名": [{"ts": 1792829233716, "values": {"U": 228.0}}]}
+```
+
+少了 `ts` 时平台不报错，而是把整个 `values` 对象当成一个普通遥测键存进去。
+
+**定位**：
+
+```bash
+# 看这个键在不在，以及它的值
+docker compose exec -T postgres psql -U postgres -d thingsboard -tAc "
+SELECT d.name FROM device d
+  JOIN ts_kv v ON v.entity_id = d.id
+  JOIN key_dictionary k ON k.key_id = v.key
+ WHERE k.key = 'values';"
+```
+
+**修法**（两条都建议做）：
+
+1. **升级固件**：新版 `rtu/main.py` 已强制带 `ts`，并且时间不可信时宁可不报
+   （不会把数据写到 1970 年）。重烧后 `values` 键不再产生。
+2. **平台侧兜底**：规则链「电表Key标准化」节点已内置兼容 —— 见到 `values`
+   是 JSON 字符串就拆开再映射，旧固件也能正常出数。部署新版后端即生效。
+
+**为什么曲线还是空的**：历史 `values` 点不会自动回填成标准键，
+需要设备用正确格式重新上报（或重烧后自然覆盖）。
+
+### 现象 H4：RTU 连接被接受，但消息全被丢弃
+
+**现象**：CONNECT 成功（CONNACK 返回码 0），PUBLISH 也不报错，
+但设备一条数据都没有。日志里反复出现：
+
+```
+ERROR MqttTransportHandler - [gatewaySessionHandler] is null, [xxx] Failed to process publish msg [v1/gateway/connect][-1]
+```
+
+**根因**：网关设备的 `additional_info` 里缺 `"gateway": true`。
+平台只认这个字段，**不认**「设备档案 = 网关」。
+
+**定位**：
+
+```bash
+docker compose exec -T postgres psql -U postgres -d thingsboard -tAc \
+  "SELECT name, additional_info FROM device WHERE name='ED1-Gateway';"
+# 缺 gateway 的会显示 {"siteId":"...","rtuDemo":true}
+```
+
+**修法**：
+
+```bash
+cd ~/energy-app
+python3 scripts/21-rtu-onboard.py \
+  --base http://127.0.0.1:8090 \
+  --tenant tenant@126.com --tenant-pass '12345678' \
+  --customer 星河工业园
+```
+
+脚本会补上 `gateway: true`（幂等，已正确时不动）。
+
 ### 现象 I：客户看板持续刷 403 + 404（同一个 id），几秒或一分钟一次
 
 **现象**：客户登录后，首页 Network 里反复出现**同一个 id**的两种请求：

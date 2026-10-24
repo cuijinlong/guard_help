@@ -243,6 +243,15 @@ if command -v lsof >/dev/null 2>&1; then
   else
     warn "MQTT 端口 ${MQTT_P} 未监听 —— RTU 会连不上。看 docker compose ps 的端口映射"
   fi
+  # RTU 现场固件用 11883（写死在 main.py 里），单独确认一次
+  RTU_P="${MQTT_RTU_PORT:-}"
+  if [[ -n "$RTU_P" ]]; then
+    if lsof -nP -iTCP:"$RTU_P" -sTCP:LISTEN >/dev/null 2>&1; then
+      ok "RTU 别名端口 ${RTU_P} 正在监听"
+    else
+      warn "RTU 别名端口 ${RTU_P} 未监听 —— 现场 RTU 会连不上（见 .env 的 MQTT_RTU_PORT）"
+    fi
+  fi
 fi
 
 cat <<DONE

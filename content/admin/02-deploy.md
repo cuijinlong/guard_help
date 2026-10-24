@@ -586,6 +586,46 @@ bash shiyongshouce/downloads/deploy/docker-97-preflight.sh
 | `--keep-data` | 不删数据库，只换 jar 并重建租户 |
 | `--rebuild-web` | 强制重建前端产物（默认源码没变就复用） |
 
+**只改了前端（`ui-ngx/`）**：
+
+⚠️ **`--rebuild-web` 不重建这套前端**：那个开关只重建 `ngxai`（AI 助手，独立子应用）。
+主界面 `ui-ngx` 的产物是打进 `guard-server` jar 的 `BOOT-INF/lib/ui-ngx-4.4.0.jar`，
+重装脚本不会替你重打它 —— 所以**改了 `ui-ngx/src/**` 后只跑 98 脚本，测的还是旧前端**。
+
+要真上线，手动走完这五步：
+
+```bash
+# ① 构建（8~12 分钟；产物落在 target/generated-resources/public）
+cd /你的路径/iot-rule-engine/ui-ngx
+npm run build:prod
+
+# ② 打成 ui jar（结构必须是 public/ 在 jar 根下）
+cd target/generated-resources
+jar cfM /tmp/ui-ngx-new.jar -C . public
+
+# ③ 替换本地 maven 仓库里的旧包（先备份，出问题可回滚）
+M2=~/Documents/dev_tools/maven_repository/rule-engine/org/thingsboard/ui-ngx/4.4.0
+cp $M2/ui-ngx-4.4.0.jar $M2/ui-ngx-4.4.0.jar.bak-$(date +%Y%m%d-%H%M%S)
+cp /tmp/ui-ngx-new.jar $M2/ui-ngx-4.4.0.jar
+
+# ④ 重打后端（会把新 ui jar 打进 BOOT-INF/lib）
+cd /你的路径/iot-rule-engine/guard-server
+mvn -o package -DskipTests
+cp target/guard-server-4.4.0.jar ~/energy-app/
+
+# ⑤ 重启并核对产物真的换了
+cd ~/energy-app
+docker compose --profile split --profile cassandra restart energy-server
+curl -s --noproxy '*' http://127.0.0.1:8090/ | grep -o 'main-[A-Z0-9]*\.js' | head -1
+```
+
+最后一步必须比：**`main-*.js` 的 hash 变了**才说明新前端生效。
+hash 没变而你以为改了 —— 那就是在测旧代码。`08-verify-release.sh` 的 G 段
+也会核对新改动是否真的进了产物（按组件特征串查）。
+
+> **怎么判断该不该重建前端**：只改 `guard-server/src/main/...`（Java、JSON 部件模板）
+> 不用重建；改 `ui-ngx/src/**` 就必须走上面五步。
+
 **只改了 `.env`（端口、密码）**：
 
 ```bash
@@ -614,7 +654,7 @@ docker compose --profile split up -d
 | `scripts/05-import-customer-data.py` | 客户台账导入 | `~/energy-app` |
 | `scripts/06-verify-e2e.sh` | 全链路验收（53 项） | `~/energy-app` |
 | `scripts/07-init-menu.sh` | 菜单重建 | `~/energy-app` |
-| `scripts/08-verify-release.sh` | 发布内容验收（75 项） | `~/energy-app` |
+| `scripts/08-verify-release.sh` | 发布内容验收（78 项） | `~/energy-app` |
 | `scripts/09-onboard-customer.sh` | **一键开通一个客户**（带演示数据） | `~/energy-app` |
 | `scripts/10-cleanup-customer.sh` | **清理一个客户**（连带遥测，含隔离校验） | `~/energy-app` |
 | `scripts/11-cassandra.sh` | **Cassandra 管理**（status/init/enable/disable/uninstall） | `~/energy-app` |

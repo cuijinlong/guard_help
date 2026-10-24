@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=75
+EXPECTED_PASS=78
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -481,6 +481,82 @@ n=sum(1 for b in (d.get('buckets') or []) if float(b.get('total') or 0) > 0)
 print(1 if n else 0)" 2>/dev/null || echo 0)
   [[ "$TOU_HAS" == "1" ]] && ok "峰谷分析接口有数据返回" \
     || bad "峰谷分析接口无数据" '演示数据或时段方案缺失：跑一键修复初始化 / 检查 tou_scheme'
+
+  # ---- F3：菜单里每个看板链接都必须真的能打开 ----
+  #
+  # ★ 为什么必须查（2026-10-24）：
+  #   「点菜单进去又弹回能源概览」是**静默故障** —— 前端把未知/失效目标交给
+  #   `**` 通配路由，`redirectTo: 'home'`，用户看到的永远是能耗概览，
+  #   控制台只有一条 404，页面上没有任何提示。最常见的成因不是崩溃，
+  #   而是菜单里的 dashboardId 指向了**已删除或未分配给该客户的看板**
+  #   （重置演示数据 / 销户重建 / 换看板后菜单没重绑）。
+  #   F 段只验「菜单项名字在」，验不出「点进去能打开」。
+  #
+  # 站内路由（/sites、/self-check…）不在这里逐个查：SPA 对未知路径也返回
+  # index.html，HTTP 状态区分不出来；真正的证据是构建产物里有对应组件，
+  # 那由 G 段的 tb-self-check / tb-energy-dict 等特征串断言覆盖。
+  # /ngxai/ 是 nginx 直接托管的独立子应用，这里单独查它的入口。
+  F3=$(python3 - "$BASE" "$CTOK" "$CM" <<'PYEOF'
+import json, sys, urllib.request, urllib.error
+base, tok, cm = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = json.loads(cm)
+links = []
+def walk(items):
+    for i in (items or []):
+        links.append(i)
+        walk(i.get('children')); walk(i.get('pages'))
+walk(cfg.get('items'))
+bad_dash, ngxai, known = [], [], ('/sites','/device-management','/device-group',
+                                  '/device-topology','/self-check','/alarm-center','/param-report')
+unknown = []
+for i in links:
+    lt = i.get('linkType'); name = i.get('name') or ''
+    if lt == 'DASHBOARD' and i.get('dashboardId'):
+        did = i['dashboardId']
+        req = urllib.request.Request(f'{base}/api/dashboard/{did}',
+                                     headers={'X-Authorization': 'Bearer ' + tok})
+        try:
+            urllib.request.urlopen(req, timeout=15)
+        except urllib.error.HTTPError as e:
+            bad_dash.append(f'{name}({did[:8]}:{e.code})')
+        except Exception as e:
+            bad_dash.append(f'{name}({did[:8]}:{type(e).__name__})')
+    elif lt == 'URL':
+        u = (i.get('url') or '').strip()
+        if u.startswith('/ngxai'):
+            ngxai.append(u)
+        elif u.startswith('/') and u not in known:
+            unknown.append(f'{name}({u})')
+bad_ngxai = []
+for _ in set(ngxai):
+    try:
+        urllib.request.urlopen(f'{base}/ngxai/', timeout=15)
+    except Exception as e:
+        bad_ngxai.append(f'/ngxai({type(e).__name__})')
+print(len(links), len(bad_dash), len(bad_ngxai))
+print(' '.join(bad_dash))
+print(' '.join(bad_ngxai))
+print(' '.join(unknown))
+PYEOF
+)
+  F3_N=$(printf '%s' "$F3" | sed -n '1p' | awk '{print $1}')
+  F3_DASH=$(printf '%s' "$F3" | sed -n '1p' | awk '{print $2}')
+  F3_NGX=$(printf '%s' "$F3" | sed -n '1p' | awk '{print $3}')
+  F3_BAD=$(printf '%s' "$F3" | sed -n '2p')
+  F3_BADNG=$(printf '%s' "$F3" | sed -n '3p')
+  F3_UNK=$(printf '%s' "$F3" | sed -n '4p')
+  ge "客户菜单可点链接" "${F3_N:-0}" 10 \
+     '客户菜单只剩几项：跑一键修复初始化重装菜单（预期 15 个看板 + 若干站内路由）'
+  eq "菜单里的看板全部可打开（失效 ${F3_DASH:-0} 个）" "${F3_DASH:-1}" "0" \
+     "菜单指向已删除/未分配的看板，点进去会静默弹回能耗概览。失效：${F3_BAD}。跑一键修复初始化重绑菜单"
+  eq "菜单里的 /ngxai 子应用入口可达（失效 ${F3_NGX:-0} 个）" "${F3_NGX:-1}" "0" \
+     "ngxai 静态产物没部署到 nginx（${F3_BADNG}）：检查 ${APP_HOME:-.}/ngxai-dist 挂载"
+  if [[ -n "$F3_UNK" ]]; then
+    echo "      ↳ 提示：这些站内路由不在已知清单，请确认前端已注册：$F3_UNK" >&2
+  fi
+  if [[ -n "$F3_BAD" ]]; then
+    echo "      ↳ 失效看板：$F3_BAD" >&2
+  fi
 else
   ok "跳过客户侧检查（未提供客户账号或登录失败）"
 fi
@@ -653,12 +729,23 @@ fi
 #      选一台数据完整的表，任取 3 天逐日比对表底差。
 if [[ -f .env ]]; then
   set -a; . ./.env 2>/dev/null; set +a
-  TOU_DEV=$(TAPI '/api/energy/meter-reading/tree' | jget "
-dims=d.get('dimensions') or []
-for dm in dims:
-    for n in dm.get('nodes') or []:
-        ids=n.get('deviceIds') or []
-        if ids: print(ids[0]); raise SystemExit" 2>/dev/null)
+  # ★ 必须挑**演示设备**（additional_info.demo=true）。
+  #   树的第一台可能是现场接进来的真实 RTU 表：它今天才上线、只在非整点
+  #   上报过几个点，历史 2~4 天完全没有 energy_reading → 本断言恒失败，
+  #   看起来像「峰谷分析算错了」，实际是取样取错了设备（2026-10-24 实测）。
+  TOU_DEV=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc "
+    SELECT d.id FROM device d
+     WHERE d.type IN ('单相电能表','电能表')
+       AND substring(d.additional_info from '\"demo\"\s*:\s*(true|\"true\")') IS NOT NULL
+     ORDER BY d.name LIMIT 1" 2>/dev/null | tr -d ' ')
+  # 兜底：老库里演示设备没打 demo 标记时，退回按名字挑（演示表统一带「园-」前缀）
+  if [[ -z "$TOU_DEV" ]]; then
+    TOU_DEV=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc "
+      SELECT d.id FROM device d
+       WHERE d.type IN ('单相电能表','电能表')
+         AND d.name LIKE '%园-%'
+       ORDER BY d.name LIMIT 1" 2>/dev/null | tr -d ' ')
+  fi
   if [[ -n "$TOU_DEV" ]]; then
     TOU_BAD=0
     TOU_CHECKED=0

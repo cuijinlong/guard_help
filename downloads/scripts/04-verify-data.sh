@@ -88,12 +88,21 @@ psql_q "SELECT name,
           COALESCE(substring(additional_info from '\"deviceVirtual\"\s*:\s*\"([^\"]+)\"'), 'real')
         FROM device" > "$WORK/virtual.txt" || true
 
+# ★ 只验**演示数据**（additional_info.demo = true）。
+#
+# 为什么必须加这个过滤（2026-10-24）：
+#   本脚本断言「每台表覆盖 ≥ 13 天」，而现场接入的真实 RTU 表是**今天才开始上报**的。
+#   把它们一起算进来，重装后接了 RTU 就一定报「覆盖不足」—— 而这不是故障。
+#   验收的目标是「演示数据自洽」，真实设备用自己的方式验证（见 21-rtu-onboard.py）。
 psql_q "SELECT d.name, COALESCE(av.str_v, av.long_v::text, ''), d.type
         FROM device d
         LEFT JOIN attribute_kv av
           ON av.entity_id = d.id AND av.attribute_type = 2
         LEFT JOIN key_dictionary kd ON kd.key_id = av.attribute_key
         WHERE d.type IN ('单相电能表','电能表','水表','燃气表','蒸汽表','温湿度变送器')
+          -- 与文件里其它地方同风格：additional_info 是 varchar，用正则而不是 ::json
+          -- （个别真实设备可能留空串，空串转 json 会直接报错）
+          AND substring(d.additional_info from '\"demo\"\s*:\s*(true|\"true\")') IS NOT NULL
           AND (kd.key = 'meterLevel' OR kd.key IS NULL)
         ORDER BY d.name" > "$WORK/level.txt" || true
 

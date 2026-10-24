@@ -177,7 +177,10 @@ def post_gateway(mqtt_host, mqtt_port, gateway_token, device_name, values):
     这里用标准库手写最小 MQTT 3.1.1 PUBLISH（QoS 0），
     避免给现场脚本引入 paho-mqtt 依赖。
     """
-    payload = json.dumps({device_name: [{"values": values}]})
+    # ★ 必须带 ts。网关遥测写成 [{"values": {...}}] 时平台不报错，
+    #   而是把整个 values 对象当成一个名为 "values" 的普通遥测键入库 ——
+    #   库里多一条 values='{"U":220,...}'，电压/电流曲线全空（2026-10-24 实测）。
+    payload = json.dumps({device_name: [{"ts": int(time.time() * 1000), "values": values}]})
     try:
         import socket, struct
 
@@ -185,12 +188,30 @@ def post_gateway(mqtt_host, mqtt_port, gateway_token, device_name, values):
             b = s.encode()
             return struct.pack("!H", len(b)) + b
 
+        def enc_rem(n):
+            """MQTT 剩余长度：变长编码，超过 127 字节必须用两位以上。
+
+            旧写法只处理了 <128 与「恰好两位」，超过 16383 会算错 ——
+            一帧多发几台表就会畸形。
+            """
+            out = b""
+            while True:
+                d = n % 128
+                n //= 128
+                out += bytes([d | (0x80 if n else 0)])
+                if not n:
+                    return out
+
         client_id = "rtu-sim-" + str(random.randint(1000, 9999))
-        # CONNECT
-        var = enc_str("MQTT") + bytes([4, 0x02]) + struct.pack("!H", 60)
-        # 用户名 = 网关 access token（ThingsBoard 网关约定）
-        var += enc_str(gateway_token) + enc_str(client_id)
-        pkt = bytes([0x10]) + bytes([len(var)]) + var
+        # CONNECT 可变头：协议名 + 级别 4 + 连接标志 + keepalive
+        #   flags 0x02 = clean session，0x80 = 带 username。
+        #   漏了 0x80 平台会按「没有用户名」解析，令牌读不到 → CONNACK 非零；
+        #   漏了它还会让剩余字节数对不上，日志报 non-zero remaining payload bytes。
+        var = enc_str("MQTT") + bytes([4, 0x02 | 0x80]) + struct.pack("!H", 60)
+        # payload 顺序：ClientId **必须**在最前，Username 在其后（MQTT 3.1.1 规定）。
+        # 旧写法把令牌写在前面，平台把令牌当成了 ClientId。
+        var += enc_str(client_id) + enc_str(gateway_token)
+        pkt = bytes([0x10]) + enc_rem(len(var)) + var
 
         s = socket.create_connection((mqtt_host, mqtt_port), timeout=15)
         s.sendall(pkt)
@@ -200,10 +221,17 @@ def post_gateway(mqtt_host, mqtt_port, gateway_token, device_name, values):
         if ack[3] != 0:
             return 0, f"MQTT 认证失败，CONNACK 返回码 {ack[3]}（令牌不对？）"
 
+        # 先声明一次下游设备（真实 RTU 也是这么做的）
+        c_topic = b"v1/gateway/connect"
+        c_pay = json.dumps({"device": device_name}).encode()
+        c_rem = struct.pack("!H", len(c_topic)) + c_topic + c_pay
+        s.sendall(bytes([0x30]) + enc_rem(len(c_rem)) + c_rem)
+        time.sleep(0.2)
+
         topic = b"v1/gateway/telemetry"
         # PUBLISH，QoS0
         rem = struct.pack("!H", len(topic)) + topic + payload.encode()
-        s.sendall(bytes([0x30]) + bytes([len(rem) if len(rem) < 128 else 0x80 | (len(rem) & 0x7F)]) + rem)
+        s.sendall(bytes([0x30]) + enc_rem(len(rem)) + rem)
         time.sleep(0.15)
         s.close()
         return 200, "ok"

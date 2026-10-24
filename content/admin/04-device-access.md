@@ -163,25 +163,123 @@ PY
 
 ### 网关下挂多台表
 
-一台 RTU 下面挂多块表时，有两种接法：
+一台 RTU 下面挂多块表时，用网关模式：RTU 用**网关设备**的 token 连一条 MQTT，
+在报文里说明这条数据属于哪台下挂设备。
 
 **接法 A：一表一设备（推荐）**
 
-每块表在平台上建一台设备，各用各的 token。RTU 分主题发布：
+每块表在平台上建一台设备（名字必须与固件里**逐字一致**），RTU 用网关设备连接。
 
 ```
-v1/gateway/telemetry
+# ① 先声明下游设备（连上后发一次即可，重连后要重发）
+topic: v1/gateway/connect
+{"device": "PowerMeter-DDSU777"}
+
+# ② 再发遥测
+topic: v1/gateway/telemetry
 {
-  "表1的设备名": [{"energy": 1.2, "voltage_a": 220.1}],
-  "表2的设备名": [{"energy": 3.4, "voltage_a": 219.8}]
+  "PowerMeter-DDSU777": [
+    {"ts": 1792829233716, "values": {"U": 228.0, "I": 6.2, "P": 1360.0, "Ep": 8.36}}
+  ],
+  "Sensor-HZ8706": [
+    {"ts": 1792829233716, "values": {"temp": 23.5, "humi": 57.5}}
+  ]
 }
 ```
 
-网关自己用一台「网关」档案设备的 token 连接。
+> **`ts` 和 `values` 两个字段都不能省**（实测 2026-10-24）：
+>
+> | 写成 | 平台的行为 |
+> | --- | --- |
+> | `[{"ts":..., "values":{...}}]` | ✅ 正常入库 |
+> | `[{"values":{...}}]`（无 ts） | ❌ 不报错，整个对象被存成一个名为 **`values`** 的键，值是 JSON 字符串；设备页显示"已上报"，但曲线全空 |
+> | `[{"U":228}]`（键值摊平） | ❌ `ts` 会被当成遥测键一起存进去 |
+>
+> `ts` 是**毫秒**。板子时间不准会让数据落到 1970 年，看板按"最近 7 天"查什么都没有 ——
+> 所以固件要先 NTP 对时（或用 `/api/noauth/energy/health` 返回的 `serverTime` 校准）。
+
+**网关设备必须打 `gateway` 标记**，否则平台把消息全丢掉：
+
+```bash
+# 设备 additional_info 里要含 "gateway": true
+docker compose exec -T postgres psql -U postgres -d thingsboard -tAc \
+  "SELECT name, additional_info FROM device WHERE name='ED1-Gateway';"
+# → ED1-Gateway | {"siteId":"...","gateway":true}
+```
+
+漏了它的症状很隐蔽：CONNECT 认证**通过**、PUBLISH 也返回成功，但每条消息都被丢弃，
+日志里只有一行：
+
+```
+ERROR MqttTransportHandler - [gatewaySessionHandler] is null ... Failed to process publish msg [v1/gateway/connect][-1]
+```
+
+把设备档案设成「网关」**不能**替代这个字段 —— 平台只认 `additional_info.gateway`。
 
 **接法 B：一表一 token（简单但不便管理）**
 
 RTU 为每块表建一条 MQTT 连接。表多时连接数会爆，不推荐超过 20 块。
+
+### 现场 RTU（HaaS506-ED1）：一条命令备好 4 台设备
+
+带实体 RTU 去客户现场演示时，平台侧要先把 4 台设备备齐 —— 否则 RTU 一上电，
+TB 会自动建成 default 档案的孤儿设备，抄表/台账/看板都不认。
+
+```bash
+cd ~/energy-app
+python3 scripts/21-rtu-onboard.py \
+  --base http://<本机局域网IP>:8090 \
+  --tenant tenant@126.com --tenant-pass '12345678' \
+  --customer 星河工业园
+```
+
+它会建（或修复）这 4 台，并把网关令牌固定成 `ED1GatewayDemoRig2026`：
+
+| 设备 | 档案 | 说明 |
+| --- | --- | --- |
+| `ED1-Gateway` | 网关 | 带 `gateway: true`，令牌固定 |
+| `PowerMeter-DDSU777` | 单相电能表 | `meterLevel=0`（不参与场站汇总，但能抄表） |
+| `Sensor-HZ8706` | 温湿度变送器 | |
+| `Relay-8CH` | default | 8 路继电器，RPC 控制 |
+
+**为什么令牌要固定**：TB 默认随机生成，重装一次变一次，现场就得重烧固件。
+固定之后，**重装、重建客户、换机器都不用改固件**。
+
+**为什么电表 meterLevel=0**：演示数据的账单与「层级守恒」断言按 meterLevel 分层算，
+真实 RTU 表若给 1/2 级会混进园区汇总，演示数字会莫名变化。level=0 仍能抄表、能看实时曲线。
+
+**验证链路**（没有硬件时用模拟器，走与真机完全相同的 MQTT 路径）：
+
+```bash
+python3 scripts/20-rtu-simulator.py \
+  --base http://127.0.0.1:8090 --tenant tenant@126.com --tenant-pass '12345678' \
+  --mode gateway --gateway ED1-Gateway --device Sensor-HZ8706 \
+  --mqtt-host 127.0.0.1 --mqtt-port 11883 --interval 1 --count 3
+```
+
+现场把 `--mqtt-host/--mqtt-port` 换成平台地址与 `11883`。
+
+#### 固件侧要核对的四组配置
+
+`rtu/main.py` 顶部「配置区」逐条核对，上电后串口第一屏会原样回显（「配置自检」）：
+
+| 组 | 项 | 现场取值 |
+| --- | --- | --- |
+| ① WiFi | SSID / 密码 | 客户现场网络 |
+| ② 平台 | `TB_HOST` | **平台机器的局域网 IP**（不能写 127.0.0.1） |
+| | `TB_PORT` | `11883`；连不上会自动回退 `1883`（平台两个端口都在听） |
+| | `TB_TOKEN` | `ED1GatewayDemoRig2026`（固定值，正常不用改） |
+| ③ 本机 | `RTU_IP` | 与 ① 同网段；换网络不确定时设 `None` 用 DHCP |
+| ④ 设备名 | 4 个名字 | 必须与平台上**逐字一致** |
+
+#### 现场三个静默陷阱（都不报错，只表现为"没数据"）
+
+1. **端口不一致**：固件写 11883、平台只开 1883（或反之）→ 探活通过、MQTT 连不上
+2. **缺 `ts`**：数据全落进 `values` 键（见「网关下挂多台表」）
+3. **缺 `gateway: true`**：消息被丢弃，日志报 `gatewaySessionHandler is null`
+
+新版固件对 1、2 都做了处理（端口回退、强制带 ts、时间不可信时拒发并提示）；
+3 是平台侧的数据，用上面的 `21-rtu-onboard.py` 一次配好。
 
 ---
 

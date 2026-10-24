@@ -64,6 +64,35 @@ else
   fi
 fi
 
+# 2b. 前端产物一致性（ui-ngx）
+#
+# ★ 为什么必须单独查（2026-10-24 真实踩过）：
+#   主界面 ui-ngx 编译后打成 ui-ngx-4.4.0.jar，再从**本地 maven 仓库**被
+#   guard-server 打包进 BOOT-INF/lib。链路有三段，任何一段没更新，
+#   跑起来看到的都是旧页面 —— 而后端 jar 的 md5 完全一致，第 2 节查不出来。
+#   实测：改了 iframe-view.component.ts，ui jar 没换，重启后页面行为没变，
+#   却以为「改动没用」。这里直接比「ui-ngx 源码最新修改时间」与「ui jar 时间」。
+UI_SRC="$ROOT/ui-ngx/src"
+UI_JAR=""
+for c in "$HOME/Documents/dev_tools/maven_repository/rule-engine/org/thingsboard/ui-ngx/4.4.0/ui-ngx-4.4.0.jar" \
+         "$HOME/.m2/repository/rule-engine/org/thingsboard/ui-ngx/4.4.0/ui-ngx-4.4.0.jar" \
+         "$HOME/.m2/repository/org/thingsboard/ui-ngx/4.4.0/ui-ngx-4.4.0.jar"; do
+  [[ -f "$c" ]] && { UI_JAR="$c"; break; }
+done
+if [[ ! -d "$UI_SRC" ]]; then
+  warn "仓库里没有 ui-ngx/src，跳过前端产物检查"
+elif [[ -z "$UI_JAR" ]]; then
+  warn "本地 maven 仓库找不到 ui-ngx-4.4.0.jar，跳过（改了前端也不会生效）"
+else
+  NEWEST=$(find "$UI_SRC" -type f -newer "$UI_JAR" -print -quit 2>/dev/null)
+  if [[ -n "$NEWEST" ]]; then
+    bad "ui-ngx 源码比 ui jar 新 → 前端改动没上线：$NEWEST"
+    echo "      修法：npm run build:prod → jar cfM → 覆盖 maven 仓库 → mvn package（见手册「只改了前端」）"
+  else
+    ok "前端产物不旧于源码（$(basename "$UI_JAR")）"
+  fi
+fi
+
 # ---------------------------------------------------------------- 3. 脚本一致性
 C "3. 脚本一致性（仓库是唯一真相，部署目录是副本）"
 SRC_DIR="$ROOT/shiyongshouce/downloads/scripts"
@@ -175,8 +204,14 @@ if [[ -d "$DATA_SRC_DIR" && -d "$DATA_DST_DIR" ]]; then
   JAR_PATH="$ROOT/guard-server/target/guard-server-4.4.0.jar"
   if [[ -f "$JAR_PATH" ]]; then
     MISSING_SQL=""
+    # ★ 不要写 `unzip -l | grep -q`：本脚本开了 pipefail，
+    #   grep -q 命中后立刻退出会让 unzip 收到 SIGPIPE（141），
+    #   管道整体算失败 → 文件明明在也被判「缺」。实测 2026-10-24：
+    #   两个文件都在 jar 里，这里却报「缺升级 SQL」。
+    #   先取全文再匹配，不看单个命令的退出码。
+    JAR_LIST=$(unzip -l "$JAR_PATH" 2>/dev/null)
     for f in sql/schema-views.sql sql/schema-functions.sql; do
-      unzip -l "$JAR_PATH" 2>/dev/null | grep -q "BOOT-INF/classes/$f" || MISSING_SQL="$MISSING_SQL $f"
+      [[ "$JAR_LIST" == *"BOOT-INF/classes/$f"* ]] || MISSING_SQL="$MISSING_SQL $f"
     done
     if [[ -z "$MISSING_SQL" ]]; then
       ok "jar 含升级所需 SQL（schema-views / schema-functions）"

@@ -75,7 +75,7 @@ ok()   { printf '\033[32m  ✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m  !\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m  ✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-[[ -f "$JAR" ]] || die "找不到 $JAR（先跑一次 docker-01-install 或 mvn package）"
+[[ -f "$JAR" ]] || die "找不到 ${JAR}（先跑一次 docker-01-install 或 mvn package）"
 
 # ---------------------------------------------------------------- 同步缓存
 sync_cache() {

@@ -274,6 +274,7 @@ if [[ "$PACK" == "true" ]]; then
   ENV_HTTP_PORT=8090
   ENV_DB_PORT=5432
   ENV_MQTT_PORT=1883
+  ENV_MQTT_RTU_PORT=11883
 else
   # 端口占用时自动顺延，省得用户手工排查
   port_free() {
@@ -290,10 +291,19 @@ else
   # MQTT 是 RTU / 网关的接入口，被 mosquitto 之类占用时顺延，别让部署失败
   MQTT_PORT=1883
   while ! port_free "$MQTT_PORT" && [[ "$MQTT_PORT" -lt 1983 ]]; do MQTT_PORT=$((MQTT_PORT+1)); done
+  # RTU 别名端口：现场固件把 11883 写死在代码里（HaaS506-ED1）。
+  # 平台多映射一个端口，换机器 / 重装 / 换客户都不用重烧固件。
+  # 与主端口相同时跳过（否则 compose 会报端口重复）。
+  MQTT_RTU_PORT=11883
+  while ! port_free "$MQTT_RTU_PORT" && [[ "$MQTT_RTU_PORT" -lt 12000 ]]; do
+    MQTT_RTU_PORT=$((MQTT_RTU_PORT+1))
+  done
+  [[ "$MQTT_RTU_PORT" == "$MQTT_PORT" ]] && MQTT_RTU_PORT=""
   ENV_APP_HOME="$STAGE"
   ENV_HTTP_PORT=$HTTP_PORT
   ENV_DB_PORT=$DB_PORT
   ENV_MQTT_PORT=$MQTT_PORT
+  ENV_MQTT_RTU_PORT=$MQTT_RTU_PORT
 fi
 
 cat > "$STAGE/.env" <<ENVEOF
@@ -311,6 +321,8 @@ DB_PASSWORD=$DB_PASS
 DB_PORT=$ENV_DB_PORT
 # 设备侧 MQTT 端口：RTU / 物联网网关连这个端口上报数据
 MQTT_PORT=$ENV_MQTT_PORT
+# RTU 现场固件写死的端口（11883），平台额外监听；留空表示不映射
+MQTT_RTU_PORT=$ENV_MQTT_RTU_PORT
 SERVER_HEAP=2g
 SERVER_HEAP_MB=2048
 # dev = 只有控制台日志；pro = 生产，日志按天落盘到 \${APP_HOME}/logs/

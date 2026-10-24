@@ -205,6 +205,10 @@ services:
       - "8090"
     ports:
       - "${MQTT_PORT:-1883}:${MQTT_PORT:-1883}"
+      # RTU 现场固件把端口写死成 11883（HaaS506-ED1 的约定）。
+      # 额外映射一个别名端口，换机器 / 重装 / 换客户都不用重烧固件。
+      # 被占用时 docker-00-prepare.sh 会顺延并写进 .env。
+      - "${MQTT_RTU_PORT:-11883}:${MQTT_PORT:-1883}"
     entrypoint: ["java", "-Dinstall.data_dir=/opt/energy/data", "-jar", "/opt/energy/app.jar"]
     command:
       - --spring.config.name=thingsboard
@@ -298,6 +302,10 @@ services:
     ports:
       - "${HTTP_PORT:-8090}:80"
       - "${MQTT_PORT:-1883}:${MQTT_PORT:-1883}"
+      # RTU 现场固件把端口写死成 11883（HaaS506-ED1 的约定）。
+      # 额外映射一个别名端口，换机器 / 重装 / 换客户都不用重烧固件。
+      # 被占用时 docker-00-prepare.sh 会顺延并写进 .env。
+      - "${MQTT_RTU_PORT:-11883}:${MQTT_PORT:-1883}"
     volumes:
       # PostgreSQL 数据、SQLite、日志都在这里；升级镜像不丢数据
       - allinone-data:/var/lib/energy
