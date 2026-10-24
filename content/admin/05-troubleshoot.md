@@ -445,6 +445,73 @@ python3 scripts/21-rtu-onboard.py \
 
 脚本会补上 `gateway: true`（幂等，已正确时不动）。
 
+### 现象 H5：客户账号点某个按钮，弹出「您没有权限执行此操作！」
+
+**现象**：客户登录后点「一键修复初始化」或某个「去修复」，弹出权限错误；
+或者点完直接跳到一个整页写着「您没有权限访问此位置！」的页面。
+
+**根因**：前端对客户显示了**管理端才有的操作**。后端权限是对的，前端漏了判断。
+2026-10-24 修掉了三处：
+
+| 位置 | 原来的行为 | 修法 |
+| --- | --- | --- |
+| 平台自检 → 「一键修复初始化」 | 客户可点 → 403（`repair-init` 仅管理员） | 按 `isCustomerUser` 隐藏，改为提示「请联系管理员补装」 |
+| 平台自检 → 每项的「去修复」 | 客户可点 → 跳到 `/profiles/*`、`/vendor-model`、`/custom-menu` 等租户专属页 → **整页权限报错** | 客户一律不显示 |
+| 「去修复」的跳转表 | `/asset-profile`、`/device-profile` 这两个路径**不存在** → 命中 `**` 通配 → 跳回能耗概览（看起来像按钮没反应） | 改成真实路由 `/profiles/assetProfiles`、`/profiles/deviceProfiles` |
+
+**定位**（一条命令，用客户账号跑）：
+
+```bash
+cd ~/energy-app && python3 - <<'EOF'
+import json,urllib.request,urllib.error
+T=json.load(urllib.request.urlopen(urllib.request.Request(
+  'http://127.0.0.1:8090/api/auth/login',
+  data=json.dumps({'username':'demo@126.com','password':'demo123456'}).encode(),
+  headers={'Content-Type':'application/json'})))['token']
+for m,p in [('POST','/api/energy/repair-init'),('POST','/api/energy/demo-data')]:
+    r=urllib.request.Request('http://127.0.0.1:8090'+p,data=b'{}',method=m,
+        headers={'Content-Type':'application/json','X-Authorization':'Bearer '+T})
+    try: urllib.request.urlopen(r); print(m,p,'→ 可调（不该给客户）')
+    except urllib.error.HTTPError as e: print(m,p,'→',e.code)
+EOF
+```
+
+返回 403 的就是客户**不该看到**的入口；只要页面上还有按钮能触发它，就是前端漏判。
+
+**修法**：按 `!isCustomerUser` 隐藏该按钮，并给客户一句「请联系管理员」——
+客户需要的是下一步，而不是一句没头没尾的权限报错。
+
+> **为什么这类问题必须优先修**：演示现场客户点一下就看到「没有权限」，
+> 会认为**整个平台**都没给他权限，而不是「这个按钮不该给你」。第一印象很难挽回。
+>
+> **排查这类问题不要直接调有副作用的写接口试权限**。`DELETE /api/energy/demo-data`
+> 这类端点对客户是**合法可用**的（设计上允许客户清自己的演示数据），
+> 用客户 token 试一下就会真的把数据删光（本手册作者 2026-10-24 就这样误删过一次）。
+> 判断权限只看 403/200 时，先选**幂等的读接口**或带 `?dryRun=true` 的形式。
+
+### 现象 H6：清除演示数据后，「我的账单」里还有账单，但每行点开都是空的
+
+**现象**：客户点「清除演示数据」→ 设备列表空了，但账单页仍有十几张账单，
+每一行都指向已经不存在的表计。
+
+**根因**：账单资产（`type=energy_bill`）的 `additional_info` 是 null，**不带 `demo` 标记**，
+所以 `deleteDemoData` 的主循环不会删它们 —— 留下孤儿账单（实测清一次留 19 个）。
+
+**定位**：
+
+```bash
+docker compose exec -T postgres psql -U postgres -d thingsboard -tAc "
+SELECT count(*) AS orphan FROM asset a
+ WHERE a.type='energy_bill'
+   AND NOT EXISTS (SELECT 1 FROM device d WHERE d.id::text = a.name);"
+```
+
+**修法**：新版 `deleteDemoData` 会在删完设备后，扫描该客户的账单资产，
+读其 SERVER_SCOPE `deviceId` 属性 —— 设备已不存在就删账单，设备还在就保留
+（真实表计的账单不会被误伤）。重装/重启后端即生效。
+
+存量孤儿可以用接口逐个清（读 `deviceId` 属性判断，见本文档的运维 SQL 章节）。
+
 ### 现象 I：客户看板持续刷 403 + 404（同一个 id），几秒或一分钟一次
 
 **现象**：客户登录后，首页 Network 里反复出现**同一个 id**的两种请求：

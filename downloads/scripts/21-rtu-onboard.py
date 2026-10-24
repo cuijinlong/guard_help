@@ -182,24 +182,37 @@ def ensure_device(base, token, name, profile_id, customer_id, site_id, existing,
     if cur is None:
         d = api(base, "/api/device", token, method="POST", body=body)
         return d["id"]["id"], "新建"
-    # 已存在：档案 / 归属客户 / siteId / 网关标志不对就更新（保存接口是 upsert）
+    # 已存在：档案 / 归属客户 / siteId / 网关标志不对就更新
+    did = cur["id"]["id"]
+    notes = []
+    old_ai = cur.get("additionalInfo") or {}
+
+    # ★ 改归属客户必须走 owner API，不能靠保存设备。
+    #   直接 save 会报 400 "Entity owner can't be changed. Please use owner api"。
+    #   这条在「设备从旧客户迁到新客户」时必然遇到（2026-10-24 实测）——
+    #   演示现场换客户演示是常见操作。
+    if (cur.get("customerId") or {}).get("id") != customer_id:
+        api(base, "/api/customer/%s/device/%s" % (customer_id, did), token, method="POST")
+        notes.append("已换归属客户")
+        # 改归属会 version++。不重读的话，下面的 save 拿着旧 version 会报
+        # 409 "Device was already changed by someone else"（实测 2026-10-24）。
+        cur = api(base, "/api/device/%s" % did, token) or cur
+        old_ai = cur.get("additionalInfo") or {}
+
     need = False
     if (cur.get("deviceProfileId") or {}).get("id") != profile_id:
         need = True
-    if (cur.get("customerId") or {}).get("id") != customer_id:
-        need = True
-    old_ai = cur.get("additionalInfo") or {}
     if old_ai.get("siteId") != site_id:
         need = True
     if bool(old_ai.get("gateway")) != bool(is_gateway):
         need = True
-    if not need:
-        return cur["id"]["id"], "已存在"
-    body["id"] = {"entityType": "DEVICE", "id": cur["id"]["id"]}
-    body["version"] = cur.get("version")
-    body["createdTime"] = cur.get("createdTime")
-    api(base, "/api/device", token, method="POST", body=body)
-    return cur["id"]["id"], "已修复"
+    if need:
+        body["id"] = {"entityType": "DEVICE", "id": did}
+        body["version"] = cur.get("version")
+        body["createdTime"] = cur.get("createdTime")
+        api(base, "/api/device", token, method="POST", body=body)
+        notes.append("已修复")
+    return did, " · ".join(notes) if notes else "已存在"
 
 
 def ensure_token(base, token, device_id, wanted):
@@ -216,6 +229,38 @@ def ensure_token(base, token, device_id, wanted):
     }
     api(base, "/api/device/credentials", token, method="POST", body=body)
     return wanted, "已设为固定值"
+
+
+def drop_stale_relations(base, token, site_id, device_id, all_sites):
+    """删掉「旧场站 --Contains--> 这台设备」的关系。
+
+    ★ 为什么必须删（2026-10-24 实测）：
+      设备换客户时，owner API 只改归属，**不会动关系**。于是同一台设备同时挂在
+      旧客户的场站和新客户的场站下。症状非常隐蔽：
+        抄表树的节点名显示「单相园区·星河工业园」，但设备归属其实是新客户
+        —— 客户在演示中心里看到别的公司的场站名，像数据串台。
+      这里按「所有不属于本场站的 Contains 父边」清理，幂等。
+    """
+    removed = 0
+    for sid, sname in all_sites:
+        if sid == site_id:
+            continue
+        try:
+            rels = api(base, "/api/relations?fromId=%s&fromType=ASSET&relationType=Contains"
+                              "&relationTypeGroup=COMMON" % sid, token) or []
+        except RuntimeError:
+            continue
+        for r in rels:
+            to = r.get("to") or {}
+            if to.get("entityType") == "DEVICE" and to.get("id") == device_id:
+                q = urllib.parse.urlencode({
+                    "fromId": sid, "fromType": "ASSET",
+                    "relationType": "Contains", "relationTypeGroup": "COMMON",
+                    "toId": device_id, "toType": "DEVICE"})
+                api(base, "/api/relation?" + q, token, method="DELETE")
+                removed += 1
+                print("      已清理旧关系：%s → 设备" % sname)
+    return removed
 
 
 def ensure_relation(base, token, site_id, device_id):
@@ -273,6 +318,16 @@ def main():
     sid = site["id"]["id"]
     print("场站：%s（%s）" % (site.get("name"), sid[:8]))
 
+    # 租户下全部场站：迁移设备时要靠它找出「旧场站 → 设备」的残留父边
+    all_sites = []
+    for c in paged(base, "/api/customers", token):
+        try:
+            for a in paged(base, "/api/customer/%s/assets" % c["id"]["id"], token):
+                if a.get("type") == "场站":
+                    all_sites.append((a["id"]["id"], a.get("name") or ""))
+        except RuntimeError:
+            pass
+
     profiles = profile_map(base, token)
     missing = [p for p in (PROFILE_GATEWAY, PROFILE_METER, PROFILE_SENSOR, PROFILE_RELAY)
                if p not in profiles]
@@ -317,6 +372,8 @@ def main():
             did, action = ensure_device(base, token, name, profiles[prof], cid, sid, existing,
                                         is_gateway=(name == GATEWAY_NAME))
             notes = [action]
+            # 换客户后旧场站的父边还在 —— 先清掉，否则抄表树会显示旧客户的场站名
+            drop_stale_relations(base, token, sid, did, all_sites)
             notes.append(ensure_relation(base, token, sid, did))
             if level is not None:
                 notes.append(ensure_attr(base, token, did, {"meterLevel": level}))

@@ -259,6 +259,105 @@ python3 scripts/20-rtu-simulator.py \
 
 现场把 `--mqtt-host/--mqtt-port` 换成平台地址与 `11883`。
 
+### 演示专用客户「平台演示中心」：真机 + 模拟混跑
+
+平台自留一个客户账号专门用于演示（不对外发放、不随客户销户清理）：
+
+| 项 | 值 |
+| --- | --- |
+| 客户名 | `平台演示中心` |
+| 账号 | `demo@126.com` / `demo123456` |
+| 角色 | CUSTOMER_USER（与普通客户完全一致，能验证客户侧全部权限） |
+
+**分工：谁能真机演、谁只能模拟**
+
+| 品种 | 出数来源 | 原因 |
+| --- | --- | --- |
+| 单相电 | **真实 RTU**（`PowerMeter-DDSU777`） | 现场带板子，能证明"平台真能接设备" |
+| 单相电（其余演示表） | 模拟器 | 一台 RTU 只能覆盖一块表 |
+| 三相电 | 模拟器 | 没有三相表，测不到三相电压/电流/不平衡度 |
+| 水 / 燃气 / 蒸汽 | 模拟器 | 没有水气汽表 |
+| 温湿度（非 RTU 那台） | 模拟器 | 同上 |
+
+#### 启动模拟（演示前 1 分钟执行）
+
+```bash
+cd ~/energy-app
+python3 scripts/23-demo-simulator.py \
+  --base http://127.0.0.1:8090 \
+  --tenant tenant@126.com --tenant-pass '12345678' \
+  --customer 平台演示中心 \
+  --interval 60 --rebuild-totals
+```
+
+它给 **19 台**不能真机演的表持续上报（跳过 RTU 那 4 台，避免两个源同时写表底）：
+
+```
+electric 11 / gas 2 / sensor 2 / steam 2 / water 2
+```
+
+**常用开关**
+
+| 开关 | 作用 |
+| --- | --- |
+| `--once` | 只跑一轮（验收/自检用） |
+| `--dry-run` | 只打印会写什么，不落库 |
+| `--interval 60` | 每 60 秒一批；演示节奏建议 30~60 秒 |
+| `--rebuild-totals` | 每轮顺带重算资产汇总（看板"选场站"维度才跟着更新） |
+| `--only 三相` | 只模拟名字含"三相"的设备 |
+| `--skip 水表,燃气` | 跳过某些设备 |
+| `--include-rtu` | 连 RTU 四台也模拟（**真机在跑时别开**，会打架） |
+
+**它不会做的事（刻意留白）**
+
+- **不模拟虚拟表**（`空调虚拟表` / `其他虚拟水表`）：那两台是"手工填报"页的载体，
+  只有月首点。自动上报会让手工填报的演示自相矛盾。
+- **不覆盖历史**：只往当前时间往后写。历史 14 天是初始化时生成的静态数据。
+- **不改表底起点**：首次运行从库内最新 `energy_reading` 接着涨，不会倒走。
+
+**数据模型（改错会让看板空白）**
+
+```
+电表      energy（本周期增量） energy_reading（累积表底，单调递增） power_total
+          voltage_a [current_a]        三相另有 _b / _c、voltage_unbalance、power_factor_*
+水/气/汽   energy  energy_reading  power
+温湿度     temperature  humidity
+```
+
+> **表底必须单调递增，且父表增量 >= 子表之和。**
+> 脚本按平台已有的 `Contains` 关系建树，父表功率 = 子表实际值之和 × 1.04（线损），
+> 天然满足 `08-verify-release.sh` 的「演示用电层级守恒」断言。
+> 父表功率**必须由子表实际值汇总**，不能各算各的 —— 否则抖动叠加后
+> 子表之和会超过父表，验收当场失败。
+
+#### 演示前 60 秒自检清单
+
+```bash
+# ① RTU 四台在线？（应为 active=True）
+python3 scripts/22-watch-rtu.py --base http://127.0.0.1:8090 \
+  --tenant tenant@126.com --tenant-pass '12345678' \
+  --customer customer@126.com --customer-pass '12345678' --seconds 10
+
+# ② 模拟器一轮能不能写进去？（应为 19/19 成功）
+python3 scripts/23-demo-simulator.py \
+  --base http://127.0.0.1:8090 --tenant tenant@126.com --tenant-pass '12345678' \
+  --customer 平台演示中心 --once
+```
+
+两项都过 → 登录 `demo@126.com` 开始演示。
+
+#### 设备从旧客户迁到新客户（脚本会自动处理）
+
+`21-rtu-onboard.py` 换客户时会做三件事，缺一件就会出现"看起来串台"：
+
+1. **改归属**：走 `POST /api/customer/{cid}/device/{did}`（owner API）。
+   直接保存设备会报 `Entity owner can't be changed`。
+2. **清旧关系**：删掉「旧场站 --Contains--> 这台设备」。
+   不删的话，抄表树的节点名会显示**旧客户的场站名** —— 设备归属是对的，
+   但客户在演示中心里看到别家公司的名字（2026-10-24 实测踩过）。
+3. **重读版本号**：改归属会 `version++`，不重读就保存会报
+   `409 Device was already changed by someone else`。
+
 #### 固件侧要核对的四组配置
 
 `rtu/main.py` 顶部「配置区」逐条核对，上电后串口第一屏会原样回显（「配置自检」）：
