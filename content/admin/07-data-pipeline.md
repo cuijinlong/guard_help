@@ -621,10 +621,16 @@ AssetTotalsScheduler（guard-server）
   每 1 小时一轮，启动后延迟 5 分钟
     ↓
   rebuildAssetTotals(tenantId, customerId, backfillDays=2)
-    ↓  按「设备 → 所属场站 / 分项 / 组织」分组
+    ↓  按「设备 → 所属场站 / 分项 / 组织 / 维度容器」分组
     ↓  组内同品种只取 meterLevel 最小者（避免总表 + 分表重复计电）
     ↓  按 ts 覆盖写 energy_total / energy_day / power_total
 ```
+
+**维度容器也要写**：`用电分项 / 用能区域 / 用能性质 / 空间位置` 四个维度下，
+每个场站都有一个「场站分组」节点。它没有 `Contains` 关系，靠 SERVER_SCOPE 的
+`siteId` 属性指向场站（与设备同一口径）。不写这些节点，**区域能耗 / 综合能耗 /
+能源流向**三个页面就是整页空白 —— 而同一页的排名部件走设备级数据，照样有数，
+看起来就像图表坏了。
 
 **为什么不用规则链**：规则链是逐条消息触发的，一台表每小时一个点，
 一次汇总要读该场站下**全部**表的历史。逐条触发等于每点都全量重算，
@@ -645,7 +651,7 @@ energy.asset-totals.refresh.interval-ms=3600000
 curl -s -X POST -H "X-Authorization: Bearer $TOKEN" \
   'http://127.0.0.1:8090/api/energy/asset-totals/rebuild' \
   -H 'Content-Type: application/json' -d '{"days":2}'
-# → {"assetsWritten": 13}
+# → {"assetsWritten": 25}      ← 随客户资产规模变化（分项 + 维度容器 + 组织）
 ```
 
 **窗口必须对齐整天**：`rebuildAssetTotals` 的起点是「今天 00:00 往前推 N−1 天」，
@@ -673,6 +679,11 @@ curl -s -X POST -H "X-Authorization: Bearer $TOKEN" \
 
 > 历史版本把品种放在优先级第一（`targetMode=kind`），于是「接口 200 + 空对象」
 > 被当成正常，页面四张卡全 0。这是 2026-10-23 修复的核心。
+
+**统计图还要再下一层**：选中节点是「维度根 / 场站分组」这类**组织节点**时，
+它们本身没有遥测，真实分项在下一层。`asset_stats_chart` / `distribution_chart`
+会沿 `Contains` 展开到叶子资产（带 visited 去重 —— 维度树不是严格树，同一资产会
+挂在多个父下），每个叶子画一条序列。
 
 **部件额外做的过滤**：`00000000-0000-0000-0000-…` 开头的占位哨兵 id 一律跳过。
 客户看板里「能源参数字典」「电能品种」保留占位符，是**有意为之** ——

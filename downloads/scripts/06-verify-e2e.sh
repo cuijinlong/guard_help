@@ -469,9 +469,11 @@ NDASH=$(TAPI '/api/tenant/dashboards?pageSize=100&page=0' | jget "d.get('totalEl
 # 少了这一步，客户登录后侧边栏的仪表板是空的，而租户管理员看得到 —— 极难察觉。
 if [[ -n "$CTOK" && -n "${CID:-}" ]]; then
   NCD=$(CAPI "/api/customer/$CID/dashboards?pageSize=100&page=0" | jget "d.get('totalElements',0)")
-  [[ "${NCD:-0}" -ge 20 ]] \
-    && ok_ "客户可见仪表板 ${NCD} 个（已复制到客户名下）" \
-    || bad_ "客户只看得到 ${NCD:-0} 个仪表板" "需要把看板复制给客户，不是仅 assign"
+  # 18 = 20 份客户报表模板 − 2 份租户专用运营台（客户能源档案 / 峰谷时段）。
+  # 后两者的部件全调租户级 API，客户打开就是一片 403，复制时已跳过。
+  [[ "${NCD:-0}" -ge 18 ]] \
+    && ok_ "客户可见仪表板 ${NCD} 个（已复制到客户名下，不含租户专用台）" \
+    || bad_ "客户只看得到 ${NCD:-0} 个仪表板（应 ≥18）" "需要把看板复制给客户，不是仅 assign"
 fi
 
 # 报表数值必须与原始遥测一致：这是「数据准不准」的最终判据

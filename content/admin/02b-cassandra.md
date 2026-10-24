@@ -216,6 +216,16 @@ bash scripts/ts-mirror.sh --clean  # 删镜像（切回 sql 之前必须跑）
 ③ 建视图 ts_kv（key 列就是 key_id，与原 SQL 完全兼容）
 ```
 
+> **`json_v` 为什么是 text 而不是 jsonb**
+>
+> Cassandra 的 `COPY TO` 用 `\"` 转义双引号，PostgreSQL 的 `COPY FROM CSV`
+> 只认 `""` —— 两套转义不同。含引号的 JSON（规则链调试输出
+> `{"ruleNodeId":"..."}`）会被读成字面 `\"`，jsonb 直接拒收；而 COPY 是原子的，
+> **一行失败整批 0 行**，镜像静默变成空表，后面所有数据类验收全部失效。
+>
+> 镜像表只用于「按 TB 原生结构写验收 SQL」，`json_v` 不需要 jsonb 操作符，存 text 足够。
+> 实测 2026-10-24：14 万行里有 1 行这种数据，整批导入失败。
+
 `04/06/08` 开头会自动调用它，**验收 SQL 一行都不用改**。
 后端是 `sql` 时它什么也不做（PG 本来就有真表）。
 

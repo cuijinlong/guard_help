@@ -98,8 +98,20 @@ fi
 log "导入 Postgres 镜像表（${ROWS} 行）"
 docker cp /tmp/energy-ts-mirror.csv energy-postgres:/tmp/energy-ts-mirror.csv >/dev/null
 
+# json_v 用 text 而不是 jsonb：Cassandra 的 COPY TO 用 \" 转义双引号，
+# 而 PostgreSQL 的 COPY FROM CSV 只认 "" —— 两套转义不同，含引号的 JSON
+# （如规则链调试输出 {"ruleNodeId":"..."}）会被读成字面 \"，jsonb 直接拒收。
+# COPY 是原子的：一行失败整批 0 行，镜像静默变成空表，后面所有数据类验收都失效
+# （实测 2026-10-24，14 万行里有 1 行这种数据）。
+#
+# 本表只用于「按 TB 原生 ts_kv 结构写验收 SQL」，json_v 不需要 jsonb 操作符，
+# 存 text 足够；真后端（Cassandra）里它本来就是 text 语义。
+#
+# 每次重建而不是 TRUNCATE：列类型改过，旧表的 jsonb 约束会挡住新数据。
 $PSQL <<'SQL'
-CREATE TABLE IF NOT EXISTS ts_kv_mirror (
+DROP VIEW IF EXISTS ts_kv;
+DROP TABLE IF EXISTS ts_kv_mirror;
+CREATE TABLE ts_kv_mirror (
   entity_type varchar(32),
   entity_id   uuid,
   key         varchar(255),
@@ -107,11 +119,10 @@ CREATE TABLE IF NOT EXISTS ts_kv_mirror (
   ts          bigint,
   bool_v      boolean,
   dbl_v       double precision,
-  json_v      jsonb,
+  json_v      text,
   long_v      bigint,
   str_v       varchar(1000000)
 );
-TRUNCATE ts_kv_mirror;
 SQL
 
 docker compose --profile split exec -T postgres \
