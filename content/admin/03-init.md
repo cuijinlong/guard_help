@@ -29,12 +29,34 @@
 | 11b | 场站 | 建客户时自动 | 2 个（直接挂在根组织下） | 设备无处可挂 |
 | 12 | 分项 | 建客户时自动 | 7 个 | 无法按用途统计 |
 | 13 | 设备（三级计量） | 建客户时自动 | 11 电表 + 6 水气汽 + 2 温湿度 + 2 虚拟 | 报表无数据 |
-| 14 | 演示遥测 | 建客户时自动 | 14 天 × 24 点 ≈ 11 万条 | 图表全空 |
+| 13b | 设备能源分项属性 `energyCategory` | 建客户时自动 | 每台计量设备一个（total/power/lighting/hvac/water_utility/gas/steam） | AI 三页「按分项」下拉全灰、按分项分析 0 台设备 |
+| 14 | 演示遥测 | 建客户时自动 | **62 天** × 24 点 ≈ 56 万条 | 图表全空；「按月」查询前半月空白、环比虚高 |
 | 15 | 仪表板 | 建客户时复制 | 客户 18 个（租户模板 20，其中「客户能源档案」「峰谷时段」是运营台，不复制） | 没有可视化 |
 | 16 | 租户菜单 | 建租户时自动 | 11 个顶层项 | 租户看不到能源入口，只剩 TB 原生菜单 |
 | 17 | 客户菜单 | 建客户时自动 | 13 个顶层项 | 左侧是 TB 原生菜单 |
 
 **全部自动**。手工只需要在「补」的时候用。
+
+### 存量数据：第 13b 项怎么自查 / 补齐
+
+`energyCategory` 是 2026-10-24 才加进初始化代码的。之前建的客户没有这个字段，
+表现为：**负载预测 / 用能建议 / 用能质量里的「按分项」全是灰的，选不了**。
+
+```bash
+# 检查（退出码 1 = 有设备缺）
+python3 scripts/24-device-categories.py --check
+
+# 补齐（幂等，只补空值，不动已有值）
+python3 scripts/24-device-categories.py --fix
+```
+
+它按「设备档案 + 设备名 + 分项」推导：水表→`water_utility`、燃气→`gas`、
+蒸汽→`steam`、进线总表→`total`、动力/空压/车床→`power`、照明/插座→`lighting`、
+空调→`hvac`。温湿度、网关、继电器、虚拟表不写。
+
+> 属性齐了以后，「按分项」还需要租户在 AI 侧**发布一次分项绑定**才会出现在下拉里。
+> 绑定是运营动作，不是初始化动作：`POST /ngxapi/models/<model_id>/publish`，
+> `scope_type=category`、`scope_value` 取上面的值。详见「数据流处理 · 6.9」。
 
 ### 还有一类「不在这张表里」的初始化：自建表
 
@@ -216,7 +238,7 @@ docker compose exec cassandra cqlsh -e   "SELECT table_name FROM system_schema.t
 | --- | --- | --- |
 | ① | 电表 Key 标准化节点（**租户级**规则链） | RTU 原始代号落库，报表读不到数 |
 | ② | 4 个维度根（用电分项 / 用能区域 / 用能性质 / 空间位置） | 用能结构页空白 |
-| ③ | 演示数据包（2 场站 / 21 设备 / 逐小时遥测） | 装完看不到效果 |
+| ③ | 演示数据包（2 场站 / 21 设备 / **62 天**逐小时遥测） | 装完看不到效果；「按月」查询前半月空白 |
 | ④ | 组织 + **演示费率** | 出账全部「未配置电价」跳过 |
 
 ④ 必须在 ③ 之后 —— 组织要把演示场站挂到自己名下。
@@ -230,7 +252,7 @@ docker compose exec cassandra cqlsh -e   "SELECT table_name FROM system_schema.t
 
 ## 一之四、演示数据：生成、清除、换成自己的
 
-新客户建出来时带一套演示数据（2 个场站、21 台设备、14 天遥测），
+新客户建出来时带一套演示数据（2 个场站、21 台设备、**62 天**逐小时遥测），
 目的是**装完就能看到完整效果**，不用等 RTU 接入。
 
 但它只是样板。接入真实设备后的正确做法是：
@@ -411,7 +433,7 @@ bash scripts/08-verify-release.sh \
   --customer customer@126.com --customer-pass '12345678'
 ```
 
-**期望**：`通过 78 项` / `这一版的功能点全部到位`。
+**期望**：`通过 81 项` / `这一版的功能点全部到位`。
 
 这个脚本把**这一版每一处改动**变成断言，重装后跑一遍就知道有没有漏：
 
@@ -427,6 +449,9 @@ bash scripts/08-verify-release.sh \
 | C3 | 客户菜单无孤儿（每条都挂在某个客户上）+ 拓扑图无悬空边 |
 | G | 前端产物（5 个新页面/样式特征串真的打进包了） |
 | H | 计量配置端点 · SQL 埋点 · 资产汇总遥测 · 客户可重算汇总 |
+| I-7 | 计量设备的 `energyCategory` 齐全（AI 三页「按分项」的唯一依据） |
+| I-8 | 能源分析看板未被锁在单一场站（数据源应为组织） |
+| I-9 | 节能记录演示数据 ≥ 3 条 |
 
 **资产汇总不再需要手工点**：`AssetTotalsScheduler` 默认每小时重算一次
 （启动后延迟 5 分钟），窗口是「昨天 00:00 至今」。客户接了自己的 RTU 之后，
@@ -925,6 +950,152 @@ energy_reading[n] = base + Σenergy[0..n]
 Σ(尖峰平谷深谷) = energy
 上级表 = 下级之和 × (1+未装表率) × (1+线损率)
 ```
+
+### 节能记录（saving_record 资产）
+
+演示包自带 3 条记录，覆盖三种状态：
+
+| 项目 | 状态 | 说明 |
+| --- | --- | --- |
+| 空压机组错峰启停 | 已核验 | 实际节电 12,480 kW·h，达标 |
+| 办公区照明 LED 改造 | 待核验 | 目标按年化填，还没核验 |
+| 车床组变频改造 | 未达预期 | 只做到目标的 62% |
+
+属性键必须与 `energy_management.saving_records` 部件读取的一致：
+`projectName / siteId / siteName / measureType / implementDate /
+baselineFrom / baselineTo / verifyFrom / verifyTo / baselineDaily /
+verifyDaily / actualSaving / targetSaving / targetBasis / costSaving /
+verifyStatus / owner / deviceId / remark`。写错键名页面不报错，只是那列显示「—」。
+
+**存量客户补齐**：点「生成演示数据」（`POST /api/energy/demo-data`）即可，
+补齐逻辑幂等，已存在的记录不会重复建。
+
+```sql
+-- 每个客户的节能记录条数与状态分布
+SELECT c.title AS 客户,
+       count(*) AS 记录数,
+       count(*) FILTER (WHERE v.str_v = 'verified')  AS 已核验,
+       count(*) FILTER (WHERE v.str_v = 'pending')   AS 待核验,
+       count(*) FILTER (WHERE v.str_v = 'shortfall') AS 未达预期
+FROM asset a
+JOIN customer c ON c.id = a.customer_id
+LEFT JOIN attribute_kv v ON v.entity_id = a.id
+     AND v.attribute_key = (SELECT key_id FROM key_dictionary WHERE key = 'verifyStatus')
+WHERE a.type = 'saving_record'
+GROUP BY c.title;
+```
+
+---
+
+### 能源分析看板的数据源：必须指向「组织」
+
+综合能耗 / 能耗洞察 / 能源流向 / 电能质量 / 盘查报告 这五个看板的
+「场站」数据源别名，早期被替换成**单相园区**那一个场站，导致：
+
+- 「场站能耗排名」只有一行
+- 能源构成里缺了三相园那台 12 t/天的生产蒸汽表，蒸汽占比虚高
+- KPI 只统计了客户一半的用能
+
+现在模板用占位符 `…05a2`（= 客户组织），部件按「组织 → 场站 → 分项 → 设备」
+递归展开，覆盖整个客户。**新客户自动正确**。
+
+存量客户跑一次修复脚本：
+
+```bash
+python3 scripts/25-fix-analysis-scope.py            # 预演
+python3 scripts/25-fix-analysis-scope.py --apply    # 执行
+```
+
+> **改模板后一定要推库。** 看板模板只在首次安装时导入一次，
+> 之后改仓库 JSON 不会自动生效 —— 新建客户复制的仍是库里那份旧模板。
+> 改完跑：
+>
+> ```bash
+> python3 scripts/26-sync-dashboard-templates.py --apply
+> ```
+>
+> 它按标题更新租户级模板，不碰客户副本。存量客户副本另用
+> `25-fix-analysis-scope.py` 或重建客户。
+
+自查 SQL（正常应为 0）：
+
+```sql
+SELECT d.title AS 看板, d.customer_id, a.type AS 数据源类型
+FROM dashboard d
+JOIN jsonb_each(d.configuration::jsonb->'entityAliases') al ON true
+JOIN asset a ON a.id = (al.value->'filter'->'singleEntity'->>'id')::uuid
+WHERE d.customer_id IS NOT NULL
+  AND d.title IN ('综合能耗','能耗洞察','能源流向','电能质量','盘查报告')
+  AND a.type = '场站';
+```
+
+---
+
+### 查询设置：「不勾选 = 当前品种全部」
+
+报表类看板（历史能耗 / 基础报表 / 参数报表 / 峰谷分析）的左侧都有「查询设置」，
+上方写着「不勾选＝看当前品种全部」。这句话现在是**真的**：
+
+- 不勾选任何设备 → 下发该品种下的**全部设备**，图表和表格直接出全量
+- 勾选父节点 → 该子树（含下属设备，父子自动去重）
+- 勾选多个末级设备 → 这几台的并集
+
+2026-10-25 之前不勾选时只下发 `sourceId`（品种资产）、`devices` 为空，
+结果部件看到空设备列表就渲染「请先在左侧选择设备并点击查询」——
+文案与行为自相矛盾，客户不勾选永远查不出东西。
+
+> 这条对「抄表功能」同样成立：不勾选即抄该品种全部表。抄表有副作用
+> （会写抄表批次），演示时先确认范围再点「一键抄表」。
+
+---
+
+### 时间覆盖：62 天逐小时（2026-10-25 起）
+
+演示遥测覆盖**建客户当天往前 62 天**的每个整点，21 台设备共约 56 万点。
+
+**为什么是 62 天而不是 14 天**：所有报表的时间范围控件都有「按月」档位，
+选中后区间是**本月 1 日 00:00 ~ 本月最后一天**。14 天的数据只能覆盖月中的
+两周，月初建的客户选「本月」会看到前半月全是空白 —— 客户会当成功能坏了。
+
+**为什么不是 31 天（够本月就行）**：「综合能耗 / 能耗洞察 / 盘查报告」都带
+「较上一周期」。选本月时上一周期是**上月同期**，只有 31 天时上月只剩几天，
+环比会算出 `+2818%` 这种数字，演示现场第一句质疑就是「你们这数据不对吧」。
+62 天让上月完整，环比回到正常量级。
+
+| 查询档位 | 区间 | 演示数据是否覆盖 |
+| --- | --- | --- |
+| 按日（今天） | 今天 00:00 至今 | ✅ 完整 |
+| 按日（近 7 天） | 7 天前至今 | ✅ 完整 |
+| 按月（本月） | 本月 1 日 ~ 月末 | ✅ 完整 |
+| 按月（上月） | 上月 1 日 ~ 月末 | ✅ 完整（环比有可比基数） |
+| 近 30 天 | 30 天前至今 | ✅ 完整 |
+| 近 90 天 | 90 天前至今 | ⚠️ 只覆盖最近 62 天 |
+| 按年（今年） | 1 月 1 日 ~ 12 月 31 日 | ⚠️ 只覆盖最近 62 天，年初段为空 |
+| 按年（去年） | 去年全年 | ❌ 无数据 |
+
+> 「按年」不覆盖整年：一年 ≈ 340 万点/客户，建客户要一小时，得不偿失。
+> 演示只需要证明「按年视图能出图」，客户问起来就这么解释。
+
+**覆盖度自查 SQL**（每台表应 ≥ 60 天）：
+
+```sql
+SELECT d.name AS 设备,
+       count(DISTINCT date_trunc('day', to_timestamp(t.ts/1000)
+             AT TIME ZONE 'Asia/Shanghai')) AS 覆盖天数,
+       to_char(to_timestamp(min(t.ts)/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD') AS 起,
+       to_char(to_timestamp(max(t.ts)/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 止
+FROM device d
+JOIN ts_kv t ON t.entity_id = d.id
+JOIN key_dictionary k ON k.key_id = t.key
+WHERE k.key = 'energy'
+  AND d.customer_id = '<客户id>'
+GROUP BY d.name
+ORDER BY 覆盖天数, d.name;
+```
+
+**存量客户只有 14 天怎么办**：删客户重建（`09-onboard-customer.sh` 幂等，
+同邮箱会复用客户但**不会补历史遥测**），或者先「清除演示数据」再
+「生成演示数据」—— 后者按当前代码重新生成，会带满 31 天。
 
 ---
 
@@ -1794,6 +1965,10 @@ DELETE /api/customer/asset/{assetId}                    取消（归还租户）
 
 系数就是配置的线损与未装表：进线 1.025（2.5% 线损），
 车间 1.1124（3% 线损 + 8% 未装表）。
+
+> 上面这组数字是 2026-10-23 的实测快照，当时演示数据是 14 天。
+> 2026-10-25 起改为 **31 天**（「按月」查询需要整月有数），
+> 绝对值会变大，但**系数关系不变** —— 断言看的是比例，不是绝对值。
 
 ### 「总分差」是物理量，不是误差
 

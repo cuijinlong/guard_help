@@ -58,7 +58,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=78
+EXPECTED_PASS=81
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -1031,6 +1031,48 @@ else
     printf '  \033[33m  - 跳过：日志里没有埋点开关记录（容器可能刚重启未打印）\033[0m\n'
   fi
 fi
+
+# I-7. 计量设备的「能源分项」属性必须齐全
+#
+#       AI 三页的「按分项」全靠 device.additional_info.energyCategory：
+#       为空 → 分项下拉 disabled、按分项分析 0 台设备、「分项」汇总落到「其他」。
+#       新建客户由 EnergyBootstrapInstaller 按「档案 + 分项 + 层级」自动写入；
+#       这条断言防的是存量数据 / 手工建的设备，以及今后改初始化代码时漏写。
+CAT_MISSING=$(DASH_DB "
+select count(*) from device d join device_profile p on p.id = d.device_profile_id
+where (p.name like '%电能%' or p.name like '%水表%' or p.name like '%燃气%' or p.name like '%蒸汽%')
+  and coalesce(d.additional_info::jsonb->>'deviceVirtual','') <> 'virtual'
+  -- 区域汇总表（办公区总表）有意不参与分项聚合，不算缺失；判据与
+  -- EnergyBootstrapInstaller#resolveEnergyCategory 保持一致
+  and not (d.name like '%总表%' and d.name not like '%进线%' and d.name not like '%动力%'
+           and d.name not like '%照明%' and d.name not like '%插座%' and d.name not like '%空调%')
+  and coalesce(nullif(d.additional_info::jsonb->>'energyCategory',''),'') = ''")
+eq "计量设备都有能源分项属性" "${CAT_MISSING:-0}" "0" \
+   "跑 scripts/24-device-categories.py --fix（幂等，只补空值）；新装客户由初始化自动写入"
+
+# I-8. 能源分析类看板的数据源必须覆盖整个客户
+#
+#       综合能耗 / 能耗洞察 / 能源流向 / 电能质量 / 盘查报告 的「场站」别名
+#       曾指向占位符 …05a1（= 单相园区），复制给客户后范围被锁在一个场站：
+#       场站排名只出一行、能源构成缺了三相园的生产蒸汽表（实测 2026-10-25）。
+#       现在模板用 …05a2（= 客户组织）。这条断言防回退。
+SCOPE_BAD=$(DASH_DB "
+select count(*) from dashboard d
+join jsonb_each(d.configuration::jsonb->'entityAliases') al on true
+join asset a on a.id = (al.value->'filter'->'singleEntity'->>'id')::uuid
+where d.customer_id is not null
+  and d.title in ('综合能耗','能耗洞察','能源流向','电能质量','盘查报告')
+  and a.type = '场站'")
+eq "能源分析看板未被锁在单一场站" "${SCOPE_BAD:-0}" "0" \
+   "看板的「场站」数据源应指向客户组织（type=组织），不是某个 type=场站 的资产；跑 scripts/25-fix-analysis-scope.py --apply"
+
+# I-9. 节能记录演示数据
+#
+#       页面是 saving_record 资产驱动。没造数据时列表 0 条、三张 KPI 全 0，
+#       客户会以为功能没做完。演示包按三种状态各造一条。
+SAVING_N=$(DASH_DB "select count(*) from asset where type='saving_record'")
+ge "节能记录演示数据" "${SAVING_N:-0}" 3 \
+   "重建客户（09-onboard-customer.sh）或对已有客户调 POST /api/energy/demo-data 补齐"
 
 # ================================================================
 echo

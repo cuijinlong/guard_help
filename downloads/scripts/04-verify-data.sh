@@ -301,10 +301,16 @@ for d in meters:
                     bad_day.append((d, t, day[t], acc))
                     break
 
-    # 峰谷守恒
+    # 峰谷守恒。
+    #
+    # 只看整点：模拟器与真实 RTU 都会在**当前时刻**（如 20:56）写一个实时点，
+    # 那一小时还没走完 —— 平台的分时拆分（energy_tip/peak/flat/…）按整点结算，
+    # 实时点上自然是 0，拿它做断言会把正常数据判成缺陷（实测 2026-10-24）。
     parts = {k: dict(series(d, k)) for k in
              ("energy_tip", "energy_peak", "energy_flat", "energy_valley", "energy_deep")}
     for t, v in e.items():
+        if t % 3600000:
+            continue
         s = sum(parts[k].get(t, 0.0) for k in parts)
         if abs(s - v) > EPS:
             bad_tou.append((d, t, s, v))
@@ -390,8 +396,10 @@ for d in meters:
             if abs(s - v) > 0.02:
                 p_sum_bad.append((d, t, r2(s), v))
                 break
-        # 1 小时粒度下 平均功率(kW) 数值上等于 该小时电量(kWh)
-        if t in e and abs(v - e[t]) > 0.02:
+        # 1 小时粒度下 平均功率(kW) 数值上等于 该小时电量(kWh)。
+        # 同样只看整点：非整点实时点上的 energy 是「本小时到此为止」的累计，
+        # power_total 是瞬时值，两者本来就不相等。
+        if t % 3600000 == 0 and t in e and abs(v - e[t]) > 0.02:
             u_bad.append((d, t, v, e[t]))
             break
     for t, v in pf.items():

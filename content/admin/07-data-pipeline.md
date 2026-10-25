@@ -992,6 +992,107 @@ python3 scripts/27-customer-surface-probe.py \
 
 ---
 
+### 6.9 能源分项属性：AI 三页「按分项」的唯一依据
+
+**位置**：设备的 `additional_info.energyCategory`（不是资产属性，也不是 SERVER_SCOPE 遥测）。
+
+AI 侧三个页面都按它聚合：
+
+| 页面 | 用法 |
+| --- | --- |
+| 负载预测 · 按分项 | `/ngxapi/biz/targets` 返回 `scope_type=category` 的已发布绑定 |
+| 用能建议 · 按分项 | `/ngxapi/biz/advice-targets`，再把该分项展开成设备列表 |
+| 用能质量 · 分项口径 | 同上，按分项汇总评分 |
+
+**取值表**（与 `ngx-ai/backend/app/api/biz.py` 的 `CATEGORY_LABELS` 一一对应）：
+
+| 值 | 显示名 | 谁该有 |
+| --- | --- | --- |
+| `total` | 总用电 | 进线总表 |
+| `power` | 动力用电 | 车间动力、空压机、车床 |
+| `lighting` | 照明插座 | 照明、插座回路 |
+| `hvac` | 空调 | 空调分项 |
+| `water_utility` | 用水 | 水表 |
+| `gas` | 燃气 | 燃气表 |
+| `steam` | 蒸汽 | 蒸汽表 |
+
+温湿度、网关、继电器、虚拟表**不写**这个字段 —— 它们不参与用能分项聚合。
+
+**空值会怎样**：分项下拉全灰、按分项分析「0 台设备」、分项汇总落到「其他」。
+页面不报错，只是没法选。
+
+**谁负责写入**：
+
+- 新装客户：`EnergyBootstrapInstaller#createDevice` 按「设备档案 + 所在分项 + 计量层级」
+  自动写入，不需要额外步骤。
+- 存量数据：跑脚本补齐（幂等，只补空值，不动已有值）。
+
+```bash
+# 检查（退出码 1 = 有缺失）
+python3 scripts/24-device-categories.py --check
+
+# 补齐
+python3 scripts/24-device-categories.py --fix
+
+# 只看会改哪些
+python3 scripts/24-device-categories.py --fix --dry-run
+```
+
+**运维 SQL：按客户看哪些计量设备还没分类**
+
+```sql
+SELECT c.title AS 客户, p.name AS 档案, d.name AS 设备
+FROM device d
+JOIN device_profile p ON p.id = d.device_profile_id
+JOIN customer c ON c.id = d.customer_id
+WHERE (p.name LIKE '%电能%' OR p.name LIKE '%水表%'
+       OR p.name LIKE '%燃气%' OR p.name LIKE '%蒸汽%')
+  AND coalesce(nullif(d.additional_info::jsonb->>'energyCategory',''),'') = ''
+ORDER BY c.title, p.name, d.name;
+```
+
+**运维 SQL：每个分项下有几台表、多少设备**
+
+```sql
+SELECT coalesce(nullif(d.additional_info::jsonb->>'energyCategory',''),'(未分类)') AS 分项,
+       count(*) AS 设备数,
+       count(*) FILTER (WHERE p.name LIKE '%电能%') AS 电表,
+       count(*) FILTER (WHERE p.name NOT LIKE '%电能%') AS 水气汽表
+FROM device d
+JOIN device_profile p ON p.id = d.device_profile_id
+WHERE d.customer_id = '<客户id>'
+GROUP BY 1
+ORDER BY 2 DESC;
+```
+
+> 分项绑定（`scope_type=category`）由租户在 AI 侧发布，不在本表。
+> 判据是**设备 id**？不是 —— 分项绑定存的是 `scope_value=power` 这类**分项码**，
+> 与设备无关，重建客户后照样有效；但**模型本身**训练时的 `entity_ids`
+> 指向具体设备，设备重建后 id 变了，必须重训。
+>
+> **重装 / 重建客户后必做两步**：
+>
+> ```bash
+> # 1) 用新设备 id 重训（15 秒左右）
+> curl -X POST http://127.0.0.1:8090/ngxapi/models/forecast \
+>   -H "X-Authorization: Bearer $TENANT_TOKEN" -H 'Content-Type: application/json' \
+>   -d '{"name":"演示-三相园进线-小时负荷预测","entity_type":"DEVICE",
+>        "entity_ids":["<新设备id>"],"key":"energy","history_days":60,
+>        "forecast_horizon":24,"granularity_ms":3600000,
+>        "aggregate":"sum","backtest_horizon":24,"overwrite":true}'
+>
+> # 2) 重新发布 4 条绑定（forecast/advice × device/category）
+> curl -X POST http://127.0.0.1:8090/ngxapi/models/<model_id>/publish \
+>   -H "X-Authorization: Bearer $TENANT_TOKEN" -H 'Content-Type: application/json' \
+>   -d '{"feature":"forecast","scope_type":"category","scope_value":"power",
+>        "scope_label":"动力用电","key":"energy"}'
+> ```
+>
+> 第 1 步忘了 → 预测页能选对象但结果为空（模型读的是已删设备的历史）。
+> 第 2 步忘了 → 下拉里根本看不到对象。
+
+---
+
 ## 七、端到端校验清单
 
 新装或新接一批表之后，按顺序跑一遍：
