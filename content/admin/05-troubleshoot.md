@@ -1026,6 +1026,81 @@ where (w->'config'->'settings') ? 'refreshSecs'
 
 ---
 
+### 现象 X2：顶栏没有「场站」选择器 / 换了场站某页不跟着变
+
+**先分清三种情况，不是同一个问题：**
+
+1. **当前页是看板**（能耗概览、历史能耗、分项、区域、参数报表…）
+   → 主顶栏被看板隐藏了（`hideMainToolbar`），选择器在**看板自己的工具栏右上角**。
+   这是有意的：看板的工具栏已经占了同一行，再顶一条会出现两个工具栏。
+   两个位置渲染的是同一个组件、同一份全局状态，切哪个都一样。
+
+2. **当前页是「组织与场站」**（`/sites`）
+   → 不显示是设计。那一页的职责就是管理整棵树（建场站、改归属、配权限），
+   在它上面再挂一个「当前场站」会让人误以为列表被过滤了。
+
+3. **其它页面**（设备管理 / 设备分组 / 设备拓扑 / 告警中心 / 自检…）
+   → 必须有。没有就是这一版前端没装上，先确认版本：
+
+```bash
+docker exec energy-server sh -c 'unzip -p /opt/energy/app.jar "BOOT-INF/lib/ui-ngx-*.jar" 2>/dev/null | head -c0' ; \
+docker compose --profile split ps energy-server
+```
+
+> 版本对了仍不显示，看浏览器控制台：`tb-station-select` 组件依赖
+> `/api/energy/visible-sites`，接口 403/500 会让它静默空着（页面右上角只剩一个空白）。
+
+**切了场站、某一页不跟着变**，按页面查：
+
+| 页面 | 跟随方式 | 不跟随的典型原因 |
+| --- | --- | --- |
+| 看板 | `DashboardPageComponent` 订阅全局状态后写进 `state.siteCtx` | 看板是「嵌入模式」且 `customerId` 与当前客户不同 —— 有意不写，避免串客户 |
+| 设备管理 | 订阅 `StationContextService.current$`，前端过滤 `additionalInfo.siteId` | 设备没有 `additionalInfo.siteId`（归属没配，任何场站都不显示） |
+| 设备分组 | 用**显示名**匹配树里的场站容器 | 树里还没有这个场站的容器（初始化时未建），或场站改过名 |
+| 设备拓扑 | 订阅全局 id，作为 `siteId` 查询参数 | 拓扑的 `site_id` 是空（老数据没归属） |
+| 告警中心 | 作为 `siteId` 查询参数发给 `/api/energy/alarms` | 见现象 X3 |
+
+---
+
+### 现象 X3：告警中心切到场站后一条都没有，但「本企业」有几十条
+
+**症状**：顶上范围条正常，分页显示 `1 – 0 / 0`；把场站切到「本企业」（旧版本）就有数据。
+抓请求能看到 `GET /api/energy/alarms?...&siteId=<场站id>`，响应里 `scope.deviceCount = 0`。
+
+**根因**：按场站收集 originator 时只拿到了场站资产本身，没有子设备。
+
+`EnergyScopeService.findContainsTargets` 先查 `FROM_ENTITY_GROUP` 组的 `Contains`，
+**只有返回 `null` 才回退 `COMMON`**。但底层 `findByFromAndType` 对「没有匹配」
+返回的是**空列表**，于是回退永远不触发 —— 场站资产的关系都在 `COMMON` 组，
+结果就是一台设备都收不到。已在 2026-10-26 改成 `relations == null || relations.isEmpty()`。
+
+**自查**（确认场站下真的有设备）：
+
+```bash
+docker exec energy-postgres psql -U postgres -d thingsboard -At -F' | ' -c "
+select relation_type_group, relation_type, to_type, count(*)
+from relation
+where from_id = '<场站id>'
+group by 1,2,3 order by 4 desc;"
+```
+
+正常应看到 `COMMON | Contains | DEVICE | N`（N > 0）。是这个结果但接口仍返回 0 条，
+说明跑的是旧 jar，重新打包 `guard-server` 并重启 `energy-server`。
+
+**验证**（demo 客户，两个场站分别应有 5 / 6 条）：
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"demo@126.com","password":"demo123456"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+curl -s -H "X-Authorization: Bearer $TOKEN" \
+  "http://localhost:8090/api/energy/alarms?pageSize=10&page=0&siteId=<场站id>" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["totalElements"], d["scope"])'
+```
+
+---
+
 ### 现象 Y：部件显示「部件无数据可显示」，但它的脚本明明会自己取数
 
 **原因：TB 根本没执行 `onInit`。**
