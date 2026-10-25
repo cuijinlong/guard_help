@@ -197,9 +197,18 @@ def build_payload(meter, hours):
             "frequency": round(random.uniform(49.92, 50.06), 2),
         }
         if meter.phases == 3:
-            # 三相：略不平衡，但要满足「unbalance <= 2%」的验收断言
-            skew = [random.uniform(-0.012, 0.012) for _ in range(3)]
-            base_v = random.uniform(226.0, 233.0)
+            # 三相：略不平衡，但必须落在两条国标线内 ——
+            #   GB/T 12325 相电压 220V ±7%  → 204.6 ~ 235.4 V
+            #   GB/T 15543 不平衡度 ≤ 2%
+            #
+            # 原来的 base 226~233 + skew ±1.2% 是贴着上限生成的：
+            # 最高相能到 235.80 V，不平衡度能到 2.4%。
+            # 实测 2026-10-25 就写出了一个 235.43 V、2.13% 的点，
+            # 04-verify-data.sh 判失败（差 0.03 V / 0.13%）。
+            # 留 2.5% 以上余量：均值 216~230（±3%），单相偏移 ±0.8%
+            #   → 最高相 ≤ 231.8 V，最低相 ≥ 214.3 V，不平衡度 ≤ 1.6%
+            base_v = random.uniform(216.0, 230.0)
+            skew = [random.uniform(-0.008, 0.008) for _ in range(3)]
             v = [round(base_v * (1 + s), 2) for s in skew]
             p_each = power / 3.0
             i_each = [round(p_each * 1000 / x / pf, 2) if x else 0 for x in v]

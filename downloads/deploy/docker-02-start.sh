@@ -71,6 +71,22 @@ TABLES=$($COMPOSE $PROFILE_ARGS exec -T postgres psql -U "${DB_USER:-postgres}" 
 [[ "${TABLES:-0}" -ge 100 ]] || die "库还没初始化（${TABLES:-0} 张表）。先跑 bash docker-01-install.sh"
 fi
 
+# ---------------- 1.5 Cassandra commitlog 自愈预检 ----------------
+# 为什么放在启动之前：
+#   commitlog 段损坏时 Cassandra 会「起→读到坏文件→退出」无限循环
+#   （restart: unless-stopped），平台整体 502，而且**不会自己好**。
+#   等它循环几十次再人工排查，成本远高于启动前一次 2 秒的探测。
+# 判定交给专门脚本（12-cassandra-recover.sh）：只在「确实损坏」时才动手，
+# 健康或没启用 Cassandra 时直接退出，不影响正常启动。
+if [[ "$MODE" == "split" && "${DATABASE_TS_TYPE:-cassandra}" == "cassandra" ]]    && [[ -f "$(dirname "$0")/scripts/12-cassandra-recover.sh" ]]; then
+  RECOVER="$(dirname "$0")/scripts/12-cassandra-recover.sh"
+  if ! bash "$RECOVER" --status 2>/dev/null | grep -q "未发现 commitlog 损坏"; then
+    warn "检测到 Cassandra 状态异常，尝试自愈（详见 scripts/12-cassandra-recover.sh）"
+    bash "$RECOVER" --yes 2>&1 | sed 's/^/    /' || \
+      die "Cassandra 自愈失败。按提示查看 docker logs energy-cassandra，或改用 DATABASE_TS_TYPE=sql"
+  fi
+fi
+
 # ---------------- 2. 启动服务 ----------------
 if [[ "$MODE" == "allinone" ]]; then
   log "启动单容器（已在上一步拉起，等待就绪）"

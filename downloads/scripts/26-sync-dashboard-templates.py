@@ -33,6 +33,7 @@ python3 scripts/26-sync-dashboard-templates.py --apply
 
 import argparse
 import json
+import subprocess
 import os
 import re
 import sys
@@ -167,7 +168,25 @@ def main():
     if updated and not a.apply:
         print('加 --apply 执行；之后新建的客户才会用到新模板。')
         print('存量客户的看板副本需要各自的修复脚本（如 25-fix-analysis-scope.py）。')
+    if a.apply and updated:
+        # 模板 JSON 里没写 timeMode 的部件，推库后会回到默认值 'own' ——
+        # 于是「已有查询设置却还自带时间控件」的重复又冒出来。
+        # 顺带跑一次去重，避免每次推模板都要记得手动补一刀。
+        _run_sibling('29-dedupe-time-controls.py', ['--apply'], a)
     return 0
+
+
+def _run_sibling(name, extra, a):
+    """调用同目录下的兄弟脚本（存在才跑，失败只提示不中断）。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    if not os.path.exists(path):
+        return
+    cmd = [sys.executable, path, '--base', a.base,
+           '--tenant', a.tenant, '--tenant-pass', a.tenant_pass] + extra
+    print('\n—— 顺带执行 %s ——' % name)
+    rc = subprocess.call(cmd)
+    if rc != 0:
+        print('  （%s 返回 %d，请手动检查）' % (name, rc))
 
 
 if __name__ == '__main__':

@@ -1099,6 +1099,239 @@ ORDER BY 覆盖天数, d.name;
 
 ---
 
+### 时间怎么选：部件里的「实时 / 历史」，不在看板右上角
+
+能源系列看板把时间选择**搬进了部件**，因为 TB 自带的时间选择器是**看板级**的：
+改一次影响整块看板所有部件，而且它旁边的实体选择器与「查询设置」的设备勾选
+是两套语义 —— 客户在一个页面上看到两个时间源，改上面那个不动下面的数，
+第一反应就是「这功能坏了」。
+
+现在时间只有两个入口，都在部件里，两处**行为完全一致**：
+
+| 部件 | 出现在 | 作用 |
+| --- | --- | --- |
+| **查询设置** | 历史能耗 / 基础报表 / 参数报表 / 峰谷分析 / 分项与区域能耗（可配） | 选设备 + 选时间 → 点「查询」下发条件 |
+| **分析条件** | 分项能耗 / 区域能耗 / 综合能耗 / 能源流向 / 电能质量 / 盘查报告 | 选范围 + 选时间 → 自动下发 |
+
+两者都有「实时 | 历史」两个页签：
+
+- **实时**：`最近 [N] [秒/分钟/小时/天]`，右端永远是**当前时刻**，区间随时间往前滚。
+  查询设置每 15 秒自动重发一次（抄表类板面除外，它会造成重复批次）；
+  分析条件同样 15 秒一轮。
+- **历史**：按日 / 按月 / 按年 + 固定起止，和以前一样。
+
+**窗口宽度恒等于你选的跨度**。数据陈旧时整个窗口**左移**到最后一点附近
+（不是只拉左端），所以宽度不变、改跨度必然改变结果：
+
+| 你选 | 服务端桶宽 | 报表表格列数（30 分钟窗口示例） |
+| --- | --- | --- |
+| 最近 1 分钟 | 1 秒 | 1 列 |
+| 最近 5 分钟 | 8 秒 | 5~6 列 |
+| 最近 30 分钟 | 45 秒 | 30 列 |
+| 最近 60 分钟 | 90 秒 | 60 列 |
+| 最近 120 分钟 | 3 分钟 | 40 列 |
+
+桶宽 = 窗口 ÷ 40（夹在 1 秒 ~ 1 小时之间），由查询设置在 `payload.intervalMs`
+里下发；结果部件优先读它，没有时才按自己的三档粒度兜底。
+
+**数据陈旧时会自动回看**。演示/验收数据是逐小时快照，初始化后不再增长 ——
+如果最后一点停在 07:00，选「最近 60 分钟」本该是空的。部件会先探该实体的
+最后一个数据点（按「勾选的设备 → 品种 → 树节点 → 场站」顺序试，30 秒缓存），
+窗口整体滑到能兜住它，并在标题/摘要里写明 `数据止于 07:00`。
+真实设备每秒都在报，探测结果≈现在，行为与纯滚动窗口没有差别。
+
+**横轴用的是查询窗口，不是数据点范围**。只有一个数据点时，若按数据点画，
+五个刻度会全是同一时刻（看着像时间没走）。现在刻度按窗口铺开 ——
+30 分钟窗口就是 `10:17 / 10:25 / 10:32 / 10:40 / 10:47`，孤点落在它真实的位置。
+
+> **实时窗口的默认跨度**：60 分钟。演示数据一小时一个点，2 分钟窗口必然空 ——
+> 现场演示想看到曲线变化，要么保持 60 分钟，要么先把 `23-demo-simulator.py`
+> 跑起来喂新鲜数据。接真实 RTU 时调成 1~5 分钟更有意义。
+
+> **粒度只在查询设置里选一次**。结果部件（统计分析、分布、排名、报表表格）
+> 不再各自带「按日/按月/按年」或「时/日/月/年」控件 —— 那些设置已经由查询设置
+> 下发的 `grain` 决定。峰谷分析的粒度分段 2026-10-25 已删除，页面上时间入口只剩一处。
+
+---
+
+### 看板右上角的 TB 时间/实体选择器：默认隐藏
+
+同上原因，18 个能源与报表看板的模板里设了：
+
+```json
+"settings": {
+  "showDashboardTimewindow": false,
+  "showEntitiesSelect": false
+}
+```
+
+- **查看/演示时**看不见右上角这两个控件，只有部件内那一套时间入口
+- **进「编辑仪表板」时仍然可见** —— TB 的原生逻辑里 `isEdit` 分支不读这两个开关，
+  管理员照样能改看板级时间窗口（例如临时调默认区间）
+- 想给某个看板单独放开：仪表板设置 → 打开「显示时间窗口」/「显示实体选择器」
+- 「峰谷时段」「客户能源档案」两个配置页**保留**原生选择器 —— 它们的部件依赖它
+
+改模板后推库，存量客户副本一起修：
+
+```bash
+python3 scripts/26-sync-dashboard-templates.py --apply   # 模板
+python3 scripts/28-hide-dashboard-toolbar.py             # 预演：客户副本清单
+python3 scripts/28-hide-dashboard-toolbar.py --apply     # 执行
+```
+
+#### 场站入口只留一处（看板右上角）
+
+场站是**整块看板**的统计范围，所以它放在看板右上角的工具栏里，
+和 TB 原生的实体/时间选择器同级，而不是塞进「查询设置 / 分析条件」部件。
+
+| 位置 | 控件 | 说明 |
+| --- | --- | --- |
+| 看板右上角 | `tb-station-select`（树形） | 组织 → 子组织 → 场站，可折叠；选中即全局生效 |
+| 查询设置 / 分析条件 | 无 | 已移除，跟随顶栏发布的 `state.siteCtx` |
+| 能耗概览 / 能源流向 / 电能质量 / 盘查报告 / 节能记录 | 无 | 同样改为跟随顶栏（`stationFollowsTop`） |
+
+**没有「全部场站」这一档**（2026-10-25 起）。场站是计量的最小归属单位：
+不同场站的电价、变压器容量、计量口径都不同，把它们加起来看没有业务意义。
+下拉里只有具体场站，**默认第一个**，选择记在 Cookie
+`tb.energy.site.<客户id>`（一年有效，按客户隔离，客户 A 的场站不会串到客户 B）。
+
+看板级开关（`configuration.settings`）：
+
+```json
+"showStationSelect": true     // 显示右上角树形场站选择器
+"showEntitiesSelect": false   // 同时关掉 TB 原生实体选择器，避免两个入口
+```
+
+> **没有场站就不能用系统。** 客户用户登录时若名下还没有任何场站，
+> 会用不可关闭的蒙屏挡住整个界面，要求现场创建一个
+> （自动建在客户的组织下，没有组织会先建一个）。
+> 租户管理员不受影响 —— 他们进系统本来就是为了建客户、配字典。
+
+自查 SQL（客户名下应有场站；为 0 的客户登录会被蒙屏）：
+
+```sql
+SELECT c.title AS 客户,
+       count(a.id) FILTER (WHERE a.type = '场站') AS 场站数
+FROM customer c
+LEFT JOIN asset a ON a.customer_id = c.id
+GROUP BY c.title
+ORDER BY 场站数;
+```
+
+自查 SQL（能源看板都应开 `showStationSelect`）：
+
+```sql
+SELECT d.title AS 看板,
+       COALESCE(c.title,'（租户模板）') AS 归属,
+       d.configuration::jsonb->'settings'->>'showStationSelect' AS 顶部场站
+FROM dashboard d
+LEFT JOIN customer c ON c.id = d.customer_id
+WHERE d.title IN ('实时能耗','历史能耗','基础报表','参数报表','分项能耗','区域能耗',
+                  '综合能耗','能耗洞察','能源流向','电能质量','盘查报告','节能记录',
+                  '闲时能耗','峰谷分析','能耗概览','我的账单','抄表功能','手工填报')
+ORDER BY 归属, 看板;
+```
+
+#### 场站与查询条件的加载顺序（改这里前必读）
+
+场站放在右上角后，产生了一个新的时序依赖：**顶栏先就绪，部件后就绪**。
+顶栏只发一个 `visible-sites` 请求；查询设置要先跑
+`auth/user → visible-sites → metric-params → devices`，分析条件还要多一步
+数据源别名解析。两边速度差 5~10 秒，顺序不稳定。
+
+踩过的坑（2026-10-25，都已修，改代码时别退回去）：
+
+| 错误做法 | 症状 |
+| --- | --- |
+| 一收到 `siteCtx` 就 `loadDevices()` | 品种还没解析，`inSourceProfiles` 把设备全过滤掉，树空 |
+| 收到 `siteCtx` 后 1.2 秒就 `submit()` | 设备清单还没回来，提交空列表，结果部件停在「请先在左侧选择设备」 |
+| 用 `scope.treeLoading` 推断「设备是否就绪」 | HTTP 回调里才置 true，判断永远滞后一拍 |
+| `flushPendingSite` 定义在订阅函数内部 | `pickFirstSource` 看不到，`ReferenceError`，树永远转圈 |
+
+现在的做法：
+
+1. **顶栏发布 → 部件先判断数据是否就绪**（`scopeReady` / `sourcesReady`）。
+   未就绪只记下待用场站，不建树、不提交。
+2. **建树挂在设备清单回调里**（`afterDevicesLoaded`）。只有这里
+   `allDevices` / `parentMap` 才是按新场站重建好的。
+3. **提交挂在建树之后**，靠显式标志 `needSubmitAfterDevices`，
+   不从 `treeLoading` 推断。
+4. **首次进页面也自动查一次**（`flushFirstQuery`），时机同样是设备就绪之后。
+5. `treeLoading` 在**发请求前**置位 —— 转圈从点击那一刻开始，不做假空态。
+
+验收口径（`27-customer-surface-probe.py` 之外的人工检查）：
+
+```
+打开「历史能耗」→ 全程不应出现「请先在左侧选择设备」
+顶栏切到另一个场站 → 统计表/曲线/明细表应自动换成新场站的设备，无需点「查询」
+```
+
+#### 时间入口只留一处（部件级）
+
+除了右上角，部件之间也可能重复。三个结果部件自带「按日/按月/按年 + 起止」
+（`asset_stats_chart` / `distribution_chart` / `ranking_list`），它们有开关：
+
+```
+config.settings.timeMode = 'own'    # 用部件自己的时间选择
+config.settings.timeMode = 'state'  # 跟随查询设置/分析条件下发的 state
+```
+
+**只有看板里有查询设置或分析条件时**才关掉它们 —— 否则部件没有任何时间来源。
+脚本按这个规则自动判断：
+
+```bash
+python3 scripts/29-dedupe-time-controls.py            # 预演：列出会改哪些看板
+python3 scripts/29-dedupe-time-controls.py --apply    # 执行
+```
+
+当前会处理：区域能耗 / 能耗概览 / 分项能耗（各自 3 个部件）。
+「能耗洞察」「盘查报告」「能源流向」「电能质量」「节能记录」**没有**查询设置，
+它们的时间控件是唯一入口，脚本不动（会打印「无枢纽部件，保持原样」）。
+
+> 这五个部件的时间控件是写死的，脚本改不了。如果哪天把
+> `audit_report` / `sankey_flow` / `power_quality` / `energy_overview`
+> 放进带查询设置的看板，脚本会告警 —— 那时要改部件代码，不是改配置。
+
+自查 SQL（有查询设置却还有部件自带时间的看板，正常应为 0 行）：
+
+```sql
+SELECT d.title AS 看板,
+       COALESCE(c.title,'（租户模板）') AS 归属,
+       w.value->>'typeFullFqn' AS 部件,
+       w.value->'config'->'settings'->>'timeMode' AS 时间模式
+FROM dashboard d
+LEFT JOIN customer c ON c.id = d.customer_id
+CROSS JOIN LATERAL jsonb_each(d.configuration::jsonb->'widgets') w
+WHERE w.value->>'typeFullFqn' IN (
+        'system.energy_management.asset_stats_chart',
+        'system.energy_management.distribution_chart',
+        'system.energy_management.ranking_list')
+  AND COALESCE(w.value->'config'->'settings'->>'timeMode','own') <> 'state'
+  AND EXISTS (
+        SELECT 1 FROM jsonb_each(d.configuration::jsonb->'widgets') h
+        WHERE h.value->>'typeFullFqn' IN (
+                'system.energy_management.query_panel',
+                'system.energy_management.analysis_bar'))
+ORDER BY 归属, 看板;
+```
+
+自查 SQL（能源看板里应只剩两个配置页是 `true`）：
+
+```sql
+SELECT d.title AS 看板,
+       COALESCE(c.title,'（租户模板）') AS 归属,
+       d.configuration::jsonb->'settings'->>'showDashboardTimewindow' AS 显示时间,
+       d.configuration::jsonb->'settings'->>'showEntitiesSelect' AS 显示实体
+FROM dashboard d
+LEFT JOIN customer c ON c.id = d.customer_id
+WHERE d.title IN ('实时能耗','历史能耗','基础报表','参数报表','分项能耗','区域能耗',
+                  '综合能耗','能耗洞察','能源流向','电能质量','盘查报告','节能记录',
+                  '闲时能耗','峰谷分析','能耗概览','我的账单','抄表功能','手工填报')
+ORDER BY 归属, 看板;
+```
+
+---
+
 ## 六之一、功能归属总表（找功能看这张）
 
 同一个功能只有一个入口。找不到某个功能时先查这张表，别再翻菜单。

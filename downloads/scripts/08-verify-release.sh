@@ -29,6 +29,10 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
+# 脚本按「部署目录结构」调用（scripts/ 与 data/ 同级），所以根目录就是 cd 之后的 pwd。
+# ★ 必须显式赋值：I-5d 的客户视角探针要拼 $APP_HOME/scripts/27-...，
+#   少了它 set -u 会让整个验收在最后一段崩掉（前面的结果全白跑）。
+APP_HOME="${APP_HOME:-$(pwd)}"
 
 BASE="http://127.0.0.1:8090"
 TENANT="" ; TENANT_PASS=""

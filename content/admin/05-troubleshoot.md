@@ -986,6 +986,81 @@ where d.name like '%进线%' or d.name like '%分项%' order by lvl;"
 
 ---
 
+### 现象 X：切换场站后左侧设备树不更新、右侧图表也不动
+
+**只有带实时刷新的看板会出现**（实时能耗最明显）；历史能耗切场站是好的。
+
+**原因：浏览器连接池被实时轮询占满，重建树的请求排在最后。**
+
+实时部件一轮刷新 = 每台设备一个 telemetry 请求。`refreshSecs` 配成 3 秒时，
+两个实时部件 × 6 台设备 = 每 3 秒 12 个请求；浏览器对同一域名只有 6 条连接，
+切场站后重建树的 `GET /api/customer/{id}/devices` 被压在最底下。
+实测排队 15.4 秒（同一条 URL 在页内直接 fetch 只要 33 ms），用户看到的就是
+「场站换了、树不动、数据也不动」。
+
+**确认**（把小于 8 的刷新间隔揪出来）：
+
+```sql
+docker exec energy-postgres psql -U postgres -d thingsboard -At -F' | ' -c "
+select d.title, w->'config'->'settings'->>'refreshSecs' secs
+from dashboard d, jsonb_each(d.configuration->'widgets') x(w)
+where (w->'config'->'settings') ? 'refreshSecs'
+  and (w->'config'->'settings'->>'refreshSecs')::int < 8;"
+```
+
+**修**（四层，都已内置）：
+
+1. 看板里部件的 `refreshSecs` 不低于 10（部件代码把下限卡在 8 秒，配 3 也不会再打满连接池）。
+2. 实时部件在 `siteCtx` 变化时等 2 秒再刷新，先把连接让给重建树。
+3. 实时取数加并发闸门（每轮最多 2 个在途）：服务端 6 个 telemetry 并发时单个要 4.5 秒，
+   限到 2 个后单个仍 ~0.2 秒，总量反而更快。
+4. 查询设置里「所有设备」（`entityType=DEVICE`、无额外过滤）直接用客户设备清单建树，
+   不再先 `POST /api/entitiesQuery/find` 拿一遍 id（省一次 1 秒往返）。
+
+修完实测（客户账号，实时能耗）：
+
+```
+切场站 → 树生效 356 / 344 / 341 ms（连测三次，期间 1~5 个请求）
+修复前：15~40 秒
+```
+
+---
+
+### 现象 Y：部件显示「部件无数据可显示」，但它的脚本明明会自己取数
+
+**原因：TB 根本没执行 `onInit`。**
+
+`ui-ngx` 的 `widget.component.ts#displayWidgetInstance()` 有两个放行条件：
+部件类型是 `static`，或 `typeParameters.processNoDataByWidget` 为真。
+否则它遍历数据订阅，**没有任何订阅 `isDataResolved()` 就返回 false** ——
+此时既不调 `onInit`，还盖一层「部件无数据可显示」。
+
+自绘部件（脚本里用 `self.ctx.http` 取数、不走 TB data 订阅）如果不声明
+`self.typeParameters`，就必然踩这个坑。客户看板里的数据源别名若指向
+租户级占位符（`00000000-…`，如组织占位符），解析一定失败 → 部件永远空白。
+
+**确认**：
+
+```bash
+# 输出 0，且脚本里有 self.ctx.http → 就是它
+grep -c 'self.typeParameters' guard-server/src/main/data/json/system/widget_types/<部件>.json
+```
+
+**修**：部件脚本开头补
+
+```js
+self.typeParameters = function () {
+  return { datasourcesOptional: true, processNoDataByWidget: true, dataKeysOptional: true };
+};
+```
+
+2026-10-25 已给全部 `energy_management_*` 自绘部件补齐（当时能耗概览的
+「概览指标卡」「日历热力图」、参数报表的同一批部件都是空的）。
+从验收脚本里能直接看出来：`python3 scripts/08-verify-release.sh` 的
+客户视角探针会把这类空态记成 `部件无数据可显示`。
+
+---
+
 ## 1. 全新部署卡在第一步：setup 接口返回 423
 
 **现象**
@@ -3287,3 +3362,103 @@ WHERE fqn LIKE 'energy_management.%'
 ```
 
 原理与三个缺陷的细节见[⑦ 数据流 6.7](/admin/data-pipeline)。
+
+---
+
+### 现象 Z：Cassandra 无限重启，平台整体 502
+
+**症状**
+
+```
+$ docker ps --filter name=energy-cassandra
+energy-cassandra   Restarting (0) 3 seconds ago
+
+$ docker inspect -f '{{.RestartCount}}' energy-cassandra
+67
+
+$ curl -s --noproxy '*' http://127.0.0.1:8090/api/noauth/setup/state
+502 Bad Gateway
+```
+
+重启计数一路涨，`9042` 端口拒连，`energy-server` 一直连不上遥测库，
+整个平台不可用。容器日志或容器内 `/var/log/cassandra/system.log` 里能看到：
+
+```
+ERROR [main] JVMStabilityInspector.java:196 - Exiting due to error while processing commit log during initialization.
+org.apache.cassandra.db.commitlog.CommitLogReadHandler$CommitLogReadException:
+    Could not read commit log descriptor in file /var/lib/cassandra/commitlog/CommitLog-7-<ts>.log
+    at org.apache.cassandra.db.commitlog.CommitLogReader.readCommitLogSegment(CommitLogReader.java:196)
+    at org.apache.cassandra.service.CassandraDaemon.setup(CassandraDaemon.java:353)
+```
+
+**根因：commitlog 被写到一半就进程被杀。**
+
+Cassandra 先把写入追加到 commitlog（顺序写），再异步刷进 SSTable。
+容器被**非优雅终止**时，当前 commitlog 段的头部描述符没落盘，下次启动读到
+半截文件就直接退出 —— 而 `restart: unless-stopped` 让它无限重试，形成
+「起 → 读到坏文件 → 退出 → 再起」的死循环，**不会自己好**。
+
+常见的非优雅终止来源：
+
+- `docker kill` / `docker stop` 超时后 SIGKILL（默认只等 10 秒）
+- 直接强退 Docker Desktop、或 Docker VM 进程被杀
+- 宿主机内存压力把 VM 里的 Cassandra 压死（OOM）
+- **把 Docker VM 内存调小**（见下方红线）
+
+**判断（三步，约 5 秒）**
+
+```bash
+docker inspect -f 'status={{.State.Status}} health={{.State.Health.Status}} restarts={{.RestartCount}}' energy-cassandra
+docker logs --tail 200 energy-cassandra 2>&1 | grep -c "Could not read commit log descriptor"
+docker exec energy-cassandra sh -c 'tail -60 /var/log/cassandra/system.log' 2>/dev/null | grep -A2 "commit log"
+```
+
+只要第三条出现 `CommitLogReadException`，就是本现象。
+
+**恢复：一条命令**
+
+```bash
+cd ~/energy-app
+bash scripts/12-cassandra-recover.sh --status   # 先诊断
+bash scripts/12-cassandra-recover.sh --yes      # 备份 + 清 commitlog + 重启 + 验证
+```
+
+它做四件事，**SSTable 一个字节都不动**：
+
+1. 停容器（最多等 180 秒，让它自己收尾）
+2. 把整个 `commitlog` 目录备份到 `~/.cassandra-commitlog-backup/<时间戳>/`
+3. 只删 `commitlog/*.log`
+4. 重启并等健康（最长 10 分钟），验证 `keyspace thingsboard` 可读
+
+代价：最多丢掉最后一次 flush 之后几百毫秒的写入（而坏文件本来就一点都读不出来）。
+
+**预防（已经写进部署，不用你手动做）**
+
+| 措施 | 落点 | 作用 |
+| --- | --- | --- |
+| `stop_grace_period: 180s` | `docker-compose.yml` 的 cassandra 服务 | 正常关闭时给足 flush 时间，不再 SIGKILL |
+| 启动前自愈预检 | `docker-02-start.sh` 第 1.5 步 | 检测到损坏就自动调 12 号脚本，不带病启动 |
+| 遥测后端默认 sql | `.env` 的 `DATABASE_TS_TYPE=sql` | 数据量小的时候根本不引入 Cassandra 这个故障点 |
+
+**Docker VM 内存红线（这次故障的直接触发点）**
+
+```
+物理内存 8 GB 的机器：Docker VM 不低于 6144 MiB
+```
+
+Cassandra 堆 2 GB + 页缓存 + 另外三个容器（Postgres 0.6G / server 1.2G / gateway）
+在 3.8 GB 的 VM 里会互相挤压，Cassandra 被反复杀掉就制造 commitlog 损坏。
+2026-10-25 实测：把 VM 从 5941 MiB 调到 3931 MiB 后，`RestartCount` 从 0 涨到 67。
+
+**要不要干脆别用 Cassandra？**
+
+数据量在**千万行以内 / 20 GB 以内**，Postgres 存遥测完全够，而且少一个容器、
+少 2 GB 常驻内存、少一整类故障。切换方式：
+
+```bash
+cd ~/energy-app
+bash scripts/11-cassandra.sh disable    # 改 .env + 重启 server，保留 Cassandra 数据
+```
+
+⚠ 切换**不迁移存量遥测**：切过去之后旧区间查不到，只有新数据写新后端。
+有历史数据要保留时，先按[② Cassandra](/admin/cassandra) 一节的迁移步骤办。

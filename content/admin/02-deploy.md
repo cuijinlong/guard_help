@@ -59,17 +59,27 @@ ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 20
 > **`.env` 是隐藏文件**，`ls` 看不到。看内容：`cat ~/energy-app/.env`。
 > **要装到别的目录**：`bash docker-00-prepare.sh /data/energy-app`。
 
-**`.env` 里的遥测后端**（新版本新增，默认 `cassandra`）：
+**`.env` 里的遥测后端**（`docker-00-prepare.sh` 按宿主机内存自动选）：
 
 ```properties
-DATABASE_TS_TYPE=cassandra        # cassandra（默认）| sql
+DATABASE_TS_TYPE=sql              # sql | cassandra（按内存自动选，见下表）
 DATABASE_TS_LATEST_TYPE=sql       # 建议留 sql：查询快、与实体同库
 ```
 
-| 值 | 起几个容器 | 首次启动 | 什么时候选 |
+| 宿主机物理内存 | 自动选 | 起几个容器 | 首次启动 |
 | --- | --- | --- | --- |
-| `cassandra`（默认） | postgres + **cassandra** + server… | 约 7 分钟 | 正式部署，设备会持续增长 |
-| `sql` | postgres + server… | 约 2 分钟 | 只有 2GB 内存，或纯功能演示 |
+| < 10 GB | `sql` | postgres + server… | 约 2 分钟 |
+| ≥ 10 GB | `cassandra` | postgres + **cassandra** + server… | 约 7 分钟 |
+
+| 值 | 什么时候选 |
+| --- | --- |
+| `sql` | 8 GB 机器、千万行以内、纯功能演示 —— 少一个容器、少 2 GB 常驻、少一整类故障 |
+| `cassandra` | ≥10 GB 内存、上亿点、持续高 QPS 写入、多节点扩写 |
+
+> ⚠ **8 GB 物理内存不要用 cassandra。** Docker VM 挤爆会把 Cassandra 反复杀，
+> commitlog 写到一半就损坏，下次启动无限重启、平台 502。
+> 恢复见[现象 Z](/admin/troubleshoot) + `scripts/12-cassandra-recover.sh`。
+> 强制指定：`DATABASE_TS_TYPE=cassandra bash docker-00-prepare.sh`。
 
 脚本会读这个值：`cassandra` 时自动带 `--profile cassandra` 起容器并等它就绪，
 `sql` 时**不启动** Cassandra（不白占 2G 内存）。详见[②b Cassandra](/admin/cassandra)。
@@ -662,6 +672,9 @@ docker compose --profile split up -d
 | `scripts/24-device-categories.py` | **设备能源分项属性**检查 / 补齐（AI 三页按分项） | `~/energy-app` |
 | `scripts/25-fix-analysis-scope.py` | **能源分析看板数据源**修复（单场站 → 客户组织） | `~/energy-app` |
 | `scripts/26-sync-dashboard-templates.py` | **看板模板推库**（改完仓库 JSON 必须跑） | `~/energy-app` |
+| `scripts/27-customer-surface-probe.py` | **客户视角探针**（用客户账号把每个页面真实点一遍） | `~/energy-app` |
+| `scripts/28-hide-dashboard-toolbar.py` | **隐藏看板右上角 TB 时间/实体选择器**（存量客户副本） | `~/energy-app` |
+| `scripts/29-dedupe-time-controls.py` | **去掉看板里重复的时间选择**（已有查询设置时关掉部件自带的） | `~/energy-app` |
 
 > `docker-00` 与 `docker-97` / `docker-98` **只在仓库里**，不要从部署目录找 ——
 > 它们要读仓库源码。
@@ -671,7 +684,10 @@ docker compose --profile split up -d
 ```
 docker-compose.yml  docker-01-install.sh  docker-02-start.sh  docker-99-uninstall.sh
 scripts/01..11-*.sh  scripts/05-import-customer-data.py  scripts/20-rtu-simulator.py
-scripts/21-rtu-onboard.py  scripts/23-demo-simulator.py  scripts/24-device-categories.py
+scripts/21-rtu-onboard.py  scripts/22-watch-rtu.py  scripts/23-demo-simulator.py
+scripts/24-device-categories.py  scripts/25-fix-analysis-scope.py
+scripts/26-sync-dashboard-templates.py  scripts/27-customer-surface-probe.py
+scripts/28-hide-dashboard-toolbar.py  scripts/29-dedupe-time-controls.py
 ```
 
 **改脚本的铁律**：

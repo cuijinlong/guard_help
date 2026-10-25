@@ -268,6 +268,35 @@ CHECKS = [
 ]
 
 
+
+def check_troubleshoot_numbering() -> list[str]:
+    """故障手册的「现象 X」编号必须唯一。
+
+    为什么需要（2026-10-25 实测踩过）：
+      往 05-troubleshoot.md 里新增「现象 P / Q」时，没注意文末**已经**有
+      一组 P / Q（安装类故障），于是同一篇里出现两组同号章节。
+      后果是交叉引用失真：正文写「见现象 Q」，读者不知道指哪一个。
+      这种错误 check-docs 原来完全查不到（它只核对数量），所以补上。
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        'content', 'admin', '05-troubleshoot.md')
+    if not os.path.exists(path):
+        return []
+    seen: dict[str, int] = {}
+    errs: list[str] = []
+    with open(path, encoding='utf-8') as f:
+        for lineno, line in enumerate(f, 1):
+            m = re.match(r'^### 现象 ([A-Za-z0-9][A-Za-z0-9\-]*)：', line)
+            if not m:
+                continue
+            num = m.group(1)
+            if num in seen:
+                errs.append(f'现象 {num} 编号重复：L{seen[num]} 与 L{lineno}')
+            else:
+                seen[num] = lineno
+    return errs
+
+
 def check_doc_sql() -> tuple[int, int, list[str]]:
     """
     校验手册里的运维 SQL 是否还能在真实库上跑通。
@@ -517,6 +546,17 @@ def main() -> int:
         else:
             print(f'\n✓ 运维 SQL 全部可执行（{sql_ran}/{sql_total} 条；'
                   f'带 <客户id> 占位符的已替换成真实 id 验证）')
+
+    # ---------------- 故障手册章节编号唯一性 ----------------
+    numbering_errors = check_troubleshoot_numbering()
+    if numbering_errors:
+        failed += len(numbering_errors)
+        print(f'\n✗ 故障手册章节编号有 {len(numbering_errors)} 处重复：')
+        for e in numbering_errors:
+            print(f'    · {e}')
+        print('  改编号（新章节用未占用的字母）后重跑。')
+    else:
+        print('\n✓ 故障手册章节编号唯一')
 
     if failed:
         print(f'\n✗ {failed} 项不一致 —— 改代码后要同步手册：')

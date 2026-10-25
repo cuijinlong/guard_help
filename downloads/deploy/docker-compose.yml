@@ -69,6 +69,8 @@ services:
     profiles: ["split"]
     image: postgres:16-alpine
     container_name: energy-postgres
+    # Postgres 需要时间把 shared_buffers 刷盘；默认 10 秒后 SIGKILL 会造成启动恢复慢
+    stop_grace_period: 60s
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${DB_NAME:-thingsboard}
@@ -112,6 +114,8 @@ services:
     profiles: ["cassandra"]
     image: cassandra:4.1
     container_name: energy-cassandra
+    # ★ 关键：Cassandra 默认只给 10 秒，超时即 SIGKILL —— commitlog 写到一半就被打断，下次启动报 "Could not read commit log descriptor" 并无限重启。180 秒足够 flush
+    stop_grace_period: 180s
     restart: unless-stopped
     environment:
       # 单节点部署：把自己当种子。多节点时列全部节点 "c1,c2,c3"。
@@ -176,6 +180,8 @@ services:
     profiles: ["split"]
     image: eclipse-temurin:25-jre
     container_name: energy-server
+    # Java 服务要时间关连接池、刷 Telemetry 缓冲
+    stop_grace_period: 60s
     restart: unless-stopped
     depends_on:
       postgres:
@@ -231,6 +237,8 @@ services:
       dockerfile: Dockerfile.prod
     image: ${AI_IMAGE:-energy/ngxai-backend:4.4.0}
     container_name: energy-ngxai-backend
+    # uvicorn 要时间优雅退出
+    stop_grace_period: 30s
     restart: unless-stopped
     depends_on:
       postgres:

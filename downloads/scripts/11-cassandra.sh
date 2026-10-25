@@ -2,9 +2,12 @@
 #
 # 能源管理平台 · Cassandra（可选遥测存储）管理
 #
-# 默认部署**使用** Cassandra 存遥测（DATABASE_TS_TYPE=cassandra）。
-# 想省内存的小规模部署可改成 sql（本脚本 disable 子命令）：
-# 遥测与实体同存 Postgres，少一个容器、少 2GB 内存。
+# 遥测后端默认**按宿主机内存自动选**（docker-00-prepare.sh）：
+#   物理内存 < 10GB → sql（遥测与实体同存 Postgres，少一个容器、少 2GB 内存）
+#   物理内存 ≥ 10GB → cassandra
+# 8GB 机器上 Cassandra 会被 Docker VM 挤压 → 非优雅终止 → commitlog 损坏 →
+# 无限重启 + 平台 502。已损坏时用 scripts/12-cassandra-recover.sh 恢复。
+# 本脚本负责显式启用/停用（enable / disable）与日常查看（status）。
 #
 # 用法：
 #   bash scripts/11-cassandra.sh status      # 看现状（容器 / keyspace / 表 / 当前后端）

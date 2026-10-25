@@ -10,28 +10,44 @@
 
 | 场景 | 建议 |
 | --- | --- |
-| 正式部署 / 设备会持续增长 | **Cassandra（默认）** |
-| 上亿点、持续高 QPS 写入 | Cassandra（唯一可行） |
+| 上亿点、持续高 QPS 写入 | **Cassandra（唯一可行）** |
 | 多节点横向扩写入 | Cassandra |
-| 只有 2GB 内存的机器 / 纯功能演示 | 改 Postgres，省一个容器、省 2G 内存 |
+| 宿主机内存 < 10 GB | **Postgres（sql）** —— prepare 会自动这么选 |
+| 千万行以内 / 百万级点 | Postgres（sql），省一个容器、省 2G 内存、少一整类故障 |
+
+> ⚠ **8 GB 物理内存的机器不要用 Cassandra。**
+> Docker VM 只有 5.8 GB，Cassandra 堆 2G + 页缓存 + Postgres 0.6G +
+> server 1.2G + gateway 会互相挤压，Cassandra 被反复杀 → commitlog 写到一半 →
+> 下次启动报 `Could not read commit log descriptor` 并**无限重启**，平台整体 502。
+> 2026-10-25 实测：VM 内存从 5941 MiB 调到 3931 MiB 后，`RestartCount` 从 0 涨到 67。
+> 恢复见 [现象 Z](/admin/troubleshoot) 与 `scripts/12-cassandra-recover.sh`。
 
 **核心区别**：只有「遥测」能换后端，实体元数据恒在 Postgres。
 
 ```
 DATABASE_ENTITIES_TYPE=sql              ← 实体元数据，不可改
-DATABASE_TS_TYPE=cassandra | sql        ← 遥测（默认 cassandra，本页讲的）
+DATABASE_TS_TYPE=cassandra | sql        ← 遥测（默认按内存自动选，本页讲 cassandra）
 DATABASE_TS_LATEST_TYPE=sql | cassandra ← 最新值（建议留 sql）
 ```
 
 **为什么最新值建议留 sql**：设备详情页、看板的实时数字读的是它，
 查询频繁、数据量小，放 Postgres 更快，也少一次跨库往返。
 
-**默认值写在两处，改一处就行**：
+**默认值由 `docker-00-prepare.sh` 按宿主机内存自动选**：
 
-| 位置 | 作用 |
+| 宿主机物理内存 | prepare 生成的 `.env` |
 | --- | --- |
-| `docker-compose.yml` 的 `${DATABASE_TS_TYPE:-cassandra}` | 兜底默认值 |
-| `.env` 的 `DATABASE_TS_TYPE=cassandra` | 实际生效值（prepare 生成） |
+| < 10 GB | `DATABASE_TS_TYPE=sql` |
+| ≥ 10 GB | `DATABASE_TS_TYPE=cassandra` |
+
+要强制指定就显式导出环境变量再跑 prepare：
+
+```bash
+DATABASE_TS_TYPE=cassandra bash docker-00-prepare.sh
+```
+
+`docker-compose.yml` 里仍是 `${DATABASE_TS_TYPE:-cassandra}` 作为兜底，
+但 `.env` 一定会写明确值，所以以 `.env` 为准。
 
 `docker-01-install.sh` / `docker-02-start.sh` 会读 `.env`：
 值是 `cassandra` 时自动带 `--profile cassandra` 拉起容器；改成 `sql` 时**不会启动**
