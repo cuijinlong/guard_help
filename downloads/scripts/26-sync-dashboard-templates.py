@@ -173,6 +173,10 @@ def main():
         # 于是「已有查询设置却还自带时间控件」的重复又冒出来。
         # 顺带跑一次去重，避免每次推模板都要记得手动补一刀。
         _run_sibling('29-dedupe-time-controls.py', ['--apply'], a)
+        # 同理：模板推的是「租户级」那一份，客户副本仍是旧形态。
+        # multiParam 这种「同一部件在不同板面上长相不同」的配置，最容易
+        # 改了模板却忘了刷副本 —— 表现为「新装客户对了、老客户还是老样子」。
+        _run_sibling('30-fix-param-mode.py', ['--apply'], a)
     return 0
 
 

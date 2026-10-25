@@ -675,6 +675,9 @@ docker compose --profile split up -d
 | `scripts/27-customer-surface-probe.py` | **客户视角探针**（用客户账号把每个页面真实点一遍） | `~/energy-app` |
 | `scripts/28-hide-dashboard-toolbar.py` | **隐藏看板右上角 TB 时间/实体选择器**（存量客户副本） | `~/energy-app` |
 | `scripts/29-dedupe-time-controls.py` | **去掉看板里重复的时间选择**（已有查询设置时关掉部件自带的） | `~/energy-app` |
+| `scripts/30-fix-param-mode.py` | **统一查询设置的指标选择形态**（存量客户副本的 `multiParam`） | `~/energy-app` |
+| `scripts/12-cassandra-recover.sh` | **Cassandra commitlog 损坏自愈**（无限重启时用） | `~/energy-app` |
+| `scripts/13-demo-account.sh` | **演示账号 + 演示数据**（`--with-rtu` 带现场真机 4 台） | `~/energy-app` |
 
 > `docker-00` 与 `docker-97` / `docker-98` **只在仓库里**，不要从部署目录找 ——
 > 它们要读仓库源码。
@@ -688,6 +691,7 @@ scripts/21-rtu-onboard.py  scripts/22-watch-rtu.py  scripts/23-demo-simulator.py
 scripts/24-device-categories.py  scripts/25-fix-analysis-scope.py
 scripts/26-sync-dashboard-templates.py  scripts/27-customer-surface-probe.py
 scripts/28-hide-dashboard-toolbar.py  scripts/29-dedupe-time-controls.py
+scripts/30-fix-param-mode.py  scripts/12-cassandra-recover.sh  scripts/13-demo-account.sh
 ```
 
 **改脚本的铁律**：
