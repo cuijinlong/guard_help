@@ -252,6 +252,29 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 
 ---
 
+### 3.0.3 图表部件的两种形态与统一规格
+
+6 个图表部件（能耗概览 / 分项能耗 / 历史能耗 / 实时能耗 / 能源流向 / 峰谷分析）
+都提供 **图表 ⇄ 数据表** 切换，且规格统一：
+
+| 项 | 规格 |
+| --- | --- |
+| 位置 | 右上角，`top: 34px`（避开 TB 自带的部件操作按钮） |
+| 尺寸 | 图标 26×26，容器 padding 2px，圆角 6px |
+| 显隐 | 默认 `opacity: 0; pointer-events: none`，`:hover` 时恢复 |
+| 激活色 | `--tb-primary-600`（当前形态高亮） |
+| 数据 | 两种形态读同一份数据（如 `bEnergy` / `billingRows`），数字必须一致 |
+
+改任一部件时，另外 5 个要一起改 —— 类名与样式分散在各部件内，
+没有共享 CSS（TB 部件之间无法互相引用样式）。
+
+**看板高度**：`gridSettings.autoFillHeight` 让网格恰好一屏。
+≤ 20 行的看板开启，> 20 行（如 36 行的「我的账单」）保持固定行高、页面可滚 ——
+否则行高被均摊到 25px，部件全被压扁。
+
+**查询设置高度**：`query_panel.sizeY` 必须等于「该看板最大底边 − 它自己的 row」，
+否则左侧会矮一截或在中间才开始。
+
 ### 3.1 能耗概览 / 实时能耗
 
 **看什么**：当前功率、今日电量、负荷率、三相电压电流。
@@ -687,22 +710,40 @@ POST /api/energy/device-config                  # 写
 
 **看什么**：没装表的分项（空调、其他水表），按月人工填一个总量。
 
-**页面结构**（2026-10-26 改，对齐原型）：左侧**查询设置**（设备类型多选 / 设备勾选 / 年 + 起止月）
-右侧**查询结果**（折线图 + 数据表详情）；录入在右上角「用能数据录入」按钮弹出的**右侧抽屉**里。
+**看板由三个 TB 原生部件组成**（2026-10-26 拆的，与其它 13 个报表看板同构）：
 
-**只对虚拟表开放**：
+| 位置 | 部件 | 职责 |
+| --- | --- | --- |
+| 左 6×11 | `energy_management.query_panel` | 选设备 / 指标 / 时间 |
+| 右上 18×7 | `energy_management.timeseries_chart` | 折线图 + 数据表（同一部件内切换） |
+| 右下 18×4 | `energy_management.manual_entry` | 「用能数据录入」按钮 + 右侧抽屉 |
 
-- 查询设置的设备清单来自 `/api/energy/manual-entry/meta` 的 `devices`，
-  后端按 `MeteringMath.isVirtual(Device)` 过滤 —— 实时表根本不在候选里。
-- 保存时后端再校验一次：非虚拟设备直接 400（`设备 … 不是本场站的虚拟设备，不能手工填报`）。
-  前端过滤只是体验，**真正的门闩在后端**（否则改个请求就能写脏数据）。
-- 实时表的漏抄补录走抄表链路 `/energy/meter-reading/field-submit`，不在这里。
+拆之前是一个 `manual_entry` 包办三者：查询设置自绘一套、折线图也自绘一套，
+于是同类系统里出现两套查询样式、两份图案，而且手工填报的图没有图例开关 / tooltip /
+图表-表格切换 / 缩放条（`timeseries_chart` 全都有）。
 
-**查询结果读的是已保存值**：接口返回的 `fill`（`{deviceId: {"1": 1820, …}}`）是库里的快照，
-不读输入框的未保存编辑。所以改了没保存，图表不会先变；保存成功后重拉 meta 并重算。
+**查询设置的两个专用开关**（都只在这个看板打开）：
 
-**单位口径**：只选一种设备类型时标 `单位 kWh`；混选多种品种时标「多品种」——
-把 kWh 与 t 相加没有业务意义，界面不能给这种暗示。
+| 设置 | 值 | 为什么 |
+| --- | --- | --- |
+| `virtualOnly` | `true` | 设备树只列 `additionalInfo.deviceVirtual='virtual'` 的表。默认 `false`，其它看板不受影响 |
+| `defaultCurrentYear` | `true` | 时间默认「今年 1/1 ~ 12/31」+ 粒度「按年」。默认 `false` |
+
+`virtualOnly` 打开时**同时跳过品种过滤**（`inSourceProfiles` 直接返回 true）：
+虚拟表跨品种，而三相场站唯一的虚拟表是水表 —— 若还按「电能」筛，树是空的。
+品种下拉也一并隐藏（`showKind=false`），留着只会误导。
+
+**只对虚拟表开放**（三道门，缺一不可）：
+
+1. 前端设备树：`virtualOnly` 过滤（见上）
+2. 后端元数据：`/api/energy/manual-entry/meta` 只返回 `MeteringMath.isVirtual(Device)` 为真的设备
+3. 后端保存：`/api/energy/manual-entry/save` 再校验一次，非虚拟设备返回 400
+
+前两道只是体验，**第三道才是门闩** —— 否则改个请求就能写脏数据。
+
+**时间粒度**：`query_panel` 按跨度自动定档（>31 天 → 月）。月度数据在
+`timeseries_chart` 里用「日桶 + 前端按自然月归并」的方式取，横轴才是真正的
+`2026-01` / `2026-02`。直接给服务端 30 天桶会串月（实测 2 月变 2630、3 月丢失）。
 
 **存储**：写在 `energy` 键的**月首 00:00** 这一个点上（整月总量，不是小时增量）。
 
@@ -712,7 +753,7 @@ SELECT to_char(to_timestamp(t.ts/1000) AT TIME ZONE 'Asia/Shanghai','YYYY-MM') A
        coalesce(t.dbl_v, t.long_v) AS 填报用量
 FROM ts_kv t
 WHERE t.entity_id = '<虚拟表设备id>'
-  AND key = (SELECT key_id FROM key_dictionary WHERE key = 'energy')
+  AND t.key = (SELECT key_id FROM key_dictionary WHERE key = 'energy')
   AND extract(day from to_timestamp(t.ts/1000) AT TIME ZONE 'Asia/Shanghai') = 1
   AND to_char(to_timestamp(t.ts/1000) AT TIME ZONE 'Asia/Shanghai','HH24:MI') = '00:00'
 ORDER BY 月份;
@@ -725,8 +766,6 @@ ORDER BY 月份;
   人工填的总量没有小时分布，硬拆峰谷等于编数。
 - 判定依据是 `device.additional_info ->> 'deviceVirtual'`，**不是** SERVER_SCOPE 属性。
   平台统一用 `MeteringMath.isVirtual(Device)`，不要再各写一份。
-
----
 
 ### 3.9 参数报表
 

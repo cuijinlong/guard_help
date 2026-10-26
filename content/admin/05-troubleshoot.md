@@ -4081,3 +4081,361 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8090/api/energ
 # ③ 给别的客户预置 → 403
 # ④ audit 的 siteCount 只含自己客户的场站数
 ```
+
+---
+
+### 现象 Y11：部件自绘查询设置/图表，与其它看板两套样式
+
+**症状**
+
+同一套系统里，手工填报页的查询设置长得和历史能耗不一样（勾选框位置、搜索框、
+时间控件形态都不同），折线图也没有图例开关 / tooltip / 图表-表格切换 / 缩放条，
+而历史能耗的图全都有。
+
+**原因：一个部件把三件事都做了。**
+
+早期 `manual_entry` 部件内部自绘了「查询设置 + 折线图 + 明细表 + 录入表格」，
+理由是「录入与查询共用同一份 `/manual-entry/meta` 快照，不存在两套口径」。
+代价是维护两套 UI 实现，且交互能力只有另一套的一小部分。
+
+原始设计文档（`nenghaobao/问题台账.md`）写的是两块：
+
+> 装配成 `query_panel`（选场站/范围/账期）+ 新的 `manual_entry` 部件（右侧）
+
+但装配脚本 `82-assemble-manual-entry-board.mjs` 落地时清空了其它部件：
+
+```js
+cfg.widgets = {};
+cfg.widgets[WIDGET_ID] = widgetEntry(w);
+console.log(`原部件 ${before.length} 个 → 新部件 1 个`);
+```
+
+**修法（2026-10-26）：拆成三个 TB 原生部件**
+
+```
+查询设置 query_panel 6×11 @(0,0)      统计分析 timeseries_chart 18×7 @(6,0)
+                                       用能数据录入 manual_entry 18×4 @(6,7)
+```
+
+- `query_panel` 新增两个开关（默认都关，不影响其它看板）：
+  - `virtualOnly`：只列 `additionalInfo.deviceVirtual='virtual'` 的设备，并跳过品种过滤
+  - `defaultCurrentYear`：时间默认「今年全年」+ 粒度「按年」
+- `manual_entry` 删掉自绘的查询/图表/表格（descriptor 从 83KB 降到 62KB），
+  只留工具栏「用能数据录入」按钮 + 右侧抽屉；年份 / 下载 / 保存都在抽屉头。
+- `manual_entry` 通过 `state.siteCtx` 跟随顶栏场站（与其它部件同一路径）。
+
+**拆的时候最容易踩的三个坑**
+
+1. **别整个替换 `configuration`。** 它除了 `widgets` / `states` / `entityAliases`，
+   还有 `settings` 和 `timewindow`。整块覆盖会丢掉 `showStationSelect`
+   和 `showDashboardTimewindow` → 顶栏变成 TB 原生实体选择器 + 时间窗口，
+   场站上下文断掉，`manual_entry` 永远停在「加载中」。
+2. **`states.<state>.layouts.main.widgets` 里还有一份 id 清单。**
+   只改 `configuration.widgets` 而不同步布局，`DashboardWidgets.doCheck` 会拿到
+   `undefined.item` → 整页白屏。
+3. **月度数据的默认区间不能是「今天」。**
+   `query_panel` 默认 `fromDate=toDate=今天`，虚拟表只在月首有一个点 →
+   打开就是空白。用 `defaultCurrentYear`（跨年自动滚动），别用
+   `defaultRangeDays=365`（会跨年，X 轴多出两个月空桶）。
+
+**验证**
+
+```bash
+# 装配脚本自带校验：三个部件齐备 + 布局一一对应 + 两个开关已开
+TB_BASE=http://localhost:8090 DASH_ID=<看板id> \
+  node nenghaobao/energy-config/82-assemble-manual-entry-board.mjs verify
+```
+
+浏览器侧要看四件事：设备树只有虚拟表、X 轴是 `2026-01…2026-10`、
+切场站后树与图例一起变、抽屉能改值并保存成功。
+
+---
+
+### 现象 Y12：查询设置的时间范围变成「----年--月」
+
+**症状**
+
+峰谷分析（以及任何带查询设置的看板），直接点「查询」后，
+「时间范围」两个输入框清空，显示浏览器原生的占位符 `----年--月`。
+
+**原因：格式化的顺序反了 —— 先格式化、后定档位。**
+
+`fmtStamp()` 按 `scope.grainLevel` 决定输出格式：
+
+```
+day   → 2026-10-19
+month → 2026-10
+year  → 2026
+```
+
+而 `dashboardTimewindowChanged` 回调里原来是：
+
+```js
+scope.fromDate = fmtStamp(twf.startTimeMs);            // ① 用**旧**档位格式化
+var twDays = dayCountOf(...);
+scope.grainLevel = twDays <= 62 ? 'month' : 'year';    // ② 之后才改档位
+```
+
+于是「7 天窗口」判成 month 档，但 `fromDate` 还是 `2026-10-19`。
+这个值写进 `<input type="month">` 属于非法值，浏览器直接清空 ——
+中文环境下的空占位符就是 `----年--月`。
+
+触发路径：点「查询」→ `submit()` 调 `ctx.dashboard.onUpdateTimewindow()` →
+看板广播 `dashboardTimewindowChanged` → 走进出错的那个分支。
+
+**修法（两处，`query_panel`）：**
+
+1. **先定档，再格式化**
+   ```js
+   var days = dayCountOf(f.startTimeMs, f.endTimeMs);
+   scope.grainLevel = grainForSpan(days);      // 先定档
+   scope.fromDate = fmtStamp(f.startTimeMs);   // 再格式化
+   ```
+   `applyInitialRange()` 的 `initFromTimewindow` 分支同样顺序反了，一起改。
+
+2. **自己推上去的时间窗，不回写档位**
+
+   ```js
+   var selfPushingTw = false;   // submit 推窗前置 true
+   twSub = ...subscribe(function (tw) {
+     if (selfPushingTw) { selfPushingTw = false; return; }
+     ...
+   });
+   ```
+
+   档位（按日/按月/按年）是**用户的选择**。不拦这一下，
+   用户明明选的「按日 · 10-20~10-26」，一点查询就被反推成「按月 · 2026-10」，
+   两个日期框也变成 `2026-10 ~ 2026-10`，语义从「这 7 天」漂成「整个 10 月」。
+
+3. **跨度判据跟着改精确**
+
+   | 跨度 | 原档位 | 现档位 |
+   | --- | --- | --- |
+   | ≤ 1 天 | day | day |
+   | 2~62 天 | **month** ← 7 天也被判成按月 | day（≤31 天） |
+   | 63 天~1 年 | year | month（≤366 天） |
+   | 更久 | year | year |
+
+**自查**：点一次「查询」，两个日期框应有值且格式与档位一致
+（按日 → `2026-10-20`，按月 → `2026-10`），档位按钮高亮不变。
+
+---
+
+### 现象 Y13：图表部件互相挤压 / 切换按钮点不到
+
+**症状**
+
+- 峰谷分析右侧的饼图被堆叠柱形图挤到下一行，或压成一条窄缝；
+- 图例里的百分比被裁成「36.」；
+- 图表/数据表切换按钮点不动。
+
+**原因一：`flex-wrap: wrap` + 两个都 `flex: 1 1 xxx`**
+
+柱图 `flex: 1 1 320px`、容器 `flex-wrap: wrap` —— 宽度不够时饼图被换行挤下去。
+现在明确 3:1 分区，且柱图 `min-width: 0`（不加这句 `flex: 1 1 0` 压不下去）：
+
+```css
+.tb-tou-charts { flex-wrap: nowrap; }
+.tb-tou-chart  { flex: 1 1 0; min-width: 0; }   /* 吃掉剩余宽度 */
+.tb-tou-pie    { flex: 0 0 300px; }             /* 固定，不被挤压 */
+```
+
+300px 再按「饼 150 + 间距 12 + 图例 138」分配 —— 原来饼 176px 时图例只剩 112px，
+百分比数字被裁掉。
+
+**原因二：切换按钮被 TB 部件操作按钮盖住**
+
+TB 在部件右上角有自己的操作按钮（编辑/全屏/删除），绝对定位、约 32px 高。
+我方切换工具的 `top` 必须 ≥ 34px 才点得到（用 `top: 8px` 会整块被盖住）。
+
+**统一规格（全系统 6 个图表部件）**：
+
+| 部件 | 根选择器 | 工具类名 |
+| --- | --- | --- |
+| 能耗概览（历史用电量统计） | `.eqas-root` | `.eqas-tools` |
+| 分项能耗 | `.eqdg-root` | `.eqdg-tools` |
+| 历史能耗 / 基础报表 / 参数报表 / 手工填报 | `.eqc-root` | `.eq-view-tools` |
+| 实时能耗 | `.eqrt-root` | `.eq-view-tools` |
+| 能源流向 | `.eqsf-root` | `.eq-view-tools` |
+| 峰谷分析 | `.tb-tou` | `.eq-view-tools` |
+
+共同点：`position:absolute; top:34px; right:6~8px`，图标 26×26，
+激活色 `--tb-primary-600`，**默认 `opacity:0; pointer-events:none`，
+`:hover` 时恢复**。
+
+**改的时候踩过的坑**：
+
+```python
+# ✗ 正则删「强制可见」规则时会把 hover 规则一起咬掉
+pat = r'\.eqas-tools \{ opacity: 1; pointer-events: auto; \}'
+# .eqas-root:hover .eqas-tools { opacity: 1; pointer-events: auto; }   ← 也被匹配
+# 结果留下孤儿选择器 .eqas-root:hover，跟着后面的规则一起失效
+```
+
+删旧规则要带行首锚点或整行匹配，别用裸片段。
+改完必须实测 `opacity` 在 hover 前/后/移开三个状态（0 → 1 → 0），
+只看截图看不出来。
+
+---
+
+### 现象 Y14：看板高度超出屏幕 / 查询设置显示不全
+
+**症状**
+
+- 峰谷分析整页要滚动才能看到底部，查询设置的下半截被切在屏幕外；
+- 历史能耗的查询设置比右侧内容矮 2 行，下面留一条空白；
+- 基础报表的查询设置从第 2 行才开始，上面空了一截。
+
+**原因一：看板没有开启高度自适应**
+
+`gridSettings.autoFillHeight` 默认 `false` —— 行高固定（约 46px），
+`sizeY` 累计多少，页面就多高。峰谷分析 16 行 = 1046px > 1000px 视口 → 溢出。
+
+打开后行高按容器高度重算，整块网格恰好一屏：
+
+```sql
+UPDATE dashboard d
+SET configuration = jsonb_set(
+      d.configuration::jsonb,
+      '{states,default,layouts,main,gridSettings,autoFillHeight}', 'true'::jsonb)::text,
+    version = d.version + 1
+WHERE d.title = '峰谷分析';
+```
+
+**但行数多的看板不能开**：`autoFillHeight` 会把行高均摊 ——
+36 行的「我的账单」每行只剩 25.7px，部件全被压扁。
+判据是 **≤ 20 行才开**：
+
+| 看板 | 总行数 | autoFillHeight |
+| --- | --- | --- |
+| 手工填报 | 11 | ✅ |
+| 实时能耗 | 12 | ✅ |
+| 历史能耗 / 参数报表 / 抄表功能 | 15 | ✅ |
+| 基础报表 / 峰谷分析 | 16 | ✅ |
+| 我的账单 | 36 | ❌ 固定行高，页面可滚 |
+
+**原因二：`query_panel` 的 `sizeY` 没和右侧对齐**
+
+各看板原来手写的 `sizeY` 不一致（13/15/16），于是有的矮一截、有的从中间开始。
+统一规则：`query_panel.sizeY = 该看板最大底边 - query_panel.row`。
+
+**原因三：布局里有重叠（重装后会复现）**
+
+`basic_report` / `meter_reading` / `my_bills` 三个模板里存在部件坐标重叠 ——
+gridster 遇到重叠会**丢掉部件**（页面看起来少了一块）或互相遮盖。
+自查：
+
+```python
+# 任意两个部件的矩形是否相交
+for a, b in combinations(widgets, 2):
+    if a.col < b.col+b.sizeX and b.col < a.col+a.sizeX \
+       and a.row < b.row+b.sizeY and b.row < a.row+a.sizeY:
+        print('重叠', a.typeFullFqn, b.typeFullFqn)
+```
+
+当前修好的布局：
+
+```
+基础报表    qp(0,0,6×16) + chart(6,0,18×8) + detail(6,8,18×8)
+抄表功能    qp(0,0,6×15) + board(6,0,18×8) + batch(6,8,18×7)
+我的账单    qp(0,0,6×16) + crosstab(6,0,18×16) + list(0,16,24×10) + analysis(0,26,24×10)
+```
+
+**原因四：`query_panel` 内部不能撑破容器**
+
+设备树原来是 `min-height: 120px` —— 部件只有 100px 高时，树会撑出容器、
+把下半截顶出可视区。改成 `min-height: 0`（flex 可压缩），
+根容器加 `overflow-y: auto` 兜底。这样内容再多也只是出滚动条，不会"显示不全"。
+
+> **重装前必查**：布局与 `autoFillHeight` 都在
+> `guard-server/src/main/data/json/tenant/dashboards/*.json` 里。
+> 只改库不改模板，卸载删卷重装后问题全部复现。
+> 改完跑 `26-sync-dashboard-templates.py` 预演，必须显示「0 个需更新」。
+
+---
+
+### 现象 Y15：右侧下方有空缺（部件少一块高度）
+
+**症状**
+
+历史能耗右侧三块（最大值/最小值、统计分析、数据表详情）整体比左侧「查询设置」矮两行，
+右下角留着一条空白；其它看板也有类似情况（能源流向、抄表功能、电能质量…）。
+
+**原因：`widgets` 与 `layouts` 里的尺寸不一致。**
+
+TB 的看板布局有**两份**：
+
+```
+configuration.widgets.<id>.{col,row,sizeX,sizeY}                       ← 部件定义
+configuration.states.<state>.layouts.main.widgets.<id>.{col,row,sizeX,sizeY}  ← ★ 真正渲染用
+```
+
+渲染只看后者。历史能耗的 `detail_table` 是 `widgets: 7 行` / `layouts: 5 行` ——
+少 2 行 × 61.6px ≈ 125px，正好是右下角那条空白。
+
+**修法：以 `widgets` 为准同步 `layouts`**（两份必须成对改）：
+
+```python
+for st in cfg['states'].values():
+    for lay in st['layouts'].values():
+        for wid, w in cfg['widgets'].items():
+            lay['widgets'][wid].update({k: int(w[k]) for k in ('col','row','sizeX','sizeY')})
+```
+
+全量排查发现的不一致（2026-10-26 已修）：
+
+| 看板 | 部件 | widgets | layouts |
+| --- | --- | --- | --- |
+| 历史能耗 | detail_table | 7 行 | 5 行 |
+| 抄表功能 | meter_batch_detail | (6,8) 18×7 | (0,0) 24×15 |
+| 能源流向 | sankey_flow | (0,10) | (0,0) |
+| 电能质量 | power_quality | (0,24) | (0,0) |
+| 盘查报告 | audit_report | (0,36) | (0,0) |
+| 峰谷时段 | 5 个配置部件 | (0,12…60) | (0,0) ← 全部重叠 |
+
+`layouts` 全是 `(0,0)` 的那几个更严重：多个部件渲染在同一格，互相遮盖。
+
+**自查 SQL**
+
+```sql
+-- 列出某看板里 widgets 与 layouts 尺寸不一致的部件
+SELECT w.key,
+       replace(w.value->>'typeFullFqn','system.energy_management.','') AS 部件,
+       (w.value->>'row')::int  AS 定义_row, (w.value->>'sizeY')::int AS 定义_行高,
+       (l.value->>'row')::int  AS 布局_row, (l.value->>'sizeY')::int AS 布局_行高
+FROM dashboard d
+JOIN LATERAL jsonb_each(d.configuration::jsonb->'widgets') w ON true
+JOIN LATERAL jsonb_each(d.configuration::jsonb->'states'->'default'->'layouts'->'main'->'widgets') l
+     ON l.key = w.key
+WHERE d.title = '历史能耗'
+  AND (w.value->>'row')::int  <> (l.value->>'row')::int
+   OR (w.value->>'sizeY')::int <> (l.value->>'sizeY')::int;
+```
+
+**三层都要修，缺一层重装就复现**：
+
+1. 模板 JSON —— `guard-server/src/main/data/json/tenant/dashboards/*.json`
+2. 部署数据目录 —— `${APP_HOME}/data/json/tenant/dashboards/`（install 读的是这里，不是 jar）
+3. 库里已有的看板 —— 租户级 + 各客户副本
+
+> **install 读的是挂载的 `data/` 目录，不是 jar 内的副本。**
+> 只改源码不拷到 `${APP_HOME}/data`，重装后照样是旧布局 ——
+> 实测：修完模板后重装，仍有 10 处不一致，因为 `data/` 还停在旧版本。
+
+---
+
+### 现象 Y16：客户看板与租户模板不一致
+
+**原因**：客户看板是**建客户那一刻**从租户级模板复制的一份快照
+（`EnergyBootstrapInstaller`：`copy.setConfiguration(substitutePlaceholders(src.getConfiguration(), ...))`）。
+
+改模板只影响**以后新建的客户**。存量客户副本必须单独修：
+
+```sql
+-- 客户副本的配置不会自动跟随模板，需要逐个更新
+SELECT d.customer_id, d.title FROM dashboard d
+WHERE d.title = '历史能耗' AND d.customer_id IS NOT NULL;
+```
+
+**修复顺序**：改模板 → 推部署 data → `26-sync-dashboard-templates.py --apply`（推租户级）
+→ 存量客户副本按同一份配置覆盖。
