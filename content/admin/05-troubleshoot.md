@@ -4439,3 +4439,463 @@ WHERE d.title = '历史能耗' AND d.customer_id IS NOT NULL;
 
 **修复顺序**：改模板 → 推部署 data → `26-sync-dashboard-templates.py --apply`（推租户级）
 → 存量客户副本按同一份配置覆盖。
+
+---
+
+### 现象 Y17：查询维度已隐藏，出数却还是按分组
+
+**症状**
+
+看板里设了「显示查询维度 = 关闭」，界面上确实没有「按设备层级 / 按分组维度」单选，
+但查询结果按分项/区域分组出数，不是按设备。
+
+**原因：`showDimension` 只控渲染，不控状态。**
+
+```html
+<div class="eqp-field" *ngIf="showDimension">   <!-- 只隐藏了按钮 -->
+```
+
+`scope.dimension` 仍有值，`loadGroupRoot()` / `rebuildGroupRows()` 的判断是：
+
+```js
+if (scope.dimension !== 'device') { loadGroupRoot(); } else { loadDevices(); }
+```
+
+只要 dimension 停在某个 `dsN`，即使按钮看不见，树照样按分组渲染。
+用户看不到当前维度，也就无从改回来 —— 报表板面会莫名变成「按分项出数」。
+
+**修法（2026-10-26）：关闭即锁定。**
+
+```js
+// buildDimensions() 末尾
+if (!scope.showDimension) { scope.dimension = 'device'; }
+
+// onDimensionChange() 开头
+if (!scope.showDimension) { return; }
+```
+
+**现在的语义**：
+
+| `showDimension` | 行为 |
+| --- | --- |
+| `true` | 显示单选，可自由切换 |
+| `false` | 隐藏单选，**强制按设备层级**（场站 → 设备树） |
+
+历史能耗 / 参数报表 / 手工填报都是 `false`。
+
+**同类隐患**：任何「隐藏了控件但没锁状态」的开关都会这样。
+排查时搜 `*ngIf="showXxx"`，再看对应状态是否还有写入口。
+
+---
+
+### 现象 Y18：历史能耗只有 A 相和总有功功率，缺 B/C 相
+
+**症状**
+
+选「有功功率」，右侧只出 2 条线：`A相有功功率` + `总有功功率`；设计图上应该是 4 条。
+
+**先看表是不是单相 —— 大多数情况不是缺陷。**
+
+单相表本来就没有 B/C 相，采样里不存在 `power_b` / `power_c`：
+
+```sql
+-- 逐台设备看 A/B/C/总 各有多少点
+SELECT d.label,
+       count(*) FILTER (WHERE kd.key='power_a')     AS a,
+       count(*) FILTER (WHERE kd.key='power_b')     AS b,
+       count(*) FILTER (WHERE kd.key='power_c')     AS c,
+       count(*) FILTER (WHERE kd.key='power_total') AS tot
+FROM ts_kv t
+JOIN key_dictionary kd ON kd.key_id = t.key
+JOIN device d ON d.id = t.entity_id
+WHERE d.customer_id = '<客户id>'
+  AND kd.key IN ('power_a','power_b','power_c','power_total')
+GROUP BY d.label ORDER BY a DESC;
+```
+
+实测（2026-10-26，demo 客户）：
+
+```
+三相园-1#进线总表     a=1465  b=1465  c=1465  tot=1465   ← 四条线
+三相园-办公区总表     a=1465  b=0     c=0     tot=1465   ← 只有 A（该表本身是单相采样）
+单相园-1#进线总表     a=1465  b=0     c=0     tot=1465   ← 单相表，正常
+```
+
+判定依据是数据里有没有 `power_b` / `power_c`，不是设备档案名。
+
+**真正的缺陷长什么样**：三相表明明有 `power_b` 数据，界面却只出 A 和总。
+那时查两处：
+
+1. `GET /api/energy/metric-params` 里「有功功率」的 `children` 是否完整
+   （应为 `power_a` / `power_b` / `power_c` / `power_total` 四项）；
+2. `timeseries_chart` 的 `drawNow()` 是否因 `if (!pts.length) { return; }`
+   把空序列整条跳过 —— 空序列本就不该出现在图例里，这是对的。
+
+```bash
+curl -s "http://localhost:8090/api/energy/metric-params" \
+  -H "X-Authorization: Bearer $TOKEN" \
+  | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for k in d['kinds']:
+    for p in k.get('params',[]):
+        if p['name']=='有功功率':
+            print([c['key'] for c in p['children']])"
+# 期望：['power_a', 'power_b', 'power_c', 'power_total']
+```
+
+---
+
+### 现象 Y19：表格很难看（没边框 / 表头像普通文字 / 列宽乱）
+
+**症状**
+
+部件里的表格像一张没有样式的原生 `<table>`：表头和数据一样是黑字、
+行与行之间没有分隔、单元格挤在一起、数字位数上下不齐。
+
+**根因：动态部件用了 `mat-table`，但样式作用域匹配不到。**
+
+```html
+<!-- 部件 templateHtml 里能这么写，`[dataSource]` 也确实能绑上 -->
+<table mat-table [dataSource]="rows"> … </table>
+```
+
+`mat-table` 的样式写在 Angular 组件的 `scss` 里，带 emulated 封装
+（编译成 `.mat-mdc-table[_ngcontent-abc-123]`）。仪表板动态部件的 HTML 是
+运行时 `innerHTML` 注入的，**不参与组件编译**，没有那个 `_ngcontent` 属性 ——
+`.mat-mdc-table` 的规则一条都命中不了，只剩浏览器默认表格样式。
+
+**判定**
+
+```js
+// 浏览器控制台
+const t = document.querySelector('.me-table');
+getComputedStyle(t.querySelector('th')).padding;   // 期望 '0px 16px'，实际 '0px' → 样式没生效
+```
+
+**修复：改用全系统统一类名 `.tb-data-table`**（定义在
+`ui-ngx/src/styles.scss`，规格见《客户菜单》3.0.4）。
+
+迁移三步：
+
+1. `<table class="...">` → `<table class="tb-data-table">`（撑满加 `--fill`，
+   密集时间序列加 `--compact`）；
+2. 给单元格补语义类：`.tb-name`（实体名）/ `.tb-num`（数字）/ `.tb-muted`（时间）/
+   `.tb-empty`（空值）；汇总行 `.tb-sum`，rowspan 分组段首行 `.tb-group-start`；
+3. **删掉部件自己 `templateCss` 里的 `th, td` 规则**。部件内联样式优先级高于
+   全局类，留着 `padding: 4px 8px; border-right: 1px solid #f0f0f0` 会把
+   统一规范覆盖回旧样子 —— 这是迁移后"看起来没变"的最常见原因。
+
+迁移后核对：
+
+```bash
+# 全库检查还有哪些部件的表没有走统一规范
+docker exec -i energy-postgres psql -U postgres -d thingsboard -t -c "
+SELECT fqn FROM widget_type
+WHERE descriptor::text LIKE '%<table%'
+  AND descriptor::text NOT LIKE '%tb-data-table%';"
+# 期望只剩两个：energy_management.calendar_heatmap（日历格子）、
+#               energy_management.energy_type_config（后台配置表单）
+```
+
+**加完类名却"看起来没变"？** 九成是部件自己的旧规则还在覆盖。全局规范的所有选择器
+都套了 `:where()`，特异性只有 `(0,1,0)`；部件里写一句
+`.eqd-table td { padding: 6px 8px; border-right: 1px solid … }` 就是 `(0,1,1)`，
+一定赢。迁移时必须把这些规则**删掉**，只留列宽、列对齐、冻结偏移、语义色。
+
+```js
+// 控制台确认到底是谁赢了
+const td = document.querySelector('.eqd-table tbody td');
+getComputedStyle(td).borderRightWidth;   // 期望 '0px'
+getComputedStyle(td).padding;            // 期望 '0px 10px'（或 '0px 16px'）
+```
+
+**`mat-table` 的坑**：`<table mat-table>` 的 DOM 仍是标准 `<table><thead><tr><th>`，
+所以给 table 加 `tb-data-table` 类名**是有效的**；但 `mat-table` 自带的行高/内边距
+（写死在 `@angular/material` 组件 scss 里、带 `_ngcontent` 作用域）在动态部件里一条
+都不生效 —— 这才是"表格像没样式"的真正原因。改动最小的修法是加类名；
+结构清理干净的做法是改写成原生 `<table>`（`timeseries_table` 走的是后者）。
+
+注意区分两类 `.mat-mdc-*`：
+
+| 写法 | 是否生效 | 原因 |
+| --- | --- | --- |
+| `@angular/material` 内置样式（`.mat-mdc-table` 的行高/padding） | ✗ | 带 `_ngcontent` 作用域，动态部件没有那个属性 |
+| 你自己在部件 `templateCss` 里写 `.mat-mdc-cell { … }` | ✓ | 无作用域，只要 DOM 上有这个 class 就命中 |
+
+所以 `manual_entry` 里那些 `.mat-mdc-form-field-*` 的覆盖是有效的（form-field 确实
+渲染了这些类名），只有针对 `mat-table` 内置盒模型的部分要换成 `.tb-data-table`。
+
+**不要用 `::ng-deep` 去穿透** —— 部件里没有 Angular 的样式宿主，
+`::ng-deep` 在 `templateHtml` 的 `<style>` 里是无效选择器；
+写在 `styles.scss` 里则需要给每个部件加一个包裹类，等于又回到"每个部件一套"。
+
+---
+
+### 现象 Y20：界面上出现带客户后缀的技术名
+
+**症状**
+
+查询设置的树、图表图例、排名列表里显示
+`三相园-1#进线总表·平台演示中心`，而客户台账上是 `三相园-1#进线总表`。
+
+**根因：取了 `entity.name` 而不是 `entity.label`。**
+
+TB 的实体有两个名字：
+
+| 字段 | 含义 | 约束 |
+| --- | --- | --- |
+| `name` | 技术名 | 租户内唯一；演示数据带客户后缀避免多客户重名 |
+| `label` | 显示名 | 可重复；客户自己维护的台账名 |
+
+统一写法：
+
+```js
+d.label || d.name || d.id.id      // 设备
+a.label || a.name                 // 资产
+```
+
+**排查：哪些部件还在用技术名**
+
+```bash
+cd guard-server/src/main/data/json/system/widget_types
+python3 - <<'PY'
+import json, glob, os, re
+for f in sorted(glob.glob('*.json')):
+    js = (json.load(open(f, encoding='utf-8'))
+            .get('descriptor', {}).get('controllerScript', '') or '')
+    for m in re.finditer(r'[^\n]*\b(?:d|dev|device)\.name\b[^\n]*', js):
+        s = m.group(0).strip()
+        if 'label' in s or len(s) < 10:
+            continue
+        print('%-46s %s' % (os.path.basename(f)[:-5], s[:110]))
+PY
+```
+
+2026-10-26 按这条扫出来的三处已修：能耗概览排名列表的叶子计量点、
+电能质量告警台的设备名、能源流向桑基图的节点名。
+
+**查询设置的搜索框例外**：同时匹配 `label` 与技术名 —— 客户可能按台账名搜，
+也可能拿着系统导出表按技术名搜。两处都命中：
+
+```js
+if ((d.label || '').toLowerCase().indexOf(qq) >= 0) { return true; }
+if ((d.name  || '').toLowerCase().indexOf(qq) >= 0) { return true; }
+```
+
+**核查数据本身**（label 为空时界面会退化成技术名，属于兜底而非缺陷）：
+
+```sql
+SELECT 'device' AS 类型, name AS 技术名 FROM device WHERE label IS NULL OR label=''
+UNION ALL
+SELECT 'asset',           name          FROM asset  WHERE label IS NULL OR label='';
+```
+
+---
+
+### 现象 Y21：Y 轴刻度与网格线对不齐 / 最下面一档压到 X 轴标签上
+
+**症状**
+
+折线图的水平网格线与左侧刻度数字错开几像素；`0` 那一档落在 X 轴日期上，
+看起来像两个数字叠在一起。
+
+**根因一：刻度与网格线用了两套映射。**
+
+网格线在 SVG 的 `viewBox` 坐标系里（`H = 360`），刻度标签在 CSS 百分比里。
+两者必须由**同一个公式**换算：
+
+```js
+// 网格线 y（viewBox 坐标）
+y = H - PAD - (v - vmin) / (vmax - vmin) * (H - 2 * PAD)
+
+// 刻度 top（百分比）—— 注意 (H - y) / H，方向相反
+pct = (PAD + (vmax - v) / (vmax - vmin) * (H - 2 * PAD)) / H * 100
+```
+
+少了 `PAD` 就会出现固定偏移（`PAD=10` 时约 3% 高度）。
+
+**根因二：刻度容器的高度不等于 SVG 的高度。**
+
+```html
+<div class="eqc-plot">                        <!-- flex 列 -->
+  <svg …></svg>                               <!-- flex: 1 1 auto -->
+  <div class="eqc-xlabels">…</div>            <!-- 18px -->
+  <div class="eqc-zoom">…</div>               <!-- 26px + 4px margin -->
+</div>
+```
+
+`.eqc-plot` 的总高度里有 48px 被下面两块占掉，`<svg>` 只占剩下的部分。
+刻度若按整个 `.eqc-plot` 的高度算百分比，最下面一档就会掉进 X 轴标签区：
+
+```css
+.eqc-ylabels-inner { position: relative; flex: 1 1 auto; margin-bottom: 48px; }
+```
+
+**验证（浏览器控制台）**
+
+```js
+const t = [...document.querySelectorAll('.eqc-ylabels span')]
+            .map(e => Math.round(e.getBoundingClientRect().top));
+const g = [...document.querySelectorAll('.eqc-plot svg line')]
+            .map(l => Math.round(l.getBoundingClientRect().top));
+console.log(t, g);   // 两组数字的差值必须恒定（约等于标签行高的一半），不能逐档变大
+```
+
+差值恒定即对齐；逐档变大说明漏了 `PAD`，整体偏移说明容器高度没扣 48px。
+
+**刻度文案**用 `fmtTick` 而不是 `fmtNum`：设计图是 `250 / 200 / … / 0`，
+`fmtNum` 会输出 `250.0 / 0.0`，三列小数点在窄轴上很脏。
+
+---
+
+### 现象 Y22：跨行（rowspan）合并的位置看不到表格边线
+
+**症状**
+
+最大值最小值表里，设备列 `rowspan=4`；参数那 4 行之间都有分隔线，
+但**设备列上那一片是空的** —— 看起来像边框掉了，或者整列被挖空。
+
+**这不是 bug，是 `border-collapse: separate` 下 rowspan 的固有行为。**
+
+每个单元格只画自己的 `border-bottom`。合并之后设备格只剩"整段末尾"那一根，
+被它跨过的 3 行在设备列上没有对应的格子，自然没有线可画。
+
+**修法：给合并格加 `.tb-span`，用等间距渐变在格子内部补线。**
+
+```html
+<td class="tb-name tb-span" [attr.rowspan]="r.deviceSpan">{{ r.deviceName }}</td>
+```
+
+```css
+.tb-data-table td.tb-span {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0, transparent calc(var(--tb-row-pitch, 36px) - 1px),
+    rgba(0,0,0,.06) calc(var(--tb-row-pitch, 36px) - 1px),
+    rgba(0,0,0,.06) var(--tb-row-pitch, 36px));
+}
+```
+
+**关键：`--tb-row-pitch` 必须按实测行距写，不能写死。**
+
+```js
+function syncSpanPitch() {
+  setTimeout(function () {
+    var t = document.querySelector('.eqc-table-ex');
+    if (!t) { return; }
+    var trs = t.querySelectorAll('tbody tr');
+    if (trs.length < 2) { return; }
+    var pitch = Math.round(trs[1].getBoundingClientRect().top - trs[0].getBoundingClientRect().top);
+    if (pitch > 0) { t.style.setProperty('--tb-row-pitch', pitch + 'px'); }
+  }, 0);
+}
+```
+
+写死 36px 会怎样：普通行确实是 36px，但密集模式是 30px、手工填报里嵌了输入框
+会到 52px。差 6px 时前几根线还看得过去，到第四行就明显错位，最后一行完全对不上 ——
+用户看到的是"补的线和真边框不在一条水平线上"，比不补更难看。
+
+**验证**
+
+```js
+const t = document.querySelector('.eqc-table-ex');
+const pitch = getComputedStyle(t).getPropertyValue('--tb-row-pitch');  // 如 '37px'
+const trs = t.querySelectorAll('tbody tr');
+console.log(pitch, Math.round(trs[1].getBoundingClientRect().top - trs[0].getBoundingClientRect().top));
+// 两个数一致（差 1 以内）才算对
+```
+
+**别用 `border-collapse: collapse` 绕**：collapse 下合并格同样没有内部横线，
+而且 sticky 冻结列在 Chrome 里会失效（这在本项目实测过，见 `.me-table` 的注释）。
+
+**哪些表的合并格要加**：`timeseries_chart`（极值表设备列 / 数据表详情的设备列与参数列）、
+`statistics_table`（设备列）、`detail_table`（设备列与参数列）。
+新增带 rowspan 的表格时，别忘了加类名 + 调 `syncSpanPitch()`。
+
+---
+
+### 现象 Y23：数据表详情的时间列不对（不是 5 分钟 / 列数不是 288）
+
+**正确口径（2026-10-26 定案，与设计图一致）**：
+
+```
+行 = 设备 × 参数 × 日期     （三个维度各自 rowspan 跨行）
+列 = 当天的 288 个 5 分钟   （00:00 / 00:05 … 23:55）
+```
+
+一天一行、288 格。**不是 24 个小时列。**
+
+**核对列数**
+
+```js
+document.querySelectorAll('.eqc-table-detail thead th.tb-num').length;   // 期望 288
+Array.from(document.querySelectorAll('.eqc-table-detail thead th.tb-num'))
+     .slice(0, 3).map(e => e.innerText);                                  // ["00:00","00:05","00:10"]
+```
+
+**为什么会变成 24 列（按小时）**
+
+明细取数是**第二路请求**（`interval=5min`），和图表的天/月桶分开。
+它有一段退化逻辑，命中就变成 24 列：
+
+```js
+var DETAIL_STEP  = 5 * 60000;
+var DETAIL_CHUNK = 2 * GRAIN_DAY;   // 2 天 ≈ 576 点 < 700
+var DETAIL_MAX_REQ = 80;
+
+// 块数 × 设备数 × 参数组数 > 80 → 退化
+if (nChunk * entities.length * groups.length > DETAIL_MAX_REQ) { step = GRAIN_HOUR; }
+```
+
+所以「勾了很多设备 / 选了很多指标 + 日期范围较长」会触发退化。
+界面上会有一行黄色说明；想恢复 5 分钟就缩小范围或少勾几项。
+
+**为什么必须切块，不能一次要完整区间**
+
+服务端 `ts_max_intervals` 默认 700。5 分钟 × 700 ≈ 2.4 天。
+一次查 7 天 = 2016 个间隔，直接超限被拒（报错是英文的，用户看不懂）。
+
+| 切法 | 7 天的请求数（1 设备 1 指标） | 每块点数 |
+| --- | --- | --- |
+| 不切 | 1（**超限失败**） | 2016 |
+| 每天一块 | 7 | 288 |
+| **2 天一块（当前）** | **4** | **576** |
+
+逐天切在"多设备多指标"时请求数会轻易上百，所以选 2 天。
+
+**列数对但大片是 `/` ？**
+
+先确认数据本身的采样间隔：
+
+```sql
+SELECT count(*) AS 点数,
+       to_char(to_timestamp(min(ts)/1000) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD HH24:MI') AS 最早,
+       to_char(to_timestamp(max(ts)/1000) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD HH24:MI') AS 最晚
+FROM ts_kv t JOIN key_dictionary kd ON kd.key_id = t.key
+WHERE kd.key = 'power_a'
+  AND t.entity_id = (SELECT id FROM device WHERE label = '三相园-1#进线总表'
+                     AND customer_id = (SELECT id FROM customer WHERE title = '平台演示中心'));
+```
+
+演示数据是**逐小时**写入的（`count ≈ 天数 × 24`），5 分钟列里每 12 格才有 1 个值，
+其余是 `/` —— 这是数据密度，不是渲染 bug。真实设备按 5 分钟上报就会填满。
+
+**分块合并时的一个坑**
+
+块是按毫秒切的，不一定对齐整 5 分钟，同一个槽位可能被切进两块。
+合并必须**追加**（`sink[idx][k].concat(m[k])`），不能赋值覆盖：
+
+```js
+if (sink === detailRaw && sink[idx][k]) { sink[idx][k] = sink[idx][k].concat(m[k]); }
+else { sink[idx][k] = m[k]; }
+```
+
+直接赋值会让前面几块被最后一块冲掉 —— 表现为「只有最后一两天有数据」。
+
+槽位内多点时取平均（不是后到覆盖），否则块边界那一格会丢数：
+
+```js
+var slot = acc[key][slotIdx] || (acc[key][slotIdx] = { sum: 0, n: 0 });
+slot.sum += Number(pt.v); slot.n++;
+```

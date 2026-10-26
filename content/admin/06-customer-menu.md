@@ -275,6 +275,196 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 **查询设置高度**：`query_panel.sizeY` 必须等于「该看板最大底边 − 它自己的 row」，
 否则左侧会矮一截或在中间才开始。
 
+---
+
+### 3.0.4 数据表格统一规范（`.tb-data-table`）
+
+全系统的表格只有一份定义：`ui-ngx/src/styles.scss` 里的 `.tb-data-table`。
+动态部件（`widget_type` 的 `templateHtml`）与普通 Angular 页面共用同一个类名。
+
+**为什么不用 `mat-table`**
+
+仪表板动态部件的 HTML **不参与 Angular 组件编译**。`mat-table` 的样式写在组件
+`scss` 里、带 emulated 作用域（`_ngcontent-xxx` 属性选择器），动态部件套上
+`.mat-mdc-table` 类名也匹配不到 —— 只会得到一个没有边框、没有内边距、
+表头和数据挤在一起的原生表格。所以部件里的 `mat-table` 只是"能跑"，
+视觉上并不跟随 TB 主题。
+
+统一规范改为**用 TB 的设计 token（`--tb-*`）复刻 Material 数据表的度量**，
+一次定义、全系统共用：
+
+| 项 | 规格 |
+| --- | --- |
+| 表头 | 高 40px，底色 `#fafafa`，12px / 500，`--tb-ink-2` 灰字，下边框 1px `--tb-line` |
+| 数据行 | 高 36px，13px，下边框 1px `rgba(0,0,0,.06)`，最后一行无边框 |
+| 内边距 | 横向 16px（密集表 `--compact` 为 10px） |
+| 竖线 | **没有**。只有水平分隔线 —— 逐格描边是 Excel 观感，表一宽就像网格纸 |
+| 数字列 | `.tb-num` 右对齐 + `tabular-nums`，保证大小数的位数上下对齐 |
+| 实体列 | `.tb-name` 字重 500，作为视觉锚点（设备名 / 参数名） |
+| 次要信息 | `.tb-muted` 用 `--tb-ink-3`（时间、单位） |
+| 空值 | `.tb-empty` 弱化，字符仍由模板决定（设计图用 `/`） |
+| 行悬停 | 整行 `#f7f7f7`，横向读数时不串行 |
+| 汇总行 | `.tb-sum` 底色 `#fafafa` + 500 字重，与明细区分 |
+| 分组段 | `.tb-group-start` 加一条顶部分隔线，把 rowspan 的不同设备切开 |
+| 跨行单元格 | `.tb-span` 用等间距渐变在合并格内部补画横线（见下） |
+| 冻结列 | `.tb-sticky` 必须**不透明底色**，否则横向滚动时内容从底下透出来；`.tb-sticky-last` 在右边缘补一条竖线交代层级 |
+
+**跨行单元格（rowspan）必须加 `.tb-span`**
+
+普通单元格靠自己的 `border-bottom` 画分隔线，一旦合并（`rowspan=4`）就只剩整段
+末尾那一根 —— 被跨过的那几行在合并列上是一片空白，整张表看起来像少了边线。
+这不是"边框被覆盖"，是 `border-collapse: separate` 下 rowspan 的固有行为。
+
+```html
+<td class="tb-name tb-span" [attr.rowspan]="r.deviceSpan">{{ r.deviceName }}</td>
+```
+
+```css
+.tb-data-table td.tb-span {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0, transparent calc(var(--tb-row-pitch, 36px) - 1px),
+    rgba(0,0,0,.06) calc(var(--tb-row-pitch, 36px) - 1px),
+    rgba(0,0,0,.06) var(--tb-row-pitch, 36px));
+}
+```
+
+`--tb-row-pitch` **不能写死**：普通行 36px、密集行 30px，手工填报那类还会被
+输入框撑高。必须由控制器在渲染后按**实测行距**写入：
+
+```js
+var a = trs[0].getBoundingClientRect();
+var b = trs[1].getBoundingClientRect();
+var pitch = Math.round(b.top - a.top);
+table.style.setProperty('--tb-row-pitch', pitch + 'px');
+```
+
+写死 36px 的后果是补出来的线逐行累积偏移，最后一行完全错位。
+`syncSpanPitch()` 要在**每次渲染与翻页之后**调用（`renderDetailPage` 里也要）。
+
+```html
+<table class="tb-data-table tb-data-table--fill">
+  <thead><tr><th class="tb-name">设备</th><th class="tb-num">最大值</th></tr></thead>
+  <tbody>
+    <tr class="tb-group-start"><td class="tb-name">1#进线总表</td><td class="tb-num">203.7</td></tr>
+    <tr><td class="tb-muted">2026-10-25 12:00:00</td><td class="tb-num">67.9</td></tr>
+  </tbody>
+</table>
+```
+
+修饰类只有两个：`--fill`（撑满容器）、`--compact`（密集时间序列，行高 30/32px）。
+
+**迁移注意**：部件自己的 `templateCss` / `<style>` 里若还有 `th, td { padding; border-right; background }`
+之类的规则，**必须删掉** —— 部件内联样式会覆盖全局类（全局规则都套了 `:where()`，
+特异性只有 `(0,1,0)`；部件写 `.eqd-table td` 是 `(0,1,1)`，一定赢）。留着就把统一规范
+覆盖回旧样子，这是迁移后"看起来没变"的最常见原因。部件里只保留"本部件专有"的规则：
+列宽、列对齐、冻结列的 `left` 偏移、语义色。
+
+**`mat-table` 能不能用**：能，但**只加类名不够**。`<table mat-table>` 渲染出来的仍是
+标准 `<table><thead><tr><th>`，所以 `.tb-data-table` 的 `thead th` / `tbody td` 规则能命中；
+但 `mat-table` 自带的「行高 / 内边距 / 分隔线」写在 `@angular/material` 的组件 scss 里、
+带 `_ngcontent` 作用域，动态部件拿不到 —— 这才是表格难看的根因。
+所以：要么给 `mat-table` 加 `tb-data-table` 类名（推荐，改动最小），
+要么改写成原生 `<table>`（结构可控，`timeseries_table` 走的就是这条）。
+
+**已在 2026-10-26 迁移的部件**（全部 `templateHtml` 含 `tb-data-table`）：
+
+| 部件 | 表格 | 备注 |
+| --- | --- | --- |
+| `timeseries_chart` | 极值表 / 数据表详情 | 基准实现，见 3.2 |
+| `statistics_table` | 参数报表 | 设备 / 参数 rowspan |
+| `detail_table` | 明细表 | 左右双向冻结列 |
+| `tou_analysis` | 峰谷分析 | `--compact` |
+| `energy_overview` | 能耗概览排名 | 去掉了硬编码 #f7f9fc / #42576b |
+| `power_quality` | 电能质量（2 张） | `--compact` |
+| `sankey_flow` | 能源流向 | `--compact` |
+| `saving_records` | 节能记录 | `--compact` |
+| `audit_report` | 盘查报告（2 张） | `--compact` |
+| `billing_crosstab` | 账单交叉表 | 首列 + 表头冻结 |
+| `realtime_trend` | 实时能耗 | `--compact` |
+| `distribution_chart` | 分项能耗 | |
+| `asset_stats_chart` | 资产统计 | `--compact` |
+| `timeseries_table` | 时序表 | 由 `mat-table` 改写为原生 |
+| `meter_reading_board` | 抄表台账（2 张） | `mat-table` + 类名 |
+| `meter_batch_detail` | 抄表明细 | `mat-table` + 类名 |
+| `manual_entry` | 手工填报 | `mat-table` + 类名；`.mat-mdc-*` 选择器改为 `thead th` / `tbody td` |
+| `idle_energy_analysis_board` | 闲置能耗分析 | |
+
+**故意不迁移的**：
+
+- `calendar_heatmap` —— 日历格子靠 `border-spacing: 3px` 分隔，不是数据表；
+- `energy_type_config` —— 后台配置表，里面是 form 控件，行高由输入框决定。
+
+**核查命令**（还有哪些表格没走统一规范）：
+
+```bash
+cd guard-server/src/main/data/json/system/widget_types
+python3 - <<'PY'
+import json, glob, os, re
+left = []
+for f in sorted(glob.glob('*.json')):
+    d = json.load(open(f, encoding='utf-8'))
+    tpl = d.get('descriptor', {}).get('templateHtml', '') or ''
+    if '<table' in tpl and 'tb-data-table' not in tpl:
+        left.append(os.path.basename(f)[:-5])
+print('未迁移：', left or '无')
+PY
+```
+
+当前结果应为 `['energy_management_calendar_heatmap', 'energy_management_energy_type_config']`
+（都在上面的"故意不迁移"清单里）。
+
+---
+
+### 3.0.5 选项卡统一规格
+
+历史能耗右侧的三个视图用文字选项卡（`viewTabs=true`）。度量严格对齐
+TB 原生 `mat-tab`（Material 3）：
+
+| token | 值 |
+| --- | --- |
+| `tab-container-height` | 48px |
+| `tab-label-text-size` | 14px（`0.875rem`） |
+| `tab-label-text-weight` | 500 |
+| `tab-label-text-tracking` | `0.006rem` |
+| `tab-active-indicator-height` | 2px |
+| `tab-divider-height` | 1px |
+
+横向 padding 24px。以前写的是 `padding: 6px 14px` + 13px 字号，
+比 TB 任何一处 tab 都小一号，放在看板里像一行普通文字链接，
+用户认不出它是可切换的选项卡。
+
+`viewTabs=false` 的部件仍用右上角两个图标切换（图表 / 数据表），
+显隐规则见 3.0.3。
+
+---
+
+### 3.0.6 设备显示名一律用 `label`
+
+TB 的实体有两个名字：`name` 是**技术名**（租户内唯一，演示数据里带客户后缀，
+如 `三相园-1#进线总表·平台演示中心`），`label` 是**显示名**（`三相园-1#进线总表`）。
+
+**界面上出现的一律是 `label`**，取值写法统一为：
+
+```js
+d.label || d.name || d.id.id      // 设备
+a.label || a.name                 // 资产
+```
+
+技术名只用于：接口按名精确匹配、日志、SQL 排障。
+一旦上屏，客户会看到一串带后缀的长名字，既超宽又不像自己的台账。
+
+排查命令：
+
+```sql
+-- 找出 label 为空的实体（界面会退化成显技术名）
+SELECT 'device' AS 类型, name AS 技术名 FROM device  WHERE label IS NULL OR label=''
+UNION ALL
+SELECT 'asset',           name          FROM asset   WHERE label IS NULL OR label='';
+```
+
+查询设置的搜索框**同时匹配 label 与技术名**：客户可能按台账名搜，也可能按系统名搜。
+
 ### 3.1 能耗概览 / 实时能耗
 
 **看什么**：当前功率、今日电量、负荷率、三相电压电流。
@@ -356,6 +546,180 @@ WHERE t.entity_id = '<场站资产id>'
 ---
 
 ### 3.2 历史能耗
+
+**布局（2026-10-26）**：
+
+```
+查询设置 7×15  │  查询结果 17×15（内部三个选项卡）
+```
+
+右侧原来有三个独立部件（最大值/最小值 3 行 + 统计分析 5 行 + 数据表详情 7 行），
+纵向把图表压到 5 行。现在合并成一个 `timeseries_chart`，用 `viewTabs=true`
+打开文字选项卡（选项卡规格见 3.0.5）：
+
+| 选项卡 | 内容 |
+| --- | --- |
+| **最大值最小值** | 设备 / 参数 / 最大值 / 最大值时间 / 最小值 / 最小值时间；**设备列 rowspan 跨行** |
+| **数据折线图** | 折线图 + 图上极值标注 + Y 轴 6 档网格 |
+| **数据表详情** | 左侧固定两列（设备 rowspan + 参数）+ 右侧横向滚动时间列 + 底部分页 |
+
+顺序与默认项对齐设计图：**默认落「最大值最小值」**（第一个）。
+
+三块共用同一份数据（`allSeries[].pts`），切换不重新取数 —— 极值表与折线图的
+标注必然一致（实测 `203.7 / 20.1` 两处相同）。
+
+**部件标题是「查询结果」**，不是「统计分析」—— 三个选项卡里有两个根本不是统计图，
+标题叫"统计分析"会让人以为只有第一个选项卡是对的。
+`config.title` 与 `config.settings.title` 两处都要改（前者是部件头，后者是设置里的默认值）。
+
+**副标题那行去掉了**。原来图表上方有
+`2026-10-20 ~ 2026-10-26相电流报表折线图 · 4 条序列`——
+查询条件在左侧「查询设置」里已经写明一次，这里再写一次属于重复，
+而且把选项卡往下挤。模板里用 `*ngIf="lineCount && !viewTabs"` 排除历史能耗；
+其它看板没有选项卡，那行是唯一的说明文字，保留。
+
+**最大值最小值表：设备列 rowspan**
+
+```html
+<tr *ngFor="let r of extremaRows"
+    [class.tb-group-start]="r.deviceSpan > 0 && r.deviceGroupIdx > 0">
+  <td class="tb-name" *ngIf="r.deviceSpan > 0" [attr.rowspan]="r.deviceSpan">{{ r.deviceName }}</td>
+  ...
+```
+
+`deviceSpan === 0` 表示"被上一行跨过"，**不输出 `<td>`** —— 输出空单元格会多出一列，
+表格宽度和边框全部错开。`deviceGroupIdx` 是本页第几组，用来给非首组加段间分隔线
+（同名的两台设备被切成两段时不会连在一起）。
+
+无数据写 `/`（不是空白，也不是 `-`），时间是完整 `YYYY-MM-DD HH:mm:ss`。
+
+**数据表详情：5 分钟列 + 冻结列 + 横向滚动 + 分页**
+
+行 = **设备 × 参数 × 日期**（三个维度各自 rowspan 跨行），
+列 = 当天的 **288 个 5 分钟**（`00:00` / `00:05` … `23:55`）。
+一天一行、288 格 —— 看某天几点最高最直观。
+
+> 不是 24 个小时列。用户口径（2026-10-26）：「每天的列间隔是 5 分钟，不是 1 小时」，
+> 与设计图一致（原型 `for (h<24) for (m+=5)` 生成 288 列，`.col-time` 宽 60px）。
+
+**取数要按天切块，不能一次要完整区间。**
+
+服务端 `ts_max_intervals` 默认 700，5 分钟 × 700 ≈ 2.4 天。
+查 7 天直接超限被拒（报错还是英文的）。所以：
+
+```js
+var DETAIL_STEP  = 5 * 60000;      // 5 分钟
+var DETAIL_CHUNK = 2 * GRAIN_DAY;  // 2 天 ≈ 576 点 < 700
+var DETAIL_MAX_REQ = 80;           // 总请求数预算
+
+// 逐块请求，本地 concat 合并（不能赋值覆盖，否则只剩最后一块）
+grab(detailStep, detailRaw, chunk.fromTs, chunk.toTs);
+```
+
+- 按 **2 天一块**：7 天 = 4 块。逐天切会让请求数轻易上百；
+- 请求数超预算（`块数 × 设备数 × 参数组数 > 80`）时**主动退化回 1 小时**，
+  并置 `scope.detailStep = 3600000`，模板给出一行说明；
+- 跨度大到连按小时都取不了（`detailStep = 0`）时，时间列全空并说明原因 ——
+  总比整张表空白强。
+
+**槽位映射**（`detailSlotOf` / `detailSlotLabel`）：
+
+```
+5 分钟 → 288 槽，槽位 = 小时 × 12 + 分钟 / 5，标签 00:00 / 00:05 …
+1 小时 →  24 槽，槽位 = 小时，            标签 00:00 / 01:00 …
+```
+
+分块边界按毫秒切、不一定对齐整 5 分钟，同一个槽位可能被切到两块里 ——
+所以合并时用「同一槽位取平均」而不是后到覆盖，否则边界那一格会丢数据。
+
+**冻结列 + 横向滚动 + 分页**
+
+前三列（设备 / 参数 / 日期）用 `position: sticky` 冻结，宽度**必须写死**：
+
+```css
+.eqc-table-detail .eqc-th-dev,  .eqc-table-detail .eqc-td-dev   { left: 0;     width: 160px; }
+.eqc-table-detail .eqc-th-param,.eqc-table-detail .eqc-td-param { left: 160px; width: 132px; }
+.eqc-table-detail .eqc-th-date, .eqc-table-detail .eqc-td-date  { left: 292px; width: 104px; }
+```
+
+sticky 的 `left` 偏移必须**等于前一列的实际宽度**（160 / 160+132=292）。
+写成 `min-width` 时浏览器按内容撑开，偏移量却还是写死的 160px，
+于是参数列直接压到数据列上（实测：`…功功率` 与 `203.0` 重叠成一坨）。
+
+底部分页：`‹ 1 2 3 ›` + `共 N 条` + `10/20/50 条/页`。
+**rowspan 必须在页内重算** —— 跨页不能继承上一页的合并格，否则第一页末尾的设备
+会在第二页顶部凭空少一行；`deviceGroupIdx` 同理，否则第二页第一组会缺分隔线。
+
+**数据折线图：Y 轴 6 档网格**
+
+`buildYTicks(vmin, vmax, 5)` 把数据上下界向外扩到整齐步长的整数倍，
+再切 5 段出 6 条线（设计图是 `250/200/150/100/50/0`）。曲线仍按真实值绘制，
+只是坐标系多留一点余量 —— 这也是 ECharts / TB 原生图表的默认行为。
+直接用 `20.1 / 203.7` 当上下界会得到零碎刻度，读数困难。
+
+```js
+niceStep(raw)   // 1 / 2 / 2.5 / 5 / 10 × 10^n，保证步长是人能心算的数
+snap(step)      // 把 lo/hi 对齐到 step 的整数倍，并算段数
+while (count < 4)  { step /= 2; }   // 数据恰好落在整格上时段数会偏少
+while (count > 10) { step *= 2; }   // 跨度过大时防止密密麻麻
+```
+
+**刻度标签与网格线必须用同一个映射**，都带上绘图区的 `PAD` 内边距：
+
+```js
+pct = (PAD + (vmax - v) / (vmax - vmin) * (H - 2 * PAD)) / H * 100
+```
+
+刻度容器（`.eqc-ylabels-inner`）的高度还要扣掉 X 轴标签 18px 与缩放条 30px
+（`margin-bottom: 48px`）。SVG 只占 `.eqc-plot` 的一部分，刻度若按整个 plot
+高度算百分比，最下面那一档会掉到 X 轴标签上。
+
+刻度文案用 `fmtTick`（整数不带 `.0`），不是 `fmtNum` —— 设计图是 `250` 不是 `250.0`。
+
+`viewTabs` 默认 `false`，只有历史能耗打开；其它用 `timeseries_chart` 的看板
+（基础报表 / 参数报表 / 手工填报）仍是右上角的两个图标切换。
+
+**查询设置的三处锁定**（对齐设计图，实测 2026-10-26）：
+
+| 设置 | 值 | 效果 |
+| --- | --- | --- |
+| `fixedRangeOnly` | `true` | 隐藏「实时/历史」与「按日/按月/按年」，只留起止两个日期框；档位固定 `day` |
+| `defaultRangeDays` | `7` | 默认最近 7 天 |
+| `showDimension` | `false` | 隐藏维度单选，**固定按场站下的设备层级** |
+| `defaultParamCode` | `16` | 默认「有功功率」 |
+| `multiParam` | `false` | 参数单选（只选一级参数） |
+| `labelParam` / `labelTime` | `选择参数` / `选择时间` | 文案对齐设计图 |
+
+`fixedRangeOnly` 的横轴粒度仍按跨度自动定（`grainOfRange`）：
+≤1 天→时 / ≤62 天→天 / 更长→月。所以「按日/按月/按年」按钮虽被隐藏，
+出数粒度并不会退化成单一档。
+
+**`showDimension=false` 现在等于「锁定按设备层级」**（2026-10-26 加的护栏）：
+
+```js
+// buildDimensions() 末尾
+if (!scope.showDimension) { scope.dimension = 'device'; }
+// onDimensionChange() 开头
+if (!scope.showDimension) { return; }
+```
+
+隐藏了单选按钮却仍允许 `dimension` 停在某个分组维度，是自相矛盾的：
+用户看不到当前是哪个维度，树却按分组渲染 —— 报表板面会莫名其妙变成
+「按分项而不是按设备」出数。所以关闭即锁定。
+
+> 参数报表、手工填报也是 `showDimension=false`，行为一致（本来就期望按设备层级）。
+
+**一级参数 → 二级指标展开**：
+
+选「有功功率」（`code=16`）后，`timeseries_chart` 按 `paramSeries` 展开该参数的全部
+`children`：`power_a` / `power_b` / `power_c` / `power_total` → A/B/C 相 + 总有功功率。
+单相表只有 `power_a` / `power_total`（本来没有 B/C 相），所以只出两条线 ——
+不是丢数据。同理相电压、相电流、无功功率、视在功率、功率因数都是 3+1 展开。
+
+**查询设置宽度**：所有含该部件的看板都是 `sizeX=7`（原 6），
+同排右侧部件左移 1 列、收窄 1 列（`col=7 / sizeX=17`）。
+左右内边距 `12px / 22px` —— 右边略大于左边，首行 `.eqp-head` 再留 26px 避开
+TB 部件右上角的操作按钮。
 
 **看什么**：任意时间段内的电量趋势（小时/日/月粒度）。
 
