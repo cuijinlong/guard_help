@@ -53,7 +53,7 @@ bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
 
 ```bash
 ls ~/energy-app/guard-server-4.4.0.jar
-ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 20
+ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 23
 ```
 
 > **`.env` 是隐藏文件**，`ls` 看不到。看内容：`cat ~/energy-app/.env`。
@@ -664,7 +664,7 @@ docker compose --profile split up -d
 | `scripts/05-import-customer-data.py` | 客户台账导入 | `~/energy-app` |
 | `scripts/06-verify-e2e.sh` | 全链路验收（53 项） | `~/energy-app` |
 | `scripts/07-init-menu.sh` | 菜单重建 | `~/energy-app` |
-| `scripts/08-verify-release.sh` | 发布内容验收（81 项） | `~/energy-app` |
+| `scripts/08-verify-release.sh` | 发布内容验收（84 项） | `~/energy-app` |
 | `scripts/09-onboard-customer.sh` | **一键开通一个客户**（带演示数据） | `~/energy-app` |
 | `scripts/10-cleanup-customer.sh` | **清理一个客户**（连带遥测，含隔离校验） | `~/energy-app` |
 | `scripts/11-cassandra.sh` | **Cassandra 管理**（status/init/enable/disable/uninstall） | `~/energy-app` |
@@ -920,7 +920,7 @@ bash scripts/02-onboard.sh ...（参数同上）
 | 水气汽表 | 6 台 | 客户 → 设备管理 |
 | 虚拟表 | 2 台 | 客户 → 手工填报 |
 | 仪表板 | 40 个（租户 20 + 客户 20） | 客户 → 仪表板 |
-| 客户菜单 | 14 个顶层项 | 客户登录后看左侧 |
+| 客户菜单 | 15 个顶层项 | 客户登录后看左侧 |
 
 ---
 

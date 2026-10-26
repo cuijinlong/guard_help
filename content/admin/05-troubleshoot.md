@@ -4970,3 +4970,652 @@ bash scripts/02-onboard.sh --admin <邮箱> --admin-pass '<密码>' \
   否则建客户会被 403（系统管理员不属于任何租户，TB 的设计）；
 - `--customer` 只是**显示名**，不会顺带建客户账号；要客户账号另跑
   `scripts/09-onboard-customer.sh --email ... --password ...`。
+
+---
+
+### 现象 Y25：`GET: /api/dashboard/<uuid> 404: OK`（重装后旧看板链接打不开）
+
+**先给结论：这不是 demo 初始化脚本的问题，也不是数据丢失。**
+
+**根因：仪表板 UUID 在每次重新部署时都会重新生成。**
+
+看板模板 `data/json/tenant/dashboards/*.json` **不带 id**（顶层只有
+`title / name / image / mobileHide / mobileOrder / configuration / resources`），
+uuid 是 install 时才生成的。所以：
+
+```
+上一次部署   历史能耗 → a9f51260-d08e-11f1-a241-b3d1071fb84e
+重装删卷后   历史能耗 → f53c40e0-d133-11f1-9c31-790224ad9987
+```
+
+浏览器书签 / 历史记录里的旧地址从此永久 404。把 uuid 的第三段（`d08e` vs `d133`）
+对比一下就能确认它属于哪一次部署。
+
+**三步确认（都不需要看代码）**
+
+```bash
+# ① 该 id 在当前库是否存在（0 行 = 是上一次部署的残留）
+docker exec -i energy-postgres psql -U postgres -d thingsboard -c \
+  "SELECT id, title FROM dashboard WHERE id='<旧uuid>';"
+
+# ② demo 用户的看板是否都正常（应全部 200）
+TOKEN=$(curl -s -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"demo@126.com","password":"demo123456"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+docker exec -i energy-postgres psql -U postgres -d thingsboard -t -A -c \
+  "SELECT id FROM dashboard WHERE customer_id IS NOT NULL;" \
+| while read -r id; do
+    printf '%s %s\n' "$(curl -s -o /dev/null -w '%{http_code}' \
+      -H "X-Authorization: Bearer $TOKEN" http://127.0.0.1:8090/api/dashboard/$id)" "$id"
+  done | sort | uniq -c
+# 期望：18 个 200，没有其它状态码
+
+# ③ 菜单里的看板引用是否都指向新库（应 0 条失效）
+docker exec -i energy-postgres psql -U postgres -d thingsboard -t -A -c \
+  "SELECT jsonb_path_query(config::jsonb, '\$.**.dashboardId')::text FROM custom_menu WHERE config IS NOT NULL;" \
+| tr -d '"' | while read -r d; do
+    c=$(docker exec -i energy-postgres psql -U postgres -d thingsboard -t -A -c \
+        "SELECT count(*) FROM dashboard WHERE id='$d';")
+    [ "$c" = "0" ] && echo "失效: $d"
+  done
+# 期望：无输出
+```
+
+实测（2026-10-26 全新重装后）：18/18 看板返回 200，菜单 18 条引用 0 条失效，
+全库不存在任何旧实例（`d08e-11f1` / `d092-11f1` / `d093-11f1`）的 id 引用。
+
+**客户侧正确做法**：从左侧菜单进入，**不要收藏具体仪表板地址**
+（收藏菜单页 / 首页即可）。菜单引用由 `EnergyMenuInstaller` 在每次部署时刷新，
+永远指向当前库的有效 id。
+
+**界面提示已改进**（2026-10-26，实测 7 秒内弹出）
+
+`GlobalHttpInterceptor` 现在对 `/api/dashboard/<uuid>` 的 404 弹出对话框：
+
+```
+标题  仪表板不存在
+正文  仪表板不存在或已被删除。
+      常见原因：系统重新部署后仪表板的内部编号会重新生成，旧的链接
+      （含浏览器书签）随之失效。请从左侧菜单重新进入；如需保留入口，
+      请收藏菜单页而不是具体仪表板地址。
+```
+
+i18n key：`dashboard.dashboard-not-found` + `dashboard.dashboard-not-found-title`
+（zh_CN / en_US 各一份）。
+
+**为什么必须用 MatDialog 而不是 toast**
+
+这是排查中最容易走错的一步。TB 的 toast 宿主是 home 组件模板里的
+`<div tb-toast>`（`home.component.html`），而访问失效看板时**当前路由就是 dashboard，
+不在 home 布局下** —— 页面里 `tb-toast` 数量为 0，通知 dispatch 出去也没人渲染：
+
+```js
+// 访问 /dashboard/<失效uuid> 时实测
+document.querySelectorAll('tb-toast').length;          // 0
+document.querySelectorAll('.toast-panel').length;      // 0
+document.querySelectorAll('.cdk-overlay-pane').length; // 0
+```
+
+改法：用 `dialogService.alert(title, content, '关闭')` —— MatDialog 走 CDK overlay
+挂到 `body`，任何路由下都能显示。
+
+排查同类问题时记住这条：**「代码执行了但界面没反应」先查宿主组件在不在**，
+不要急着怀疑逻辑分支。
+
+**为什么不去"固定看板 uuid"**：技术上可行（给模板 JSON 加 id、install 时 setId），
+但会引入两个更糟的问题：
+
+- 多环境共用同一份模板时 id 必然冲突；
+- 已经部署过的实例升级时 id 反而会变一次，等于把问题推迟到升级那一刻。
+
+TB 自己的模型也是「id 随机 + 靠菜单/别名引用」，本项目沿用，不加特例。
+
+---
+
+### 现象 Y26：按日选 30 天，柱子全挤成一条线 / Y 轴被拉到 1.5k，其他柱看不到
+
+**症状**：分项能耗（或区域能耗）切「按日」、范围拉到 30 天，图上几乎空白 ——
+只有左侧一根可能到顶的柱子，其余柱子的高度都是 0.5px；Y 轴顶端显示 `1.5k` 之类
+远超实际小时用量的数字。
+
+**根因：月度汇总点混进了小时桶**
+
+演示数据里的虚拟表（空调 / 炊事等手工填报表）按「**月首一个点 = 整月用量**」写入：
+
+```sql
+-- 空调分项整月的全部 energy_total 点（只有 2 个）
+SELECT to_char(to_timestamp(kv.ts/1000),'YYYY-MM-DD HH24:MI'), kv.dbl_v
+FROM ts_kv kv JOIN key_dictionary kd ON kd.key_id = kv.key
+WHERE kd.key='energy_total' AND kv.entity_id='<分项资产id>' ORDER BY kv.ts;
+-- 2026-09-01 00:00 | 1520
+-- 2026-10-01 00:00 |  760
+```
+
+按日视图把它当成「09-01 00:00 这**一个小时**用了 1520 kWh」（周围真实小时值约 3），
+`stackMax` 直接变 1520，其余 719 个桶被压到 0.5px 下限。
+
+**已修（2026-10-26）**：`asset_stats_chart` 在 `mapSeries` 里做两件事：
+
+- `spreadMonthly()`：序列平均点间隔 ≥ 20 天（或只有一个点）→ 判为月汇总序列，
+  把每个点按「到下一个点 / 该自然月月末 / 请求末端」的桶数**均分**，总量守恒；
+- `snapTs()`：所有序列的点吸附到 `fromTs + k*iv` 网格（取 floor）。
+  服务端 `interval` 聚合返回的 ts 是**桶内最后一个数据点**（小时桶 `:30`、天桶 `12:00`），
+  摊平点用的是整点 `:00`，精确比较永远不相等 —— 不吸附就会出现「某一天只剩一根柱子」。
+
+**判读（改之前要不要自己确认）**：
+
+```sql
+-- 某个分项资产在 30 天里的点数与最大值：点数只有 1~2 个、值上千 = 月汇总
+SELECT count(*), max(kv.dbl_v)::numeric(12,2)
+FROM ts_kv kv JOIN key_dictionary kd ON kd.key_id = kv.key
+WHERE kd.key='energy_total' AND kv.entity_id='<资产id>'
+  -- 2026-09-01 00:00 ~ 2026-09-30 23:59:59.999（毫秒）
+  AND kv.ts BETWEEN 1788192000000 AND 1790783999999;
+```
+
+修复后正确形态（2026-10-26 实测，30 天 / 6 分项）：Y 轴 `10.5`（该场站小时合计），
+`rects = 6 × 720 = 4320`，每天 24 小时的日周期清晰可辨。
+
+---
+
+### 现象 Y27：给看板新增了一个部件，接口里能看到、页面就是不渲染
+
+**这是最容易白查半天的一处**：仪表板有**两份**结构，必须同时改。
+
+```
+configuration.widgets                      ← 部件本体（配置、settings、几何）
+configuration.states.<state>.layouts.<layout>.widgets   ← gridster 布局索引
+```
+
+只往 `widgets` 里加，页面按 `layouts` 渲染 → 新部件完全不出现，浏览器控制台也**不报错**
+（不是报错被吞，是根本没进渲染列表）。
+
+**正确改法（两份一起写）**
+
+```python
+import json, subprocess
+did = '<看板id>'
+raw = subprocess.run(['docker','exec','-i','energy-postgres','psql','-U','postgres','-d','thingsboard','-At','-c',
+                      "SELECT configuration FROM dashboard WHERE id='%s';" % did],
+                     capture_output=True, text=True, check=True).stdout
+cfg = json.loads(raw)
+ws = cfg['widgets']
+for st in (cfg.get('states') or {}).values():
+    for lay in (st.get('layouts') or {}).values():
+        lw = lay.setdefault('widgets', {})
+        for wid, w in ws.items():
+            # 已存在 → 同步几何；不存在 → 补一条（mobileOrder 取当前最大值 +1）
+            if wid in lw:
+                lw[wid].update({k: w[k] for k in ('row','col','sizeX','sizeY')})
+            else:
+                order = max([l.get('mobileOrder') or 0 for l in lw.values()] + [0]) + 1
+                lw[wid] = {**{k: w[k] for k in ('row','col','sizeX','sizeY')},
+                           'mobileOrder': order, 'mobileHeight': w['sizeY']}
+body = json.dumps(cfg, ensure_ascii=False)
+subprocess.run(['docker','exec','-i','energy-postgres','psql','-U','postgres','-d','thingsboard','-c',
+                "UPDATE dashboard SET configuration = $cw$%s$cw$ WHERE id='%s';" % (body, did)], check=True)
+```
+
+改完接口确认：
+
+```bash
+curl -s -H "X-Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8090/api/dashboard/<id> \
+| python3 -c "import sys,json;d=json.load(sys.stdin);print(len(d['configuration']['widgets']),'widgets /',len(d['configuration']['states']['default']['layouts']['main']['widgets']),'layouts')"
+```
+
+两个数字必须相等（多 state 的看板按 state 分别核对）。
+
+> 模板文件（`data/json/tenant/dashboards/*.json`）里同样有 `states.layouts`，
+> 改模板时也要一起补，否则下次重装又丢。
+
+---
+
+### 现象 Y28：环形图图例只有色块没有文字 / 区域能耗页没有环形图
+
+**一、图例只有颜色没有 label**
+
+`distribution_chart` 的图例文本取 `slice.name`，而 `slice.name` 来自
+`collectLeafAssets()` 的返回值 —— 那个函数只产出 `{ id, type }`，
+实体名一路没带下来，于是 `name` 是 `undefined`，`<span>{{ s.name }}</span>`
+渲染成空，只剩前面的色块。
+
+**已修（2026-10-26）**：`collectLeafAssets` 出口统一补名，
+走一次 `/api/asset|device/{id}` 取 `label || name`，结果进 `nameCache` 复用。
+
+自查（页面控制台）：
+
+```js
+[...document.querySelectorAll('.eqdg-lg')].map(e => e.innerText.trim());
+// 修前：["", "", ...]（或只有数字）
+// 修后：["公共区域 3407.59 53.5%", "A栋办公区 2962.99 46.5%"]
+```
+
+**二、区域能耗页没有环形图**
+
+区域能耗与分项能耗**共用同一套部件**，差别只在 `analysis_bar.settings.siteChildType`
+（`分项` / `区域`）。如果区域页只有堆叠柱 + 排名、没有分布环图，
+说明看板里根本没挂 `distribution_chart`。
+
+**已补（2026-10-26）**：`area_energy.json` 增加 `distribution_chart`（12×5），
+并把「区域排名」挪到右列、「单元排名」下移一行。同步时注意 Y27 的
+`states.layouts` 双写。
+
+**三、两页口径必须一致**
+
+```
+分项能耗   analysis_bar(siteChildType=分项) + asset_stats_chart + distribution_chart + ranking_list
+区域能耗   analysis_bar(siteChildType=区域) + asset_stats_chart + distribution_chart + ranking_list × 2
+```
+
+两页的 `asset_stats_chart` 几何、`metricKey`、`agg` 必须完全相同，
+只允许 `titleTemplate` 里的「分项 / 区域」措辞不同。
+
+---
+
+### 现象 Y29：合计比实际大两三倍（关口表 + 下级表被一起加了）
+
+**症状**：能耗排名/概览的「合计」远大于进线表读数。例如单相园显示 306.24 kW·h，
+而进线总表只有 107.84 kW·h；「生产车间」区域显示 146092.59 —— 和整个三相场站一模一样。
+
+**根因：合计把父表和它的子表都加了一遍**
+
+同一度电只在上游计量一次。父表（进线 / 分项总表）的读数**已经包含**子表，
+两者相加就是重复计量。
+
+演示数据的典型结构（单相园）：
+
+```
+1#进线总表 (107.84)
+├── 照明分项总表 (55.32)
+│   └── A栋照明回路 (49.31)
+└── 插座分项总表 (49.90)
+    └── A栋插座回路 (44.47)
+
+全加 = 107.84+55.32+49.90+49.31+44.47 = 306.84   ← 错
+正确 = 107.84（只有进线）                        ← 对
+```
+
+**判据：用拓扑，不要用 meterLevel**
+
+```sql
+-- 某资产节点下，哪些表是「本范围内的关口表」（没有上级表）
+-- 这台的 parentDeviceId 为空，或父表不在这棵子树里
+SELECT d.label,
+       d.additional_info::jsonb->>'parentDeviceId' AS parent
+FROM relation r
+JOIN device d ON d.id = r.to_id
+WHERE r.from_id = '<区域或分项资产id>'
+  AND r.relation_type = 'Contains' AND r.to_type = 'DEVICE'
+ORDER BY d.label;
+```
+
+前端 `ranking_list` 的 `meters` 模式按这个判据把行分成两段：
+
+```
+关口表（不重复计量，参与合计）   ← 合计只加这一段
+普通表（下级表计，仅列明细不参与合计）
+```
+
+后端 `writeAssetTotal` 同样取拓扑根（`parentDeviceId` 指向的表不在集合内即为止口），
+并按品种分开写 `energy_total` / `water_total` / `gas_total` / `steam_total`。
+
+**另外两处必须同时满足**
+
+1. **区域只挂叶子表**。区域是空间分区，同一层必须互斥。进线总表挂到某个区域，
+   那个区域就等于全场站。判据：区域内各分区之和 ≤ 场站总量，差值 = 公共用电 / 线损。
+2. **跨品种不混算**。水的 m³ 和电的 kW·h 不是一个量纲，合计只报电力，
+   其他品种单独成句。
+
+**改完必须重算资产汇总**（否则页面还是旧值）
+
+```bash
+TOKEN=$(curl -s -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"demo@126.com","password":"demo123456"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+curl -s -X POST -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"days":60}' \
+  http://127.0.0.1:8090/api/energy/asset-totals/rebuild
+# {"ok":true,"assetsWritten":30,...}
+```
+
+> 重算现在是「**先清窗口内旧值再写**」。不清会残留上一版口径的值：
+> 实测品种修正后，`炊事` 同时存在旧的 `energy_total 780.65`（错）和新的
+> `gas_total 780.65`（对），页面出现两条同名不同单位的记录。
+
+---
+
+### 现象 Y30：环形图总量莫名其妙大得离谱（9998.80）/ 图例出现「资产 + 设备」混排
+
+**根因：扇区取了多个层级**
+
+旧的取数逻辑从根一路下钻到「叶子」，于是同一张图里同时出现：
+
+```
+区域资产   生产车间   4717.02
+分项资产   动力       4334.22   ← 和「生产车间」覆盖同一批电
+分项设备   1#进线总表  107.84   ← 又重复一次
+```
+
+三者相加 = 9998.80，没有任何业务含义。
+
+**修法：按维度定位同一层，只读该层节点自身已汇总的量**
+
+`distribution_chart` 新增设置项「按哪个维度分片」（`siteChildType`）：
+
+| 取值 | 含义 |
+| --- | --- |
+| 留空 | 跟随分析条件下发的维度（分项能耗 / 区域能耗页） |
+| 分项 | 只切分项（照明 / 动力 / 插座…） |
+| 区域 | 只切区域（车间 / 办公区…） |
+
+概览页这类**没有查询面板**的看板必须在部件设置里明确指定，
+否则拿不到维度、退回旧的全量下钻。该页已配 `分项`。
+
+**同名消歧**：两个场站都有「照明」，图例会出现两条一样的名字。
+现在只在重名时补场站前缀（技术名 `照明分项·单相园·平台演示中心` → `单相园·照明`），
+不重名时不动。
+
+**验证**
+
+```js
+// 页面控制台
+[...document.querySelectorAll('.eqdg-lg')].map(e => e.innerText.trim());
+// 期望：同层、互斥、名字不重复
+// 反例（修复前）：["生产车间 4717.02", "动力 4334.22", "1#进线总表 107.84", ...]
+```
+
+---
+
+### 现象 Y31：场站档案的「能源品种」一个选项都没有 / 报表列出用不到的品种
+
+**症状 A：场站档案 → 能源品种下拉是空的**
+
+```bash
+curl -s -H "X-Authorization: Bearer $TOKEN" http://127.0.0.1:8090/api/energy/dictionaries
+# {}   ← 前端下拉就拿不到任何选项
+```
+
+**根因**：`admin_settings.energyDictionaries` 从未初始化。
+
+**修**：`POST /api/energy/repair-init`（平台自检 → 一键修复初始化），
+返回里看 `dictionariesFixed: true`。它会把 `energyType` 分类**从品种库同步**：
+
+```
+品种库（energy_type_library）有哪些品种 → 下拉就有哪些选项
+code 必须与品种资产的 code 一致（elec / water / gas / steam）
+```
+
+全新部署时这一步在建客户流程里自动做（`onCreateCustomer`），不用手动点。
+
+**症状 B：只装电表的场站，报表里还能选水/燃气/蒸汽**
+
+**根因**：分析条件部件没带 `siteId` 请求品种清单，拿的是全量。
+
+**自查**：
+
+```js
+// 页面控制台看请求（Network 里看 URL 也一样）
+// 正确：/api/energy/metric-params?siteId=<场站id>
+// 错误：/api/energy/metric-params          ← 没带场站
+```
+
+服务端判定顺序：
+
+1. 场站属性 `energyType` 有值 → 严格按它；
+2. 没配 → 从该场站子树内设备的档案推断（`device profile.energyTypeCode`）；
+3. 都空 → 返回全部（**不会**因为你没建档就把功能关掉）。
+
+响应字段：
+
+```json
+{ "filtered": true, "siteKinds": ["elec"], "kinds": [ { "code": "elec", ... } ] }
+```
+
+`filtered=true` 且 `kinds` 为空 = 这个场站一个品种都没启用 ——
+部件会显示「本场站未启用能源品种，请到场站『档案』里选择」，
+**不会**回退到数据源实体（那会让过滤失效）。
+
+**首屏时序的坑（2026-10-27 踩过）**
+
+顶栏场站与品种清单是两条异步线，谁先完成不定。如果品种先完成，
+那次请求不带 `siteId`，之后顶栏才发布场站 —— 必须补一次带 `siteId` 的请求，
+否则「按场站过滤」在首屏永远不生效。判据是 `lastKindSiteKey`：
+与当前场站键不一致就重拉，一致才建树。
+
+**改了场站品种后没变化**：刷新页面。品种清单在部件初始化时拉取，
+切换场站会自动重拉，但同一场站改档案不会主动推。
+
+---
+
+### 现象 Y32：浏览器标签页还写着 ThingsBoard / 登录页换了但标签没变
+
+**三个可能的漏点，按顺序查**
+
+| # | 位置 | 症状 | 修 |
+| --- | --- | --- | --- |
+| 1 | `index.html` 的 `<title>` | 首屏闪一下官方名，之后才变 | 改成品牌名，重新构建前端 |
+| 2 | `TitleService` 的 `\|\| 'ThingsBoard'` 兜底 | 白标没配时标签页是官方名 | 改用 `BRAND_NAME` 常量 |
+| 3 | `WhiteLabelingService.platformName` 兜底 | 登录页版本行写官方名 | 同上 |
+
+**先确认是「没改」还是「没生效」**
+
+```bash
+# ① 构建产物里有没有旧品牌（0 = 源码已清干净）
+grep -c "ThingsBoard" ui-ngx/target/generated-resources/public/index.html
+grep -o "<title>[^<]*</title>" ui-ngx/target/generated-resources/public/index.html
+
+# ② 打进后端的 jar 里有没有新产物
+unzip -p guard-server/target/guard-server-4.4.0.jar \
+  BOOT-INF/lib/ui-ngx-4.4.0.jar > /tmp/ui.jar
+unzip -p /tmp/ui.jar public/index.html | grep -o "<title>[^<]*</title>"
+
+# ③ 容器里跑的是不是这个 jar
+docker exec energy-server sh -c 'unzip -p /app/guard-server-4.4.0.jar \
+  BOOT-INF/lib/ui-ngx-4.4.0.jar > /tmp/u.jar && unzip -p /tmp/u.jar public/index.html' \
+| grep -o "<title>[^<]*</title>"
+```
+
+① 有旧品牌 → 改源码；
+① 干净但 ② 有 → **ui-ngx jar 没装到本地 maven 仓库**，后端打进去的是旧依赖；
+② 干净但 ③ 有 → 容器跑的还是旧 jar，`cp` 后要 `docker compose restart energy-server`。
+
+**顺序必须是这样**
+
+```bash
+cd ui-ngx && ng build --configuration production
+jar cfM /tmp/ui-ngx.jar -C target/generated-resources .
+cp /tmp/ui-ngx.jar ~/Documents/dev_tools/maven_repository/rule-engine/org/thingsboard/ui-ngx/4.4.0/ui-ngx-4.4.0.jar
+cd ../guard-server && mvn -o package -DskipTests -q      # ← 必须在上一步之后
+cp target/guard-server-4.4.0.jar ~/energy-app/
+```
+
+反了的话 `mvn package` 会把**旧的** ui-ngx jar 打进 `BOOT-INF/lib/`，
+构建全绿、部署也成功，但浏览器看到的还是老界面 —— 最难查的一类。
+
+**只想改浏览器标签、不想动登录页**：改 `brand.models.ts` 的 `BRAND_NAME` 即可，
+它同时被 `index.html`（手写）、`TitleService`、`platformName` 兜底引用。
+
+---
+
+### 现象 Y33：登录页出现一条灰条 / 一个被裁切的图标
+
+**症状**：右栏「欢迎登录」上方多出一块横向灰条，或者一个只有半边、右边被切掉的图形。
+
+**根因**：平台内置的横版 logo 是 520×160（盾牌 + 中文 + 英文，右侧全带文字）。
+白标未配置时 `loginLogo` 返回 `assets/logo_title_white.svg`（白色版），
+在白色背景上几乎不可见；塞进 44px 高的位置又把宽度裁掉，只剩左侧图形。
+
+**已修（2026-10-27）**：判断规则改为「`logo_title_` 前缀 = 内置图，不展示」：
+
+```ts
+customLoginLogo$(): Observable<string> {
+  return this.wl.loginLogo$.pipe(
+    map(url => (!url || url.indexOf('logo_title_') >= 0) ? null : url)
+  );
+}
+```
+
+左栏品牌区用内联 SVG 盾牌 + 品牌名表达身份，不再依赖横版 logo。
+客户在「白标」菜单里真的传了自定义图（`tb-image://` 资源）才会显示在登录卡上方。
+
+**自查**：
+
+```js
+// 浏览器控制台
+document.querySelector('.custom-logo');   // 未配白标时应为 null
+```
+
+如果它存在且 `src` 指向 `assets/logo_title_*.svg`，说明判断没生效
+（前端产物没更新，见 Y32 的构建顺序）。
+
+---
+
+### 现象 Y34：白标里改了主色，登录页纹丝不动 / 改了 logo 登录页看不到
+
+**症状 A：白标选了别的色板，后台变蓝了，登录页还是品牌绿**
+
+**根因**：登录页的 SCSS 把品牌色写成了字面量 `#16834A`。
+Material 组件读 `--tb-primary-*` 会跟着白标变，而登录页读的是编译进去的常量。
+
+**已修（2026-10-27）**：登录页所有品牌色改成 CSS 变量 + 品牌绿兜底：
+
+```scss
+// ❌ 旧写法：白标换色，这里不动
+$brand-green: #16834A;
+
+// ✅ 新写法：白标换色，这里跟着变；没配白标就是品牌绿
+$brand-green: var(--tb-login-primary-600, #16834A);
+```
+
+**自查**：
+
+```js
+// 浏览器控制台（登录页）
+getComputedStyle(document.documentElement).getPropertyValue('--tb-login-primary-600');
+// 期望：白标配的颜色，例如 "#1976D2"
+// 若为 "#16834A" → 白标没生效，查下面的「三处变量是否同源」
+```
+
+**三处变量必须同源**，否则会出现「首屏青色闪一下、之后变绿」：
+
+```
+theme-constants.scss        → --tb-primary-*
+login-theme-constants.scss  → --tb-login-primary-*
+brand.models.ts             → 运行时默认（brandGreenPalette）
+```
+
+任一处还是 teal（`#00897b`）就说明没改到 —— 它会在某个时机短暂显示。
+
+---
+
+**症状 B：白标上传了 logo，登录页不显示**
+
+先分清两种情况：
+
+**① 只改了 appTitle，没传 logo** → 右栏本来就不该有图。
+左栏品牌区用内联盾牌 + 品牌名，是设计（避免和横版文字图重复）。
+
+**② 真传了 logo 但看不到**，按顺序查：
+
+```bash
+# 1. 白标里存的 URL 是什么
+curl -s http://127.0.0.1:8090/api/noauth/whiteLabel/loginWhiteLabelParams \
+| python3 -c 'import sys,json;print(json.load(sys.stdin).get("logoImageUrl"))'
+```
+
+| 输出 | 含义 | 修 |
+| --- | --- | --- |
+| `null` | 没配 | 见下面「正确的设置姿势」 |
+| `data:image/...` 或 `http://...` | **格式错**，后端会 500 / 前端裂图 | 必须是 `tb-image;...` |
+| `assets/logo_title_black.svg` | 内置默认图 | 设计上不显示，正常 |
+| `tb-image;/api/images/system/<key>` | 格式对 | 继续下一步 |
+
+```bash
+# 2. 图能不能取到（关键：必须是 200 + image/*）
+curl -o /dev/null -w '%{http_code} %{content_type}\n' \
+  http://127.0.0.1:8090/api/noauth/whiteLabel/loginLogo/system/<key>
+# 期望：200 image/png
+# 404 → 白标里存的 key 与实际上传的资源不一致
+```
+
+```js
+// 3. 页面里图有没有加载成功（naturalWidth 为 0 = 裂图）
+document.querySelector('.custom-logo')?.naturalWidth;
+```
+
+**正确的设置姿势**
+
+`logoImageUrl` 不是普通 URL，必须是平台图片资源引用，格式是
+**`tb-image;/api/images/system/<key>`**（分号，不是 `://`）：
+
+```bash
+# 上传（SYS_ADMIN）
+curl -X POST -H "X-Authorization: Bearer $SYS_TOKEN" \
+  -F "file=@logo.png" -F "title=品牌logo" \
+  http://127.0.0.1:8090/api/image
+# → {"resourceKey":"logo.png"}
+
+# 写入白标（注意 domainId 必须为 null，用 SYS_ADMIN）
+curl -X POST -H "X-Authorization: Bearer $SYS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"domainId":null,"appTitle":"青松能管",
+       "logoImageUrl":"tb-image;/api/images/system/logo.png",
+       "logoImageHeight":60}' \
+  http://127.0.0.1:8090/api/whiteLabel/loginWhiteLabelParams
+```
+
+**为什么这些格式这么严格**（三处代码都对格式有假设，错了就散架）
+
+```
+后端 getLoginImageKey()：url.split('/') 必须正好 5 段
+  'tb-image;/api/images/system/logo.png'
+   → ['tb-image;', 'api', 'images', 'system', 'logo.png']  ✓ 5 段，取 [4]
+
+前端 image pipe：先 removeTbImagePrefix('tb-image;')，
+  再用 /\/api\/images\/(tenant|system)\/(.*)/ 判断是否是资源图
+```
+
+写成 `tb-image://system/logo.png`（我第一版就是）会 404：
+分隔符是分号，且中间必须带完整 `/api/images/{system|tenant}/`。
+
+**返回 500 `Cannot read the array length because "input" is null`**
+= `logoImageUrl` 传了 data URI 或裸 URL，后端解不出来。改用 `tb-image;` 格式。
+
+**返回 400 `Domain id could not be empty`**
+= 用 TENANT_ADMIN 调了租户级接口，而社区版没有 domain 表。
+改用 **SYS_ADMIN** + `domainId: null` 走系统级。
+
+---
+
+**症状 C：改了 logo 尺寸，登录页图还是很小/被裁**
+
+图片展示规则已改成等比缩放：
+
+```
+max-width: 100%; width: auto; height: auto; object-fit: contain
+max-height: 白标的 logoImageHeight（默认 56）
+```
+
+如果图仍然偏小，是 `logoImageHeight` 配小了（它是**上限**，不是固定值）。
+调大白标里的 `logoImageHeight` 即可。若图被裁切，说明前端产物还是旧的
+（旧版写死 `height: 44px`），按 Y32 的顺序重新构建。
+
+---
+
+**症状 D：想彻底恢复默认品牌**
+
+```bash
+curl -X DELETE -H "X-Authorization: Bearer $SYS_TOKEN" \
+  http://127.0.0.1:8090/api/whiteLabel/currentLoginWhiteLabelParams   # 登录页
+curl -X DELETE -H "X-Authorization: Bearer $SYS_TOKEN" \
+  http://127.0.0.1:8090/api/whiteLabel/currentWhiteLabelParams        # 后台主题
+```
+
+期望回到：`--tb-login-primary-600 = #16834A`、品牌名「能源卫士」、
+无 logo、绿按钮、背景 `#F3F8F3`。实测 2026-10-27 双向切换均正常。
+
+> 若某个 DELETE 返回 405，稍等几秒重试一次即可（实测偶发，重试即 200）。

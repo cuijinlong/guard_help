@@ -33,7 +33,7 @@
 | 14 | 演示遥测 | 建客户时自动 | **62 天** × 24 点 ≈ 56 万条 | 图表全空；「按月」查询前半月空白、环比虚高 |
 | 15 | 仪表板 | 建客户时复制 | 客户 18 个（租户模板 20，其中「客户能源档案」「峰谷时段」是运营台，不复制） | 没有可视化 |
 | 16 | 租户菜单 | 建租户时自动 | 11 个顶层项 | 租户看不到能源入口，只剩 TB 原生菜单 |
-| 17 | 客户菜单 | 建客户时自动 | 14 个顶层项 | 左侧是 TB 原生菜单 |
+| 17 | 客户菜单 | 建客户时自动 | 15 个顶层项 | 左侧是 TB 原生菜单 |
 | 18 | **演示账号**（可选） | `13-demo-account.sh` | 1 个客户 + 1 个账号 | 没有可直接拿去演示的独立账号 |
 | 19 | **RTU 现场设备**（可选） | `13-demo-account.sh --with-rtu` | 4 台（网关/单相表/温湿度/继电器） | 真机上电后设备自动创建成孤儿，抄表与台账不认 |
 
@@ -485,7 +485,7 @@ bash scripts/08-verify-release.sh \
   --customer customer@126.com --customer-pass '12345678'
 ```
 
-**期望**：`通过 81 项` / `这一版的功能点全部到位`。
+**期望**：`通过 85 项` / `这一版的功能点全部到位`。
 
 这个脚本把**这一版每一处改动**变成断言，重装后跑一遍就知道有没有漏：
 
@@ -2629,3 +2629,269 @@ BILL-A74E3EE0-2026-10-elec-A7CDCF20
 - 不改抄表记录（账单是算出来的，不是抄出来的）
 - 不改遥测
 - 不删旧账单（换价重出会覆盖未付款账单，已付款的不动）
+
+---
+
+## 十一、登录页与品牌（白标）
+
+### 设计目标
+
+部署完成后，**从第一眼到每一个标签页都不应该出现底层产品名**。
+所有品牌信息集中在两处：一处默认值、一处可配置项。
+
+```
+默认值      ui-ngx/src/app/shared/models/brand.models.ts
+可配置项    admin_settings → whiteLabeling（「白标」菜单）
+```
+
+运行时优先级：**白标配置 > brand.models 默认值**。
+所以换品牌有两种方式，按场景选：
+
+| 场景 | 改哪里 | 生效范围 |
+| --- | --- | --- |
+| 一套系统一个品牌 | `brand.models.ts` 的 `BRAND_NAME` 等 | 全部，含首屏 title |
+| 多租户各自品牌 | 「白标」菜单里填 `appTitle` / `platformName` | 该租户及其客户 |
+
+### 品牌常量（唯一来源）
+
+`brand.models.ts` 里就这些，改这里就够：
+
+```ts
+BRAND_NAME         = '能源卫士'         // 浏览器标签、平台名、页脚兜底
+BRAND_NAME_EN      = 'ENERGY GUARDIAN'  // 登录页英文名（仅内置品牌时显示）
+BRAND_TAGLINE      = '智慧能源 · 绿色低碳'
+BRAND_GREEN        = '#16834A'          // 主色（= 色板的 500/600）
+BRAND_GREEN_LIGHT  = '#35A866'
+BRAND_GREEN_PALE   = '#E8F4E9'
+brandGreenPalette  = { 50…900, A100…A700 }   // 完整色阶，喂给 Material
+```
+
+**为什么收敛成一个文件**：改造前 `appTitle` / `platformName` / 浏览器标签的兜底值
+分别硬编码成 `'ThingsBoard'`，散在 4 个文件里。改品牌要改 4 处，
+漏一处就会出现「页面写能源卫士、标签页写 ThingsBoard」的不一致。
+
+### 登录页的色调与 logo 如何跟随白标
+
+这是白标设计的核心：**登录页不写死任何品牌色，全部读白标下发的 CSS 变量。**
+
+#### 颜色：三层，从编译期到运行时
+
+```
+① 编译期默认   ui-ngx/src/theme/theme-constants.scss
+                ui-ngx/src/theme/login-theme-constants.scss
+                $brand-green-palette: (50…900, A…)
+                → 生成 --tb-primary-* / --tb-login-primary-*
+                → 作用：前端 JS 起来之前的首屏
+
+② 运行时默认   brand.models.ts 的 brandGreenPalette
+                → WhiteLabelingService 覆盖 ① 的同名变量
+                → 作用：不配白标时整站的主色
+
+③ 客户配置     「白标」菜单 → 主色板（含 custom）
+                → 再次覆盖 ①②
+                → 作用：登录页 + 后台同时变色
+```
+
+登录页 SCSS 里所有品牌色都写成带兜底的变量引用：
+
+```scss
+$brand-green:       var(--tb-login-primary-600, #16834A);  // 主按钮、链接、强调
+$brand-green-light: var(--tb-login-primary-400, #43A860);  // 按钮渐变末端
+$brand-green-pale:  var(--tb-login-primary-50,  #E8F4E9);  // 胶囊标签底、左栏渐变
+$brand-green-tint:  var(--tb-login-primary-100, #C7E6CD);  // 特性卡边框、左栏光斑
+```
+
+**三处必须同色**，否则会出现「首屏青色闪一下、之后变绿」：
+
+| 位置 | 变量 |
+| --- | --- |
+| `theme-constants.scss`（后台） | `--tb-primary-500/600` |
+| `login-theme-constants.scss`（登录） | `--tb-login-primary-500/600` |
+| `brand.models.ts`（运行时默认） | `brandGreenPalette` |
+
+> ⚠ 阴影用的是固定 `rgba(22,131,74,.19)`：SCSS 的 `rgba()` 不接受 CSS 变量，
+> 所以光晕颜色不跟白标变。视觉上只影响按钮下方的柔光，主色完全跟随。
+
+#### logo：白标上传后自动出现
+
+登录页右栏（「欢迎登录」上方）显示白标的 `logoImageUrl`，**等比缩放、不裁切**：
+
+```
+max-width: 100%; width/height: auto; object-fit: contain
+max-height: 白标的 logoImageHeight（默认 56px）
+```
+
+**判定规则**：内置的两版横版图（`logo_title_black.svg` / `logo_title_white.svg`，
+520×160 且右侧带文字）判成「默认」，不显示 —— 左栏品牌区已用盾牌图形表达身份，
+再放一张横版文字 logo 是重复；塞进卡片还会被裁成灰条。
+只有客户**自己上传**的图才显示。
+
+#### 设置 logo 的正确姿势（运维/脚本）
+
+白标的 `logoImageUrl` **不是**随便一个 URL，必须是平台图片资源：
+
+```bash
+# ① 上传图片（SYS_ADMIN，系统级）
+curl -X POST -H "X-Authorization: Bearer $SYS_TOKEN"   -F "file=@/path/logo.png" -F "title=品牌logo"   http://127.0.0.1:8090/api/image
+# → {"resourceKey":"logo.png", ...}
+
+# ② 写进白标：格式是 tb-image;/api/images/system/<key>（分号，不是 ://）
+curl -X POST -H "X-Authorization: Bearer $SYS_TOKEN"   -H 'Content-Type: application/json'   -d '{"domainId":null,"appTitle":"青松能管",
+       "logoImageUrl":"tb-image;/api/images/system/logo.png",
+       "logoImageHeight":60,
+       "paletteSettings":{"primaryPalette":{"type":"custom","extends":"blue",
+         "colors":{"500":"#1E88E5","600":"#1976D2","700":"#1565C0","50":"#E3F2FD"}}}}'   http://127.0.0.1:8090/api/whiteLabel/loginWhiteLabelParams
+```
+
+**三个坑**（都实测踩过）：
+
+| 现象 | 原因 | 正解 |
+| --- | --- | --- |
+| `400 Domain id could not be empty` | 用 TENANT_ADMIN 调租户级接口，而 CE 版没有 domain 表 | 用 **SYS_ADMIN**，`domainId: null` |
+| `500 Cannot read the array length because "input" is null` | `logoImageUrl` 传的是 data URI 或普通 URL | 传 `tb-image;/api/images/{system,tenant}/<key>` |
+| logo 位置是裂图（`naturalWidth: 0`） | 同上，URL 格式不对导致取图 404 | 见上一行；可先 `curl` 验证 `/api/noauth/whiteLabel/loginLogo/system/<key>` 返回 200 |
+
+#### 端到端验证（实测记录 2026-10-27）
+
+设成蓝色 + 自定义 logo 后：
+
+```
+--tb-login-primary-600      #1976D2   （蓝）
+品牌名（左栏）               青松能管
+document.title             青松能管 | 登录
+右栏 logo                   300×80 → 显示 225×60（等比，不裁切）
+登录按钮渐变                 rgb(25,118,210) → rgb(66,165,245)
+左栏渐变（光斑 / 底色）       rgb(187,222,251) / rgb(227,242,253)
+页面背景                     rgb(234,243,246)（白标的 pageBackgroundColor）
+登录后 --tb-primary-600      #1976D2   （后台同步变蓝）
+登录后 title                 青松能管 | 首页
+侧边栏 logo                  白标上传的图
+```
+
+删除白标后全部回退：`#16834A` / 能源卫士 / 无 logo / 绿按钮 / `#F3F8F3` 背景。
+
+#### 白标的三个作用域
+
+| 作用域 | 谁配 | 影响 |
+| --- | --- | --- |
+| 系统级 | SYS_ADMIN，`domainId: null` | 全站默认（含登录页） |
+| 租户级 | TENANT_ADMIN | 该租户及其客户（CE 版需 domain，通常走系统级） |
+| 客户级 | CUSTOMER_USER | 仅该客户 |
+
+登录页读的是 `/api/noauth/whiteLabel/loginWhiteLabelParams`（匿名），
+按请求域名匹配 domain，没匹配到就落到系统级。
+
+- **删登录白标**：`DELETE /api/whiteLabel/currentLoginWhiteLabelParams`
+- **删后台主题**：`DELETE /api/whiteLabel/currentWhiteLabelParams`
+
+### 三个 title 来源都要对
+
+浏览器标签页的标题由三处产生，缺一处就会漏出旧品牌：
+
+| 时机 | 来源 | 现在的值 |
+| --- | --- | --- |
+| JS 起来之前（首屏） | `ui-ngx/src/index.html` 的 `<title>` | 能源卫士 |
+| 路由切换后 | `TitleService`：`appTitle() \|\| BRAND_NAME` + 翻译后的页面名 | 能源卫士 \| 首页 |
+| 登录页平台名 | `WhiteLabelingService.platformName` 兜底 `BRAND_NAME` | 能源卫士 v.4.4.0 |
+
+验证：
+
+```bash
+# ① 构建产物里不能有旧品牌
+grep -c "ThingsBoard" ui-ngx/target/generated-resources/public/index.html   # 期望 0
+grep -o "<title>[^<]*</title>" ui-ngx/target/generated-resources/public/index.html
+
+# ② 运行时（浏览器控制台）
+document.title                                   // "能源卫士 | 首页"
+(document.body.innerText.match(/thingsboard/gi) || []).length   // 0
+```
+
+### 登录页布局
+
+双栏白标布局，设计取自 `nenghaobao/历史能耗/preview.html`：
+
+```
+左栏  品牌区：绿渐变径向底
+      ├─ 盾牌 logo + 品牌名 + 英文名
+      ├─ 胶囊标签（BRAND_TAGLINE）
+      ├─ 主标语「让每一份能源消耗 / 都看得见、管得住」
+      ├─ 简介段落
+      ├─ 三张特性卡（实时感知 / 智能分析 / 节能优化）
+      └─ 页脚 slogan + 版权
+
+右栏  纯白登录卡
+      ├─ 欢迎登录 + 副标题（带品牌名）
+      ├─ 账号 / 密码（Material 控件，保留原有校验与错误码分支）
+      ├─ 忘记密码 / 注册链接
+      ├─ 主按钮（品牌绿渐变 + → 箭头）
+      └─ 安全提示 + 平台名与版本
+```
+
+**为什么保留 Material 表单控件**
+
+账号格式校验（`validateEmail`）、密码可见切换、错误码分支
+（凭证过期 → 重置页 / 密码违规 → 提示）都挂在 Reactive Form 上。
+为了换皮重写表单逻辑会丢这些分支，所以只替换外壳与视觉。
+
+**自定义 logo 的展示规则**
+
+平台内置两版横版 logo（`assets/logo_title_black.svg` / `_white.svg`，
+都是 520×160 且右侧带文字），塞进右栏 44px 高只会被裁成灰条。
+所以判据是：`logo_title_*` 一律判成「内置」，不展示；
+只有客户在「白标」菜单里真的传了图（`tb-image://` 资源）才显示在登录卡上方。
+
+**响应式**
+
+≤ 900px 时左栏折叠，品牌区的内容不显示，登录卡顶部出现小号
+盾牌 + 品牌名（`.compact-brand`），品牌不至于消失。
+
+### 白标配置自查
+
+```bash
+TOKEN=$(curl -s -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+curl -s -H "X-Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8090/api/whiteLabelingParams \
+| python3 -c 'import sys,json;d=json.load(sys.stdin);print({k:d.get(k) for k in ("logoImageUrl","appTitle","platformName")})'
+```
+
+三个值都是 `null` 是**正常的** —— 表示没配白标，前端用 `brand.models`
+的默认值。想要每个租户显示不同名字，才去「白标」菜单里填。
+
+### 除 title 之外还清掉的地方
+
+| 位置 | 原来 | 现在 |
+| --- | --- | --- |
+| 首屏 loading 三点 | `rgb(43,160,199)` 蓝 | 品牌绿 `#16834A` |
+| 首屏背景 | `#eee` 灰 | `#F3F8F3`（与登录页同色系，不闪白） |
+| 页脚版权 | The ThingsBoard Authors | 能源卫士 · Energy Guardian |
+| 双因素发行方名称 | ThingsBoard | 能源卫士（显示在认证器 App 里） |
+| Excel 导出属性 | ThingsBoard, Inc. | 能源卫士 |
+| 分享卡片文案 | 由 ThingsBoard 提供支持 | 由能源卫士提供支持 |
+| 默认 favicon | `thingsboard.ico` | 空（不指向官方图标） |
+| 默认帮助链接 | `https://thingsboard.io` | 空（点帮助不跳官方站） |
+
+> Edge / 移动应用 / 集成后台那些运维界面的文案**保留原文**：
+> 它们不出现在 title、也不在客户菜单里，改成品牌名反而会让排障时
+> 对不上官方文档。
+
+### 改了之后必须重新构建
+
+品牌常量与登录页都在前端产物里，只改后端或只重启服务不会生效：
+
+```bash
+cd ui-ngx
+node --max_old_space_size=8192 ./node_modules/@angular/cli/bin/ng build --configuration production
+jar cfM /tmp/ui-ngx.jar -C target/generated-resources .
+cp /tmp/ui-ngx.jar ~/Documents/dev_tools/maven_repository/rule-engine/org/thingsboard/ui-ngx/4.4.0/ui-ngx-4.4.0.jar
+
+cd ../guard-server && mvn -o package -DskipTests -q
+cp target/guard-server-4.4.0.jar ~/energy-app/
+cd ~/energy-app && docker compose --profile split restart energy-server
+```
+
+**顺序不能反**：先装 ui-ngx jar 到本地 maven 仓库，再打后端包 ——
+后端是把它作为依赖打进 `BOOT-INF/lib/` 的。反了打进去的还是旧前端。

@@ -62,7 +62,7 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=81
+EXPECTED_PASS=85
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -338,8 +338,8 @@ fi
 # ================================================================
 sec "D. 看板模板"
 TPL_N=$(DASH_DB "SELECT count(*) FROM dashboard WHERE customer_id IS NULL;" | tr -d ' ')
-eq "看板模板数" "${TPL_N:-0}" "20" \
-   '模板没导全：重跑 docker-01-install.sh，或确认 deploy 目录 data/json/tenant/dashboards 是 20 个文件'
+eq "看板模板数" "${TPL_N:-0}" "23" \
+   '模板没导全：重跑 docker-01-install.sh，或确认 deploy 目录 data/json/tenant/dashboards 是 23 个文件'\
 
 TITLES=$(DASH_DB "SELECT title FROM dashboard WHERE customer_id IS NULL;" | tr -d '\r')
 has  "「峰谷时段」已改名" "$TITLES" '峰谷时段' \
@@ -416,7 +416,9 @@ sec "F. 客户菜单"
 if [[ -n "$CTOK" ]]; then
   CM=$(CAPI '/api/customMenu')
   CM_N=$(echo "$CM" | jget "print(len(d.get('items') or []))" 2>/dev/null)
-  eq "客户顶层项" "${CM_N:-0}" "13" \
+  # 15 项 = 2026-10-27 定稿结构：设备管理拆成一级 + 三个子项、平台自检升为一级、
+  #        空调管理（三个子看板）插在「组织」之前
+  eq "客户顶层项" "${CM_N:-0}" "15" \
      '客户菜单是旧结构：跑一键修复初始化（会重装全部客户菜单）'
   CM_DETAIL=$(echo "$CM" | python3 -c "
 import json,sys
@@ -427,11 +429,22 @@ for i in (d.get('items') or []):
     print(nm+':'+'/'.join(pages))" 2>/dev/null)
   has "告警中心为一级链接（无子项）" "$CM_DETAIL" '告警中心:' \
       '告警中心还挂着「告警列表/告警规则」子项：一键修复初始化'
-  has "设备运维含平台自检" "$CM_DETAIL" '平台自检' \
+  # 自检必须是一级（原挂在设备运维下，2026-10-26 提升）
+  has "平台自检为一级入口" "$CM_DETAIL" '平台自检:' \
       '客户菜单缺自检入口：一键修复初始化'
+  # 设备管理是分组，子项必须齐三个（一级叫「设备管理」、二级第一项才是「设备运维」）
+  has "设备管理含设备运维" "$CM_DETAIL" '设备管理:设备运维' \
+      '设备菜单结构不对：一键修复初始化'
+  has "设备管理含设备分组" "$CM_DETAIL" '设备管理:设备运维/设备分组' \
+      '设备菜单缺设备分组：一键修复初始化'
+  has "设备管理含设备拓扑" "$CM_DETAIL" '设备管理:设备运维/设备分组/设备拓扑' \
+      '设备菜单缺设备拓扑：一键修复初始化'
   # 菜单 label 是「用能账单」，它指向的看板标题才是「我的账单」
   has "能耗分析含用能账单" "$CM_DETAIL" '用能账单' \
       '「用能账单」没在能耗分析下：一键修复初始化'
+  # 空调管理（2026-10-27）：一级分组 + 三块看板，一次断言整组
+  has "空调管理含三个子看板" "$CM_DETAIL" '空调管理:空调运行监控/运行计划与配置/每日复盘报告' \
+      '空调菜单不完整：确认三块看板存在（缺看板时该子项会被过滤），再跑一键修复初始化'
   # ---- F2：客户看得见的**数据**，不只是菜单项 ----
   #
   # ★ 为什么必须加这一组（2026-10-22）：
