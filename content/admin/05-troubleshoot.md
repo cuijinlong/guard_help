@@ -3699,7 +3699,385 @@ WHERE c.customer_id = '<客户id>'
   AND p.additional_info::jsonb->>'siteId' = c.additional_info::jsonb->>'siteId';
 ```
 
-> 演示数据目前没有 `parentDeviceId` / `meterLevel`（两列都是空），
-> 所以上条 SQL 查不出东西 —— 这正是它无法自动去重的原因：
-> 缺少层级信息时，平台只能把每台表都当成独立计量点。
+> 演示数据有 `meterLevel`（1 进线 / 2 分项 / 3 回路 / 0 非计量），
+> 但**没有** `parentDeviceId` —— 所以上条 SQL 只能查出空结果。
+> 这正是它无法自动去重的原因：只知道级别、不知道“哪张表管哪张表”，
+> 平台只能把每台表都当成独立计量点。
+> 要从根上解决，需要建表时就写入 `parentDeviceId`（或按 `meterLevel` 去重口径汇总）。
 
+
+---
+
+### 现象 Y4：峰谷分析报 403（`GET /api/energy/tou-analysis?groupRootId=…`）
+
+**症状**
+
+```
+GET http://localhost:8090/api/energy/tou-analysis?groupRootId=2c1bf840-…&granularity=day&from=…&to=…
+403 Forbidden
+```
+
+用客户账号（`CUSTOMER_USER`）在看板里把统计范围选成「电能」「水表」这类**品种根**时触发。
+换成「用电分项 / 用能区域」等维度根就正常。租户账号看不到这个问题。
+
+**原因：品种资产是租户公共资产，`customer_id` 是 `NULL_CUSTOMER_ID`。**
+
+能源品种（电能 / 水表 / 燃气 / 蒸汽）、设备型号库、费率模板库这类资产的
+`customer_id` 是 `13814000-1dd2-11b2-8080-808080808080`（TB 的「无客户」哨兵），
+它们全租户共享、不归属任何客户。
+
+旧判定写的是「必须等于自己客户」：
+
+```java
+if (mine == null || !mine.equals(asset.getCustomerId())) {
+    throw new ThingsboardException("无权访问该维度", PERMISSION_DENIED);
+}
+```
+
+品种根的 `customerId` 永远不等于任何客户的 id → 一律拒绝。
+这不是越权拦截生效，而是把**公共资产误判成了别人的资产**。
+
+**修复**（2026-10-26，`EnergyAnalysisController.requireVisibleAsset`）：
+租户公共资产放行，客户级隔离不变。
+
+```java
+boolean tenantPublic = owner == null || owner.isNullUid();
+if (mine == null || (!mine.equals(owner) && !tenantPublic)) { throw …; }
+```
+
+**验证三条**（缺一条都不算修好）：
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"customer@126.com","password":"12345678"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# ① 本租户公共品种根 → 期望 200
+curl -s -o /dev/null -w '%{http_code}\n' -H "X-Authorization: Bearer $TOKEN" \
+  "http://localhost:8090/api/energy/tou-analysis?groupRootId=<本租户品种根>&granularity=day&from=1790784000000&to=1792984267943"
+
+# ② 自己客户的维度根 → 期望 200
+# ③ 别人的客户资产 → 期望 403（隔离仍然生效，别只测 ①② 就收工）
+```
+
+> 同一套判定在 `EnergyMeterReadingController.requireVisibleDevice` 等位置也有，
+> 改口径时先确认是「资产可见性」还是「设备可见性」——设备没有公共资产的概念。
+
+---
+
+### 现象 Y5：查询设置部件的树「场站跑到分项下面」/ 混着别的场站
+
+**症状（2026-10-26 之前）**
+
+```
+按设备层级：单相园-1#进线总表 / 三相园-1#进线总表 / …   ← 两个场站的表平铺在一起
+按分组维度：用电分项 → 单相场站 → 照明          ← 场站插在分项下面
+           → 还能看到三相场站的分项            ← 右上角选的是单相场站
+```
+
+设备分组页的树同样多一层「单相场站」。
+
+**这是两件事，别混着查**：
+
+**① 按设备层级没把场站当根**
+
+树由 `rebuildRows()` 从设备清单平铺构造，场站只用来过滤（`passSite`），
+不参与成树。修法是当右上角选了具体场站时，插一个 `type='SITE'` 的虚拟根行：
+不可勾选（场站资产没有遥测）、点箭头只切换第一层显隐、根名取场站 label。
+
+「全部场站」下没有单一名字可概括，保持平铺 —— 该分支只作兜底，
+正常情况下全局选择器一定落在具体场站上。
+
+**② 分组维度的「场站分组」被当成正常节点渲染**
+
+数据模型：维度容器 → `场站分组`（`asset.type='场站分组'`，label = 场站名）→ 分项/区域。
+那是**内部隔离层**，不是分类层级。界面要做的：
+只保留当前场站那个分组，把它的子节点提升到维度根下。
+
+场站归属怎么匹配（`pickSiteGroup`，三级判据）：
+
+1. `场站分组.name` 包含场站 `name`（技术名稳定，客户改不了）
+2. `场站分组.label` 等于场站 `label`
+3. 只存在一个分组时直接用
+
+都不中 → 保持原样。宁可多显示一层，也不猜错场站。
+
+穿透之后「新建子分类 / 添加设备 / 拖拽落点」的真实挂载父仍是那个场站分组
+（存在维度根的 `mountId` 上）。丢掉 mountId，新节点会挂到维度容器下、
+脱离场站分区、聚合直接断掉。
+
+**自查 SQL**
+
+```sql
+-- 某维度下有几个场站分组、各挂了多少分类
+SELECT g.label AS 场站分组, count(r.to_id) AS 子节点数
+FROM asset g
+LEFT JOIN relation r ON r.from_id = g.id AND r.relation_type_group = 'COMMON'
+WHERE g.type = '场站分组'
+  AND g.customer_id = '<客户id>'
+GROUP BY g.label ORDER BY 1;
+```
+
+> 设备分组页用的是同一套穿透逻辑（`filterTreeBySite`），两处要一起改。
+> 只改部件不改页面，会出现「看板对了、设备分组还多一层」。
+
+---
+
+### 现象 Y6：自写部件报 `Widget Error: Cannot read properties of undefined`
+
+**症状**
+
+```
+Widget Error:
+Cannot read properties of undefined (reading 'length')
+Cannot read properties of undefined (reading 'hasData')
+```
+
+刚给部件加了新字段（比如 `chart`、`queryTypes`），脚本里明明赋了值，页面还是报这个。
+换成别的属性名也没用，错误只是从 `reading 'length'` 变成 `reading 'hasData'`。
+
+**原因：TB 动态部件的首帧变更检测早于 `self.onInit`。**
+
+TB 的 `DynamicWidgetComponent` 在构造时把 `ctx.$scope = this`（`$scope` 就是组件实例本身），
+随后**立刻跑一次变更检测**；而 `self.onInit` 是之后才由 widget context 调用的。
+所以首帧时 scope 上除 TB 预置字段（`ctx`/`settings`/`data`…）外**全是 undefined**。
+
+旧字段不出问题是因为它们都在 `*ngIf` 里带了自己保护（`tabs && tabs.length`）；
+新加的 `*ngIf="chart.hasData"` 没有这层保护，首帧就崩了，整个部件变成错误态。
+
+**修法：加就绪门（推荐）**
+
+```js
+self.onInit = function () {
+  var scope = self.ctx.$scope;
+  scope.inited = false;          // ① 首帧一定不渲染
+  /* …所有字段初始化… */
+  scope.inited = true;           // ② 全部就位后再开门
+  detect();
+};
+```
+
+```html
+<div class="me-main" *ngIf="inited && !loading">…</div>
+```
+
+**备选：给每个绑定加安全导航**（`meChart?.hasData`、`(rows || []).length`）。
+能救回来，但字段一多就容易漏 —— 新增模板块时照样会踩。就绪门是一劳永逸的。
+
+**排查要点**
+
+- 报 `reading 'X'` 时，先问「X 是哪个对象的属性」，再确认那个对象**在首帧是否存在**，
+  而不是先去查赋值语句（赋值语句通常是对的）。
+- 部件里 `console.log` 看不到输出时，看 Network 面板里 `widget_type` 的 descriptor 是否已更新 ——
+  直接 `UPDATE widget_type` 是即时生效的（不用重启），但浏览器要硬刷新。
+
+---
+
+### 现象 Y7：改了大屏部件尺寸，页面还是原来的宽度
+
+**症状**：把看板的 `configuration.widgets.<id>.sizeX` 从 12 改成 24，刷新页面部件还是半宽。
+
+**原因：布局读的是 `states`，不是 `widgets`。**
+
+TB 的布局有两份：
+
+```
+configuration.widgets.<id>.sizeX                     ← 部件定义上的尺寸（新加部件时的默认值）
+configuration.states.default.layouts.main.widgets.<id>  ← ★ 真正生效的布局
+```
+
+`DashboardUtilsService.validateAndUpdateDashboard` 只在 `states` **不存在**时
+才用 `widgets` 的尺寸生成布局；一旦有了 `states`，就只认 `states` 里的那份。
+
+**修法**：两份一起改，并抬 `version`（前端按 version 判断要不要重建）。
+
+```sql
+UPDATE dashboard d
+SET configuration = jsonb_set(
+      jsonb_set(d.configuration::jsonb,
+        '{states,default,layouts,main,widgets,<widgetId>,sizeX}', to_jsonb(24)),
+      '{widgets,<widgetId>,sizeX}', to_jsonb(24))::text,
+    version = d.version + 1
+WHERE d.title = '手工填报';
+```
+
+**别忘了模板**：新装客户的看板来自
+`guard-server/src/main/data/json/tenant/dashboards/*.json`。
+只改库不改模板，下一次 `26-sync-dashboard-templates.py --apply` 会把库里的改动盖回去，
+新装环境也还是旧尺寸。
+
+**栅格宽度怎么算**：`gridSettings.columns`（默认 24）决定总列数，
+`sizeX` 是占几列 —— 24 列下 `sizeX=24` 才是全宽，`12` 就是半宽。
+
+---
+
+### 现象 Y8：设备分组「添加设备」列出别的场站的设备
+
+**症状**
+
+右上角选的是「单相场站」，打开「设备分组 → 添加设备」，
+抽屉里同时列出三相场站的表（`三相园-1#进线总表`、`三相园-车间动力总表`…）。
+勾选后能提交，设备就被挂到了单相场站的分项下 —— 聚合口径从此错乱。
+
+**原因：候选设备来自客户级接口，没有按场站收窄。**
+
+`StructureService.loadCustomerDevices(customerId)` 取的是
+`GET /api/customer/{id}/devices` —— 该客户名下**全部**设备。
+主树按场站裁剪过（`filterTreeBySite`），但抽屉是另一条取数路径，漏了这一层。
+
+**修法**（2026-10-26）：候选按 `device.additionalInfo.siteId` 过滤。
+
+```ts
+const siteId = this.globalSiteId;                 // 全局场站，来自 StationContextService
+const inSite = (d) => !siteId || !d.siteId || d.siteId === siteId;
+```
+
+两个**必须保留**的例外：
+
+| 情况 | 处理 | 为什么 |
+| --- | --- | --- |
+| 设备 `siteId` 为空（新接入还没归属） | 保留 | 用户就是在这里给它归属，过滤掉就永远挂不上 |
+| 全局场站为空（租户视角未定位） | 不过滤 | 没有场站上下文就无从收窄 |
+
+被排除的数量会写在抽屉底部（「已排除 N 台其他场站的设备」），
+否则用户会以为设备丢了。
+
+> 用 **id** 匹配，不要用场站名。`additionalInfo.siteId` 存的是资产 id，
+> 而场站名是 `label`（客户可改）—— 改名后按名字过滤会静默失效。
+
+**同类问题的排查清单**（凡是「列清单」的地方都要过一遍）：
+
+| 位置 | 收窄依据 | 状态 |
+| --- | --- | --- |
+| 设备分组 · 主树 | `filterTreeBySite(siteFilter)` | ✅ |
+| 设备分组 · 右侧设备表 | 跟随选中节点（树已裁剪） | ✅ |
+| 设备分组 · 添加设备候选 | `additionalInfo.siteId` | ✅ 2026-10-26 修 |
+| 设备运维 · 列表 / 统计 / 历史 | `currentSiteId` | ✅ |
+| 设备拓扑 · 卡片 / 候选实体 | `additionalInfo.siteId` | ✅ |
+| 告警中心 | `?siteId=` | ✅ |
+| 看板内所有部件 | `state.siteCtx`（query_panel 发布） | ✅ |
+| 手工填报 | `/energy/manual-entry/meta?siteId=` | ✅ |
+| 组织与场站 | —— | 例外：它的职责就是管整棵树 |
+
+**自查 SQL**（看某个分项下是否混进了别的场站的设备）：
+
+```sql
+-- 某场站的分项下，出现了不属于该场站的设备 → 应修复归属
+SELECT i.label AS 分项, d.label AS 设备,
+       COALESCE(d.additional_info::jsonb->>'siteId','(空)') AS 设备场站
+FROM asset i
+JOIN relation r ON r.from_id = i.id AND r.relation_type_group = 'COMMON'
+JOIN device d ON d.id = r.to_id
+WHERE i.type = '分项'
+  AND COALESCE(i.additional_info::jsonb->>'siteId','') <> ''
+  AND COALESCE(d.additional_info::jsonb->>'siteId','') <> COALESCE(i.additional_info::jsonb->>'siteId','')
+ORDER BY 1, 2;
+```
+
+---
+
+### 现象 Y9：切到「还没建分组」的场站，树还是上一个场站的
+
+**症状**
+
+右上角切到新建的场站（还没建任何分项/区域），左边树里显示的仍是
+**上一个场站**的分项 —— 顶栏写着「新场站」，树里是「老场站」的分类。
+
+**原因：匹配条件里多了「必须存在于树里」这一条。**
+
+```ts
+// 旧代码
+if (!this.siteNames.includes(this.globalSiteName)) { return; }   // ← 这里
+```
+
+`siteNames` 是从树里派生的（有哪些「场站分组」就列哪些）。
+新场站还没建分组 → 不在 `siteNames` 里 → 函数直接返回，
+`siteFilter` 停在上一个场站，于是树继续显示旧数据。
+
+**修法**：切过去，树为空，空态说明原因。
+
+```ts
+private applyGlobalSite(): void {
+  if (!this.globalSiteName) { return; }
+  if (this.siteFilter === this.globalSiteName) { return; }
+  this.siteFilter = this.globalSiteName;      // 不再要求它出现在 siteNames 里
+  this.onSiteChange();
+}
+```
+
+空态文案要分开写，否则用户以为页面坏了：
+
+```
+「临时验证场站」还没有用能分组。
+切到有分组的场站，或联系管理员先在「基础配置」里建分项 / 区域。
+```
+
+**通用原则**：过滤条件指向的值**不在候选集里**时，正确行为是「结果为空 + 说明原因」，
+不是「保留上一次的结果」。后者会让用户看到**不属于当前上下文**的数据，
+而这个错误没有任何报错 —— 最难排查。
+
+---
+
+### 现象 Y10：客户账号能读写别的客户的场站结构（`/energy/site-groups/*`）
+
+**症状**
+
+客户账号（`CUSTOMER_USER`）直接调：
+
+```
+POST /api/energy/site-groups/ensure   {"siteId":"<别的客户的场站id>"}   → 200，帮别人建了容器
+GET  /api/energy/site-groups/audit                                      → 列出全租户所有客户的场站
+GET  /api/energy/site-groups/audit?fix=true                             → 修复全租户
+```
+
+**原因：`requireSite` 只判「场站存在」，没判「场站属于你」。**
+
+```java
+// 旧代码
+Asset site = assetService.findAssetById(tenantId, new AssetId(uuid));
+if (site == null) { throw new ThingsboardException("场站不存在", ITEM_NOT_FOUND); }
+return site;           // ← 到此为止
+```
+
+同项目的其它控制器都做了客户收口
+（`EnergyManualEntryController.requireSite`、`IdleEnergyController.requireAccessibleSite`），
+只有这里漏了。这是**实现遗漏**，不是设计取舍。
+
+**修法**（2026-10-26）：
+
+```java
+private void requireCustomerAccess(CustomerId owner, String what) throws ThingsboardException {
+    User user = getCurrentUser();
+    if (!user.isCustomerUser()) { return; }              // 租户账号不受限
+    CustomerId mine = user.getCustomerId();
+    boolean tenantPublic = owner == null || owner.isNullUid();
+    if (mine == null || (!mine.equals(owner) && !tenantPublic)) {
+        throw new ThingsboardException("无权访问" + what, PERMISSION_DENIED);
+    }
+}
+```
+
+三处都要收口，漏一处等于没修：
+
+1. `ensure` 传 `siteId` → `requireSite` 内校验
+2. `ensure` 传 `{customerId, siteName}`（建场站前预置）→ 校验 `customerId`
+3. `audit` 的场站遍历 → 客户账号只遍历自己客户的场站（`fix` 自然只作用于这批）
+
+**验证四条**（缺一条都不算修好）：
+
+```bash
+# 客户账号 token
+TOK=$(curl -s -X POST http://localhost:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"customer@126.com","password":"12345678"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# ① 自己客户的场站 → 200
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8090/api/energy/site-groups/ensure \
+  -H "X-Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d '{"siteId":"<自己的场站>"}'
+
+# ② 别的客户的场站 → 403
+# ③ 给别的客户预置 → 403
+# ④ audit 的 siteCount 只含自己客户的场站数
+```
