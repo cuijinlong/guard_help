@@ -8,7 +8,7 @@
 
 ---
 
-## 一、左侧菜单全貌（13 项）
+## 一、左侧菜单全貌（14 项）
 
 ```
 客户登录（customer@…）
@@ -39,11 +39,12 @@
 │
 ├─ 告警中心            /alarm-center + /api/energy/alarms
 │
-├─ 设备运维
-│   ├─ 设备管理        /device-management
-│   ├─ 设备分组        /device-group
-│   ├─ 设备拓扑        /device-topology + /api/energy/topologies
-│   └─ 平台自检        /self-check + /api/energy/self-check
+├─ 设备管理
+│   ├─ 设备运维        /device-management（设备列表 + 测点参数）
+│   ├─ 设备分组        /device-group（分组树 + 设备归属）
+│   └─ 设备拓扑        /device-topology + /api/energy/topologies
+│
+├─ 平台自检            /self-check + /api/energy/self-check
 │
 ├─ 综合能耗            看板：energy_overview
 ├─ 能源流向            看板：energy_management_sankey_flow
@@ -52,6 +53,13 @@
 ├─ 节能记录            看板：energy_management_saving_records
 └─ 组织                /sites（组织 → 场站 → 设备 三级）
 ```
+
+> **2026-10-26 改名**：原来一级叫「设备运维」，它下面第一项又叫「设备管理」——
+> 两个词互为父子，客户点之前分不清哪个是哪个。
+> 现在一级用上位概念「设备管理」，三个二级项用各自的动作：
+> **设备运维**（看设备状态与测点）/ **设备分组**（给设备归类）/ **设备拓扑**（看接线）。
+> URL 全部不变；「平台自检」升为一级（出问题时第一个该点的地方）。
+> 存量客户重启不会自动变，走一次「平台自检 → 一键修复初始化」即可（幂等）。
 
 **四种页面类型**，排查时先分清是哪一种：
 
@@ -794,7 +802,15 @@ ORDER BY a.start_ts DESC;
 
 ---
 
-### 3.12 设备拓扑 / 设备分组 / 设备管理
+### 3.12 设备管理：设备运维 / 设备分组 / 设备拓扑
+
+**三个页面各自管什么**（2026-10-26 改版后）：
+
+| 菜单 | 路由 | 是干什么的 | 主要数据源 |
+| --- | --- | --- | --- |
+| 设备运维 | `/device-management` | 看设备**本身**：状态、参数、测点实时值、历史曲线、计量配置 | `/api/customer/{cid}/deviceInfos` + `ts_kv` + `/api/energy/device-config` |
+| 设备分组 | `/device-group` | 看设备**归在哪个分类**：分项 / 区域 / 性质 / 位置 | `/api/customer/{cid}/assets` + `relation` |
+| 设备拓扑 | `/device-topology` | 看设备**怎么接线**：进线 → 变压器 → 母线 → 出线 | `asset.type='topology'` + `relation` |
 
 **存储**：
 
@@ -803,7 +819,53 @@ ORDER BY a.start_ts DESC;
 | 拓扑图 | `asset.type='topology'`，`additionalInfo` 存布局 |
 | 拓扑节点/连线 | `relation`（`Contains` + `additionalInfo` 里的坐标） |
 | 设备分组 | `entity_group` + `relation` |
+| 设备分组内的**人工排序** | `relation.additional_info ->> 'order'`（设备分组页「上移 / 下移」写入） |
 | 设备所属场站 | `device.additional_info ->> 'siteId'` |
+| 计量层级 / 倍率 | `attribute_kv`（`DEVICE` + `SERVER_SCOPE`：`meterLevel` / `ctRatio` / `ptRatio` / `meterRatio`） |
+
+```sql
+-- 某个分组下设备的排列顺序（设备分组页「上移/下移」的结果）
+SELECT d.name AS 设备,
+       coalesce((r.additional_info::jsonb ->> 'order')::int, 9999) AS 顺序
+FROM relation r
+JOIN device d ON d.id = r.to_id
+WHERE r.from_id = '<分组资产id>'
+  AND r.relation_type = 'Contains'
+  AND r.to_type = 'DEVICE'
+ORDER BY 顺序, d.name;
+
+-- 某台设备的计量配置（attribute_kv 的 key 是整数，要 join key_dictionary）
+SELECT k.key AS 字段, a.long_v, a.str_v
+FROM attribute_kv a
+JOIN key_dictionary k ON k.key_id = a.attribute_key
+WHERE a.entity_id = '<设备id>'
+  AND a.attribute_type = 2   -- 2 = SERVER_SCOPE（1=CLIENT_SCOPE, 3=SHARED_SCOPE）
+  AND k.key IN ('meterLevel','ctRatio','ptRatio','meterRatio','ratioApplied');
+```
+
+**设备的三个展示口径**（改造后三处一致，排查时按这张表对）：
+
+| 列 | 取值 | 说明 |
+| --- | --- | --- |
+| 设备名称 | `asset/device.label`，为空回退 `name` | 客户看到的展示名 |
+| 设备编号 | `device.name` | 技术名，租户内唯一；现场对表用它 |
+| 设备一级类型 | 按**设备档案名**归类 | 电能 / 水表 / 燃气 / 蒸汽 / 环境 / 接入设备 / 其他 |
+| 设备二级类型 | `device_profile.name` | 单相电能表 / 电能表 / 水表 / 温湿度变送器 / 网关… |
+
+**网关不进「设备分组 → 添加设备」的候选**（2026-10-22 定，仍是这个口径）：
+
+网关是代下级设备上报的通信代理，本身不产生能耗。把它挂进分项/区域，
+上级汇总会多出一行没有电量、也无法解释的节点。抽屉底部会写明「已排除 N 台网关」，
+所以它不会凭空消失 —— 在「设备运维」和「组织」里仍然看得到、也仍然统计在线状态。
+
+**为什么「设备分组 → 添加设备」的类型页签是「全部 / 电能表 / 其他表计」**，
+而不是原型里的「全部 / 关口表 / 普通表」：
+
+「关口表 / 普通表」在我们的模型里不是设备属性，而是**计量层级** `meterLevel`
+（1 级进线 = 关口），存在设备的 `SERVER_SCOPE` 属性里。列表页拿不到这个值 ——
+要按它筛就得给几十上百台表逐台请求一次 `device-config`，打开抽屉要等十几秒。
+设备档案名是现成的、准确的，所以三段式的形态保留、语义换成我们真正掌握的数据。
+如果确实要按计量层级筛，需要后端补一个批量查询端点（尚未做）。
 
 ```sql
 -- 某场站的设备与拓扑视图

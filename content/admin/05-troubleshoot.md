@@ -1101,6 +1101,58 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 
 ---
 
+### 现象 X4：菜单里还是「设备运维 → 设备管理」，没有变成「设备管理 → 设备运维 / 分组 / 拓扑」
+
+**这是升级后的预期行为，不是装坏了。**
+
+菜单只在「租户初始化 / 客户建档」时装一次。仅重启服务不会重装存量客户的菜单 ——
+那是刻意的：客户可能改过菜单名、加过自己的项，启动时无脑重建会把这些抹掉。
+
+**修**（二选一，都是幂等的）：
+
+```bash
+# ① 界面：运营配置 → 平台自检 → 一键修复初始化
+# ② 命令行（租户账号）
+TOKEN=$(curl -s -X POST http://localhost:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -s -X POST -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{}' \
+  http://localhost:8090/api/energy/repair-init | python3 -m json.tool | head -20
+```
+
+**确认**（查库比看界面可靠）：
+
+```bash
+docker exec energy-postgres psql -U postgres -d thingsboard -t -A -c "
+select cm.config::text from custom_menu cm
+join customer c on c.custom_menu_id = cm.id
+where c.title like '%<客户名片段>%';" \
+| python3 -c 'import sys,json;d=json.load(sys.stdin)
+def w(x,i=0):
+    for k in x or []:
+        print("  "*i + str(k.get("name")) + ((" → "+k["url"]) if k.get("url") else ""))
+        w(k.get("pages"), i+1)
+w(d["items"])'
+```
+
+看到的应该是：
+
+```
+- 设备管理
+  - 设备运维 → /device-management
+  - 设备分组 → /device-group
+  - 设备拓扑 → /device-topology
+- 平台自检 → /self-check
+```
+
+**为什么重启不自动改**：`EnergyMenuInstaller.installCustomerMenu` 对「已是新结构」的菜单直接跳过
+（`hasHomeMenuItem && !needsLegacyLinkUpgrade && !needsDeviceMenuUpgrade`）。
+结构检测是幂等的，跑几次结果一样，不会产生重复菜单。
+
+---
+
 ### 现象 Y：部件显示「部件无数据可显示」，但它的脚本明明会自己取数
 
 **原因：TB 根本没执行 `onInit`。**
