@@ -4749,19 +4749,16 @@ console.log(t, g);   // 两组数字的差值必须恒定（约等于标签行�
 
 ---
 
-### 现象 Y22：跨行（rowspan）合并的位置看不到表格边线
+### 现象 Y22：跨行（rowspan）合并的位置看不到表格边线 / 看不出跨行效果
 
-**症状**
+**两个症状，其实是同一个根因的两种表现**：
 
-最大值最小值表里，设备列 `rowspan=4`；参数那 4 行之间都有分隔线，
-但**设备列上那一片是空的** —— 看起来像边框掉了，或者整列被挖空。
+| 症状 | 原因 |
+| --- | --- |
+| 跨行那一列中间是空白，像边线丢了 | 普通格靠自己的 `border-bottom` 画线，`rowspan` 合并后只剩整段末尾那一根 |
+| 补了线之后，又看不出是跨行 | 线补齐了，但跨行格被切成和右侧一致的 N 段，视觉上就是 N 个独立格子 |
 
-**这不是 bug，是 `border-collapse: separate` 下 rowspan 的固有行为。**
-
-每个单元格只画自己的 `border-bottom`。合并之后设备格只剩"整段末尾"那一根，
-被它跨过的 3 行在设备列上没有对应的格子，自然没有线可画。
-
-**修法：给合并格加 `.tb-span`，用等间距渐变在格子内部补线。**
+**正确做法：跨行格 = 一整块淡底，内部不画线。**
 
 ```html
 <td class="tb-name tb-span" [attr.rowspan]="r.deviceSpan">{{ r.deviceName }}</td>
@@ -4769,49 +4766,52 @@ console.log(t, g);   // 两组数字的差值必须恒定（约等于标签行�
 
 ```css
 .tb-data-table td.tb-span {
-  background-image: repeating-linear-gradient(
-    to bottom,
-    transparent 0, transparent calc(var(--tb-row-pitch, 36px) - 1px),
-    rgba(0,0,0,.06) calc(var(--tb-row-pitch, 36px) - 1px),
-    rgba(0,0,0,.06) var(--tb-row-pitch, 36px));
+  --tb-cell-bg: #fafafa;
+  background-color: #fafafa;
+  vertical-align: middle;
 }
+.tb-data-table .tb-sticky.tb-span { --tb-cell-bg: #fafafa; background-color: #fafafa; }
+.tb-data-table :where(tbody tr:hover) .tb-sticky.tb-span { background-color: #f2f2f2; }
 ```
 
-**关键：`--tb-row-pitch` 必须按实测行距写，不能写死。**
-
-```js
-function syncSpanPitch() {
-  setTimeout(function () {
-    var t = document.querySelector('.eqc-table-ex');
-    if (!t) { return; }
-    var trs = t.querySelectorAll('tbody tr');
-    if (trs.length < 2) { return; }
-    var pitch = Math.round(trs[1].getBoundingClientRect().top - trs[0].getBoundingClientRect().top);
-    if (pitch > 0) { t.style.setProperty('--tb-row-pitch', pitch + 'px'); }
-  }, 0);
-}
-```
-
-写死 36px 会怎样：普通行确实是 36px，但密集模式是 30px、手工填报里嵌了输入框
-会到 52px。差 6px 时前几根线还看得过去，到第四行就明显错位，最后一行完全对不上 ——
-用户看到的是"补的线和真边框不在一条水平线上"，比不补更难看。
+**别再用渐变补线**（`repeating-linear-gradient` + `--tb-row-pitch`）：
+技术上能做到像素级对齐（实测落点误差 1px 内），但补完就看不出跨行了 ——
+这是被实装并否决过的方案。
 
 **验证**
 
 ```js
-const t = document.querySelector('.eqc-table-ex');
-const pitch = getComputedStyle(t).getPropertyValue('--tb-row-pitch');  // 如 '37px'
-const trs = t.querySelectorAll('tbody tr');
-console.log(pitch, Math.round(trs[1].getBoundingClientRect().top - trs[0].getBoundingClientRect().top));
-// 两个数一致（差 1 以内）才算对
+const td = document.querySelector('.eqc-table-ex tbody td.eqc-td-dev');
+const s = getComputedStyle(td);
+console.log({
+  rowspan: td.rowSpan,                       // > 1
+  bg: s.backgroundColor,                     // rgb(250, 250, 250)
+  verticalAlign: s.verticalAlign,            // 'middle'
+  backgroundImage: s.backgroundImage,        // 'none' ← 关键：不能再有渐变
+  borderRight: s.borderRightWidth            // '0px'  ← 没有竖线
+});
 ```
 
-**别用 `border-collapse: collapse` 绕**：collapse 下合并格同样没有内部横线，
-而且 sticky 冻结列在 Chrome 里会失效（这在本项目实测过，见 `.me-table` 的注释）。
+**三个容易踩的细节**
+
+1. **`.tb-sticky` 不要用 `background: #fff` 简写**
+   简写会把 `background-image` 一起重置，写死 `#fff` 还会让叠加的 `.tb-span` 淡底失效
+   —— 数据表详情的设备列同时是「冻结 + 跨行」，最容易踩。
+
+2. **悬停规则要带 `.tb-sticky` 组合**
+   `.tb-sticky.tb-span` 是 (0,3,0)，比 `td.tb-span`(0,2,1) 高。
+   只写后者的话，冻结+跨行的格子悬停时不变色，滚到右侧时左边留一块不动的色。
+
+3. **不要留 `vertical-align: top`**
+   部件自己的 `.eqc-table-ex .eqc-td-dev { vertical-align: top }`(0,2,0)
+   会被 `.tb-data-table td.tb-span`(0,2,1) 覆盖 —— 但如果写在**更靠后**的位置或
+   用了更高特异性，设备名就会贴上边框，看起来像"只占第一行"。
 
 **哪些表的合并格要加**：`timeseries_chart`（极值表设备列 / 数据表详情的设备列与参数列）、
 `statistics_table`（设备列）、`detail_table`（设备列与参数列）。
-新增带 rowspan 的表格时，别忘了加类名 + 调 `syncSpanPitch()`。
+
+**不要用 `border-collapse: collapse` 绕**：collapse 下合并格同样没有内部横线，
+而且 sticky 冻结列在 Chrome 里会失效（本项目实测过，见 `.me-table` 的注释）。
 
 ---
 
@@ -4899,3 +4899,74 @@ else { sink[idx][k] = m[k]; }
 var slot = acc[key][slotIdx] || (acc[key][slotIdx] = { sum: 0, n: 0 });
 slot.sum += Number(pt.v); slot.n++;
 ```
+
+---
+
+### 现象 Y24：重装时 `docker-00-prepare.sh` 报 `DATABASE_TS_TYPE: unbound variable`
+
+**症状**
+
+```
+docker-00-prepare.sh: line 309: DATABASE_TS_TYPE: unbound variable
+```
+
+卸载删卷后重跑准备脚本，直接中断，部署目录只剩半套文件。
+
+**两个根因，都在同一个 heredoc 里**
+
+`scripts` 里的 `.env` 是用 `cat > "$STAGE/.env" <<ENVEOF` 生成的（无引号 → 变量会被**立即展开**）。
+这段把「赋值语句」也写进了 heredoc —— 那些行只是**文件内容**，并没有真正赋值给 shell。
+
+```bash
+cat > .env <<ENVEOF
+...
+HOST_MEM_GB=$(sysctl -n hw.memsize ...)      # ← 写进文件的字面量，shell 里仍为空
+DATABASE_TS_TYPE=${DEFAULT_TS_TYPE}          # ← 同上
+ENVEOF
+```
+
+脚本头是 `set -euo pipefail`，于是展开 `$DATABASE_TS_TYPE` 时未定义 → 直接退出。
+
+**修法：把求值挪到 heredoc 之前**（已修，源文件在
+`shiyongshouce/downloads/deploy/docker-00-prepare.sh`）。
+
+**第二个坑：`$VAR` 紧跟全角字符**
+
+```bash
+ok "遥测后端：$DATABASE_TS_TYPE（宿主机内存 ...）"
+#                  ↑ Bash 把全角的「（」当成变量名的一部分
+# 报错：DATABASE_TS_TYPE<乱码>: unbound variable
+```
+
+Bash 在 UTF-8 下允许非 ASCII 字符出现在变量名里，所以中文标点紧跟在变量名后面时必须加花括号：
+
+```bash
+ok "遥测后端：${DATABASE_TS_TYPE}（宿主机内存 ...）"
+```
+
+**自查整脚本有没有同类写法**
+
+```bash
+grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' docker-00-prepare.sh
+# 有输出就说明该处需要 ${VAR} 花括号
+```
+
+**重装顺序**（删卷重来时的最短路径）
+
+```bash
+cd ~/energy-app && bash docker-99-uninstall.sh --purge --yes     # 删容器+卷+目录
+cd <repo>/shiyongshouce/downloads/deploy
+bash docker-00-prepare.sh --force                                # 重组部署目录+新 .env
+cd ~/energy-app && bash docker-01-install.sh                     # 建表+装 726 个部件
+bash docker-02-start.sh --admin-email <邮箱> --admin-pass '<密码>'
+bash scripts/02-onboard.sh --admin <邮箱> --admin-pass '<密码>' \
+     --tenant "<租户名>" --customer "<客户名>" \
+     --tenant-email <租户管理员> --tenant-pass '<密码>'          # 触发演示数据
+```
+
+注意 `02-onboard.sh` 的两个硬要求：
+
+- 用**系统管理员**开通时必须同时给 `--tenant-email / --tenant-pass`，
+  否则建客户会被 403（系统管理员不属于任何租户，TB 的设计）；
+- `--customer` 只是**显示名**，不会顺带建客户账号；要客户账号另跑
+  `scripts/09-onboard-customer.sh --email ... --password ...`。

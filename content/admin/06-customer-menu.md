@@ -306,14 +306,12 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 | 行悬停 | 整行 `#f7f7f7`，横向读数时不串行 |
 | 汇总行 | `.tb-sum` 底色 `#fafafa` + 500 字重，与明细区分 |
 | 分组段 | `.tb-group-start` 加一条顶部分隔线，把 rowspan 的不同设备切开 |
-| 跨行单元格 | `.tb-span` 用等间距渐变在合并格内部补画横线（见下） |
+| 跨行单元格 | `.tb-span` 整块淡底、内部无线、垂直居中（见下） |
 | 冻结列 | `.tb-sticky` 必须**不透明底色**，否则横向滚动时内容从底下透出来；`.tb-sticky-last` 在右边缘补一条竖线交代层级 |
 
 **跨行单元格（rowspan）必须加 `.tb-span`**
 
-普通单元格靠自己的 `border-bottom` 画分隔线，一旦合并（`rowspan=4`）就只剩整段
-末尾那一根 —— 被跨过的那几行在合并列上是一片空白，整张表看起来像少了边线。
-这不是"边框被覆盖"，是 `border-collapse: separate` 下 rowspan 的固有行为。
+跨行的语义是「这几行属于同一个设备」，所以它必须是**一整块**：
 
 ```html
 <td class="tb-name tb-span" [attr.rowspan]="r.deviceSpan">{{ r.deviceName }}</td>
@@ -321,26 +319,36 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 
 ```css
 .tb-data-table td.tb-span {
-  background-image: repeating-linear-gradient(
-    to bottom,
-    transparent 0, transparent calc(var(--tb-row-pitch, 36px) - 1px),
-    rgba(0,0,0,.06) calc(var(--tb-row-pitch, 36px) - 1px),
-    rgba(0,0,0,.06) var(--tb-row-pitch, 36px));
+  --tb-cell-bg: #fafafa;
+  background-color: #fafafa;
+  vertical-align: middle;
 }
+/* 冻列 + 跨行叠加时底色也要跟着走，否则冻结列会是一道白条 */
+.tb-data-table .tb-sticky.tb-span { --tb-cell-bg: #fafafa; background-color: #fafafa; }
+/* 悬停：必须带 .tb-sticky 组合，(0,3,0) 才能压过上面的规则 */
+.tb-data-table :where(tbody tr:hover) .tb-sticky.tb-span { background-color: #f2f2f2; }
 ```
 
-`--tb-row-pitch` **不能写死**：普通行 36px、密集行 30px，手工填报那类还会被
-输入框撑高。必须由控制器在渲染后按**实测行距**写入：
+**走过的两次弯路**（都实装过、都被反馈）：
 
-```js
-var a = trs[0].getBoundingClientRect();
-var b = trs[1].getBoundingClientRect();
-var pitch = Math.round(b.top - a.top);
-table.style.setProperty('--tb-row-pitch', pitch + 'px');
-```
+| 做法 | 结果 |
+| --- | --- |
+| 什么都不做 | 普通格靠自己的 `border-bottom` 画线，合并后内部一片空白，用户以为**边线丢了** |
+| 用等间距渐变把被跨过的行线补齐 | 线确实对齐了（实测误差 1px 内），但跨行格被切成和右侧一模一样的 N 段，**看起来就是 N 个独立格子，完全看不出跨行** |
+| **整块淡底 + 内部无线**（当前） | 一眼看出是一整块；外框由普通单元格规则提供，"边线丢了"也不会再发生 |
 
-写死 36px 的后果是补出来的线逐行累积偏移，最后一行完全错位。
-`syncSpanPitch()` 要在**每次渲染与翻页之后**调用（`renderDetailPage` 里也要）。
+要点：
+
+- 淡底用 `#fafafa`（与表头同色），一眼看出是层级块，又不抢数据注意力；
+- **内部不画任何横线** —— 补线会让跨行失效；
+- 冻结列（`.tb-sticky`）必须用 `background-color: var(--tb-cell-bg, #fff)` 而不是
+  `background: #fff` 简写，否则会把跨行底色冲掉；
+- 设备名**垂直居中**（`vertical-align: middle`）。部件里若写了
+  `.eqc-table-ex .eqc-td-dev { vertical-align: top }` 会盖掉它，设备名就贴在上边框，
+  看起来像"只占第一行"。
+
+**没有任何竖线**：跨行块与右侧数据列之间那道"线"是淡底与白底的色差边界，
+不是边框（实测所有 `td` 的 `border-right: 0px`）。不要为了"更清楚"去加 `border-right`。
 
 ```html
 <table class="tb-data-table tb-data-table--fill">

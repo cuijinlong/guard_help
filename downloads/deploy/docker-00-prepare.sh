@@ -306,6 +306,19 @@ else
   ENV_MQTT_RTU_PORT=$MQTT_RTU_PORT
 fi
 
+# 遥测后端：按宿主机物理内存自动选（详见下面 .env 注释）。
+# ★ 必须在 heredoc **之前**求值：heredoc 里写 `VAR=$(...)` 只是往文件里写字面量，
+#   而 `$DATABASE_TS_TYPE` 会被立即展开 —— set -u 下未定义就直接退出（实测）。
+HOST_MEM_GB=$( (sysctl -n hw.memsize 2>/dev/null || awk '/MemTotal/{printf "%.0f\n", $2*1024}' /proc/meminfo 2>/dev/null || echo 0) | awk '{printf "%.0f", $1/1073741824}' )
+if [[ -n "${DATABASE_TS_TYPE:-}" ]]; then
+  DATABASE_TS_TYPE="$DATABASE_TS_TYPE"
+elif [[ "${HOST_MEM_GB:-0}" -ge 10 ]]; then
+  DATABASE_TS_TYPE="cassandra"
+else
+  DATABASE_TS_TYPE="sql"
+fi
+DATABASE_TS_LATEST_TYPE="${DATABASE_TS_LATEST_TYPE:-sql}"
+
 cat > "$STAGE/.env" <<ENVEOF
 # 由 docker-00-prepare.sh 生成于 $(date '+%Y-%m-%d %H:%M:%S')
 # 改端口或密码就改这个文件；改完删掉容器重跑 docker-01-install.sh。
@@ -345,20 +358,12 @@ TB_API_PASSWORD=tenant
 #     物理内存 < 10GB  → 默认 sql（少一个容器、少 2GB 常驻、少一整类故障）
 #     物理内存 ≥ 10GB  → 默认 cassandra（高写入吞吐更好）
 #   要强制指定就显式导出 DATABASE_TS_TYPE=cassandra|sql 再跑本脚本。
-HOST_MEM_GB=$( (sysctl -n hw.memsize 2>/dev/null || awk '/MemTotal/{printf "%.0f\n", $2*1024}' /proc/meminfo 2>/dev/null || echo 0) | awk '{printf "%.0f", $1/1073741824}' )
-if [[ -n "${DATABASE_TS_TYPE:-}" ]]; then
-  DEFAULT_TS_TYPE="$DATABASE_TS_TYPE"
-elif [[ "${HOST_MEM_GB:-0}" -ge 10 ]]; then
-  DEFAULT_TS_TYPE="cassandra"
-else
-  DEFAULT_TS_TYPE="sql"
-fi
-DATABASE_TS_TYPE=${DEFAULT_TS_TYPE}
+DATABASE_TS_TYPE=$DATABASE_TS_TYPE
 # 最新值后端：建议留 sql（查询快、与实体同库）
-DATABASE_TS_LATEST_TYPE=${DATABASE_TS_LATEST_TYPE:-sql}
+DATABASE_TS_LATEST_TYPE=$DATABASE_TS_LATEST_TYPE
 ENVEOF
 
-ok "遥测后端：$DATABASE_TS_TYPE（宿主机内存 ${HOST_MEM_GB:-?}GB；可用 DATABASE_TS_TYPE 环境变量覆盖）"
+ok "遥测后端：${DATABASE_TS_TYPE}（宿主机内存 ${HOST_MEM_GB:-?}GB；可用 DATABASE_TS_TYPE 环境变量覆盖）"
 
 if [[ "$PACK" == "true" ]]; then
   ok "已生成 .env（随包分发；APP_HOME 解压后自动填入，密码随机）"
