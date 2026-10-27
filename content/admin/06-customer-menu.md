@@ -275,6 +275,48 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 部件底部的提示文案会跟着这个开关变，不要写死任何一句 ——
 同一个部件在两种看板里语义不同，写死一半就是错的。
 
+#### 时间范围的日期选择器
+
+四个看板（历史能耗 / 峰谷分析 / 分项能耗 / 区域能耗）的时间范围都用
+**TB 自带的 `tb-datetime`**（Material 日期面板），不用原生 `<input type="date">`：
+
+| 项 | 约定 |
+| --- | --- |
+| 组件 | `<tb-datetime type="date\|month\|year">`，`subscriptSizing="none"` |
+| 默认区间 | **近 7 天**（右端今天，左端往前 6 天），由 `defaultRangeDays` 控制 |
+| 按月 / 按年 | 默认取当前月 / 当前年（本身就"一段"，再往前推会跨到上月/上年） |
+| 起止对齐 | 按日 ≤ 30 天、按月 = 同一个月、按年 = 同一年；改哪端就以哪端为准 |
+| 值的形式 | 部件内部仍存 `"2026-10-27"` / `"2026-10"` / `"2026"` 字符串，`tsOf()` 现算毫秒 |
+
+**为什么值不存两份**：`tb-datetime` 的 `ngModel` 是毫秒时间戳，而 `submit` /
+`parseDateInfo` / `clampRange` 都按字符串解析（字符串比较恰好等于日期先后）。
+模板用 `tsOf(str)` 现算毫秒、`onPick(ts)` 转回字符串 —— 两边各存一份必然不同步
+（切档、跨零点、外部改时间窗都会错开）。
+
+**样式必须走 `::ng-deep`**：动态部件模板里的 `<style>` 也会被 Angular 按封装策略
+改写，普通后代选择器的**每一段**都会追加 `[_ngcontent-x]`；而 `tb-datetime`
+内部 DOM 带的是它自己的 `[_ngcontent-y]`，规则一条都匹配不上
+（典型症状：宿主的高度生效了，内部尺寸纹丝不动）。
+
+**外框要自绘**：`appearance="outline"` 的框**不是** wrapper 的 border，而是
+`.mdc-notched-outline` 里三块 `notch-piece`（leading / notch / trailing）各画一段
+拼出来的 —— 框色 `rgba(0,0,0,.38)`、圆角 4px、字形高 56px，与旁边的下拉框
+（`#d9d9d9` / 3px / 30px）完全不是一套。做法是隐藏那三块，在
+`.mat-mdc-text-field-wrapper` 上自己画 1px 方框：
+
+```css
+.eqp-dates tb-datetime ::ng-deep .mdc-notched-outline { display: none; }
+.eqp-dates tb-datetime ::ng-deep .mat-mdc-text-field-wrapper {
+  height: 30px; padding: 0; background: #fff;
+  border: 1px solid var(--eqp-border, #d3dbd6); border-radius: 3px;
+}
+```
+
+只压 wrapper 的 `height` 是压不住的 —— 内部 `infix` 仍是 34px，会溢出到框外，
+看起来就是"外框特别大、日历图标跑到框外面"。
+
+---
+
 #### 三层计量树长什么样
 
 演示数据里单相 / 三相场站都是 **1 级 → 2 级 → 3 级** 三层
