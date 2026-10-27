@@ -5737,7 +5737,56 @@ WHERE kd.key = 'energy' AND tk.entity_id IN (
 
 ---
 
-### 现象 Y38：看板部件被压扁、图表只剩标题、日期框互相重叠
+### 现象 Y38：看板右上角弹红色 toast「GET /api/relations?fromId=00000000-… 404」
+
+部件拿**模板占位符**当实体 id 去查关系了。占位符是
+
+```
+00000000-0000-0000-0000-0000000005a1   第一个场站
+00000000-0000-0000-0000-0000000005a2   客户组织
+00000000-0000-0000-0000-0000000017e0   用电分项根
+00000000-0000-0000-0000-00000000d101…  四个维度根
+```
+
+安装器 `EnergyBootstrapInstaller.substitutePlaceholders()` 在**给客户复制看板**时
+把它们换成真实 id。所以占位符出现在客户看板上只有两种可能：
+
+| 原因 | 修 |
+| --- | --- |
+| 客户看板还没复制（首次登录前） | 正常，等演示包初始化完成 |
+| **手工把模板 JSON 整份写进了客户看板** | 用 `tools/push-dashboard.py` 推库（只更新 `widgets/states/settings`，保留 `entityAliases`） |
+
+> **⚠ 推看板一律用 `python3 tools/push-dashboard.py <template>`，不要手写
+> `UPDATE dashboard SET configuration = <整份模板>`**。模板里的 `entityAliases`
+> 是占位符，整份覆盖等于把占位符倒灌进客户看板 —— 2026-10-27 就是这么踩的：
+> 改布局时整份覆盖，页面右上角每次加载都弹一次 404，场站/分项范围取不到数据。
+>
+> 注意 `11b7`（能源参数字典）与 `e1ec`（电能品种）是**故意保留占位符**的：
+> 它们是租户级资产，客户账号读会 403。别"顺手"把它们也换掉。
+
+**已经踩了的修法**（只换该换的，保留 11b7/e1ec）：
+
+```sql
+UPDATE dashboard
+SET configuration = replace(
+      replace(configuration::text,
+        '00000000-0000-0000-0000-0000000005a1', '<该客户第一个场站 id>'),
+      '00000000-0000-0000-0000-0000000017e0', '<该客户用电分项根 id>')::json
+WHERE title = '能耗概览';
+```
+
+**自检**（应为 0）：
+
+```sql
+SELECT count(*) FROM dashboard
+WHERE configuration::text LIKE '%0000000005a1%'
+   OR configuration::text LIKE '%0000000017e0%'
+   OR configuration::text LIKE '%0000000005a2%';
+```
+
+---
+
+### 现象 Y39：看板部件被压扁、图表只剩标题、日期框互相重叠
 
 `gridSettings.autoFillHeight = true` 会把所有行**压缩**进一屏：
 30 行的内容塞进 12 行的高度，部件容器被压到自身内容的 40% ——
@@ -5764,7 +5813,7 @@ FROM dashboard WHERE id = '<看板id>';
 
 ---
 
-### 现象 Y39：看板顶部有一条红色进度条，一直不消失
+### 现象 Y40：看板顶部有一条红色进度条，一直不消失
 
 那是 `mat-progress-bar mode="indeterminate" color="warn"`，绑的是**全局**
 `isLoading` —— 任何一次 HTTP 请求都会点亮它。部件多、又有周期刷新的看板
@@ -5790,7 +5839,7 @@ WHERE id = '<看板id>';
 
 ---
 
-### 现象 Y40：日期选择器是「大圆角 Material 框」，跟旁边的按钮/下拉不一个规格
+### 现象 Y41：日期选择器是「大圆角 Material 框」，跟旁边的按钮/下拉不一个规格
 
 样式写了但不生效，99% 是写在了 `templateCss` 里。
 
@@ -5819,7 +5868,7 @@ WHERE id = '<看板id>';
 
 ---
 
-### 现象 Y41：改过的时间范围刷新后又变回去了（或不想要记忆里的旧区间）
+### 现象 Y42：改过的时间范围刷新后又变回去了（或不想要记忆里的旧区间）
 
 2026-10-27 起，客户手动选过并**确认**的时间范围会按「客户 + 看板」记在浏览器里，
 刷新/重进看板优先用它（见
