@@ -241,6 +241,37 @@ docker compose exec cassandra cqlsh -e   "SELECT table_name FROM system_schema.t
 `label` 留业务原名。前端渲染一律取 `label || name`。
 这属于命名约定，不改变「场站/设备是客户级实例」的定位。
 
+**后端接口也要按这条走**（2026-10-27 补齐）。原来只在前端写了 `label || name`，
+但接口从不返回 `label`，于是每一处都静默退到技术名 —— 客户在「功率因数与负荷需量」
+的关口表下拉里看到的是 `单相园-1#进线总表·平台演示中心`。
+现在统一收口到 `com.guard.server.util.DisplayName.of(...)`：
+
+| 接口 | 字段 | 改法 |
+| --- | --- | --- |
+| `GET /api/energy/meters` | `name` | 改为**显示名**；另返回 `label`（原始）与 `technicalName`（技术名，排查用） |
+| `GET /api/energy/tou-analysis` | `scopeName` / `deviceBreakdown[].deviceName` | `DisplayName.of(device)` |
+| 抄表记录 / 抄表明细 / 设备计量配置 | `deviceName` | 同上 |
+| 手工填报（清单、解绑结果） | `deviceName` / `detachedDevices[]` | 同上 |
+
+两条边界：
+
+- **给人看的**字段一律用 `DisplayName.of()`；
+- **用于匹配、去重、拼 SQL** 的地方必须仍用 `name`（它是唯一键）。
+  日志也保留 `name` —— 排查时要的是能唯一定位的那一个。
+
+```sql
+-- 核对：客户设备的技术名 vs 显示名
+SELECT d.name AS 技术名, d.label AS 显示名, d.type AS 档案
+FROM device d
+WHERE d.customer_id = '<客户id>'
+ORDER BY d.name;
+```
+
+> 唯一例外是看板工具栏的「实体选择」浮层（`tb-aliases-entity-select`）——
+> 那是 TB 原生通用组件，读的是 `EntityInfo.name`（无 label 字段）。
+> 本平台所有客户看板都设了 `configuration.settings.showEntitiesSelect = false`，
+> 该控件不渲染（尺寸 0×0），客户看不到。
+
 ---
 
 ## 一之三、装完第一件事：打开「平台自检」
