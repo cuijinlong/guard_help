@@ -5619,3 +5619,242 @@ curl -X DELETE -H "X-Authorization: Bearer $SYS_TOKEN" \
 无 logo、绿按钮、背景 `#F3F8F3`。实测 2026-10-27 双向切换均正常。
 
 > 若某个 DELETE 返回 405，稍等几秒重试一次即可（实测偶发，重试即 200）。
+
+---
+
+### 现象 Y35：日期选择器还是英文（October / Wed）/ 显示成 01/01/2026 / 外框比旁边输入框高一截
+
+**三个症状同源**，都在日期选择器（`tb-datetime`）上，但成因不同：
+
+**A. 还是英文月份、英文星期**
+
+`CustomDateAdapter` 没生效。检查两件事：
+
+1. 类是否还在 `ui-ngx/src/app/shared/adapter/custom-datatime-adapter.ts`，
+   且 `SharedModule` 里仍然 `{ provide: DatetimeAdapter, useClass: CustomDateAdapter }`；
+2. 前端是否**真的**重建了 —— 这个文件编译进 `ui-ngx` 的 JS，改完不重建不生效。
+   按 [Y32](#现象-y32浏览器标签页还写着-thingsboard--登录页换了但标签没变) 的顺序重建。
+
+> 别去改 `MAT_DATE_LOCALE='zh-CN'`：那是全局 token，会连带改变设备安装日期、
+> 告警计划等所有 Material 日期组件的格式，还要额外 `registerLocaleData(localeZh)`，
+> 否则报「Missing locale data for the locale "zh-CN"」。
+
+**B. 按年档显示成 01/01/2026**
+
+`MatDatetimepickerInputDirective.getDisplayFormat()` 是个 switch，只写了
+`date` / `datetime` / `time` / `month`，**漏了 `year`** —— `type="year"` 拿到
+`undefined`，父类退回 DatePipe 默认格式（en-GB 下就是 `01/01/2026`）。
+
+适配器里把 `undefined` 精确映射成「只有年」：
+
+```ts
+if (displayFormat === undefined || displayFormat === null) {
+  return String(date.getFullYear());   // → 2026
+}
+```
+
+**C. 外框比旁边的下拉框高一截、日历图标跑到框外**
+
+`appearance="outline"` 的框不是 wrapper 的 border，而是
+`.mdc-notched-outline` 里三块 `notch-piece` 拼出来的（框色 `rgba(0,0,0,.38)`、
+圆角 4px、字形高 56px）。只压 wrapper 的 `height` 压不住，内部 `infix` 仍是 34px。
+
+修法是隐藏那三块、在 wrapper 上自绘 1px 方框，见
+[3.0.2 的「时间范围的日期选择器」](#时间范围的日期选择器)。
+
+**顺带一份自检 SQL/命令**（改完前端后确认真的生效）：
+
+```bash
+# 1) 前端产物里应该有中文月份
+grep -o '十一月' ~/energy-app/data/../*/public/main-*.js 2>/dev/null | head -1
+# 2) 浏览器控制台执行（在任一带日期选择器的看板里）
+#    [...document.querySelectorAll('tb-datetime input')].map(i => i.value)
+#    期望 ['2026-10-21', '2026-10-27'] 这种 yyyy-MM-dd
+```
+
+---
+
+### 现象 Y36：分项 / 区域能耗里还有「实时」页签，或者页面一直停在几分钟的窗口
+
+本意是**只有历史**（2026-10-27 起默认收起实时/历史切换）。两个方向都要查：
+
+| 现象 | 原因 | 修 |
+| --- | --- | --- |
+| 页签还在 | 部件设置 `showTimeMode=true`，或部件 JSON 是旧版 | 关掉 `showTimeMode`；确认 `energy_management_analysis_bar` 已推库 |
+| 页签没了但窗口仍是几分钟 | 只藏了 UI、没钉死 `timeMode`（旧写法） | 升级部件：初始化必须走 `scope.timeMode = (showTimeMode && settings.timeMode==='realtime') ? 'realtime' : 'history'` |
+
+> 只用 `*ngIf` 藏起来是不够的：`timeMode` 仍可能被 `settings.timeMode` 设成
+> `realtime`，界面上却没有开关能改回来 —— 板面永久停在实时窗口，且从界面上
+> 找不到原因。开关和取值必须在同一处判断。
+
+---
+
+### 现象 Y37：客户登录后每块看板都空白，但数据库里明明有演示数据
+
+演示数据是**建客户那一刻**往前 62 天生成的一段历史。客户隔一个月才登录时，
+「最近 7 天」这个默认窗口里什么都没有 —— 数据在库里，只是不在窗口里。
+
+**先确认窗口对不对**（用客户账号的 token）：
+
+```bash
+curl -s -H "X-Authorization: Bearer $CTOK" \
+  http://127.0.0.1:8090/api/energy/time-anchor
+```
+
+期望 `demo=true` 且 `anchor` 等于演示数据的最后一天。若 `demo=false`：
+
+| 原因 | 修 |
+| --- | --- |
+| 客户属性 `energyDemoWindow` 没写 | 「平台自检 → 一键修复初始化」（`demoWindowFixed` 会 >0） |
+| 属性写了但接口读不到 | 确认后端已升级（早期版本用 `getJsonValue()` 读 StringDataEntry，永远读不到） |
+| 直接改库后接口还是旧值 | `attributesService` 有缓存，改库要重启 `energy-server` 才生效 |
+
+**核对属性与数据是否一致**：
+
+```sql
+SELECT c.title, ak.str_v
+FROM attribute_kv ak
+JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+JOIN customer c ON c.id = ak.entity_id
+WHERE kd.key = 'energyDemoWindow';
+```
+
+再对一下遥测的最早/最晚时间：
+
+```sql
+SELECT to_timestamp(min(ts)/1000) AS 最早, to_timestamp(max(ts)/1000) AS 最晚
+FROM ts_kv tk
+JOIN key_dictionary kd ON kd.key_id = tk.key
+WHERE kd.key = 'energy' AND tk.entity_id IN (
+  SELECT id FROM device WHERE customer_id = '<客户id>');
+```
+
+两者对不上时以**数据**为准，把属性改成数据实际覆盖的那一段（见
+[演示数据的时间窗口](#演示数据的时间窗口默认时间窗对齐)）。
+
+> **默认时间窗只对齐「演示客户」**。真实客户的 `demo=false`，走「最近 N 天」，
+> 不受这条逻辑影响。租户管理员看模板库时同样是真实今天。
+
+---
+
+### 现象 Y38：看板部件被压扁、图表只剩标题、日期框互相重叠
+
+`gridSettings.autoFillHeight = true` 会把所有行**压缩**进一屏：
+30 行的内容塞进 12 行的高度，部件容器被压到自身内容的 40% ——
+日历只露半截、图表只剩标题栏、两个日期框叠在一起。
+表现为"页面太挤"，其实是布局策略问题，不是部件写错了。
+
+| 检查 | 期望 |
+| --- | --- |
+| `autoFillHeight` | `false`（超出视口 → 纵向滚动） |
+| 单部件 `sizeY` | 按**最小 1366 宽**校准：图表类 ≥6，带工具条+图例的 ≥7，日历 ≥7 |
+
+> 桌面端**没有固定行高**：`detectRowSize()` 在「非 autofill + 非移动端」返回
+> `null`，所以 `gridSettings.rowHeight` 写了也不生效。行高由 gridster 按看板
+> 宽度等比算（≈ 宽度 × 0.034）：1366 → 46px/行，1680 → 59px/行，1920 → 69px/行。
+> 高度只能靠 `sizeY` 调，且要在 1366 上验收 —— 在 1920 上合身的行数，
+> 到 1366 会把内容裁掉。
+
+```sql
+SELECT jsonb_pretty((configuration::jsonb)->'states'->'default'->'layouts'->'main'->'gridSettings')
+FROM dashboard WHERE id = '<看板id>';
+```
+
+改完库**必须重启** `energy-server`，否则读到的还是缓存的看板配置。
+
+---
+
+### 现象 Y39：看板顶部有一条红色进度条，一直不消失
+
+那是 `mat-progress-bar mode="indeterminate" color="warn"`，绑的是**全局**
+`isLoading` —— 任何一次 HTTP 请求都会点亮它。部件多、又有周期刷新的看板
+（能耗概览 / 实时能耗）会一直亮着，看起来像页面卡在加载。
+
+TB 已内置看板级开关，写在 `configuration.settings`：
+
+```json
+{ "suppressLoadingBar": true }
+```
+
+```sql
+UPDATE dashboard
+SET configuration = jsonb_set(configuration::jsonb, '{settings,suppressLoadingBar}', 'true')
+WHERE id = '<看板id>';
+```
+
+改完重启 `energy-server`。**只影响这一块看板**，其它看板仍按全局 loading 显示。
+
+> 判断是不是这个原因：控制台看 `document.querySelectorAll('mat-progress-bar').length > 0`，
+> 且此时部件其实都已有数据 —— 那就是"全局 isLoading 被轮询点亮"，不是真在加载。
+> 部件自己的"加载中…"是部件级状态，与这条红条无关。
+
+---
+
+### 现象 Y40：日期选择器是「大圆角 Material 框」，跟旁边的按钮/下拉不一个规格
+
+样式写了但不生效，99% 是写在了 `templateCss` 里。
+
+`templateCss` 由 TB 作为组件 styles 注入，并把每条规则前缀成
+`.widget-type-system-energy_management_xxx ...`；其中的 `::ng-deep`
+**被原样保留**，而浏览器不认识这个伪元素 —— **整条规则被丢弃**。
+
+症状很好认：日期框高 78px、内框 56px、圆角 4px 的 Material 默认外观，
+旁边工具条只有 30px。
+
+```js
+// 控制台自检：规则还在不在
+[...document.styleSheets].flatMap(s => { try { return [...s.cssRules]; } catch { return []; } })
+  .map(r => r.selectorText || '').filter(t => /tous-pick|eqp-pick|eqab-pick/.test(t));
+// 只剩不含 ::ng-deep 的那一条 → 说明压缩样式被丢弃了
+```
+
+**修**：把带 `::ng-deep` 的规则搬进 `templateHtml` 的 `<style>` 块。
+那条路径由 Angular 动态编译按封装策略改写，`::ng-deep` 会降级成
+`[_ngcontent-x]` 穿透到 `tb-datetime` 内部。
+
+```js
+// 修好后验证：宿主高度应为 30
+[...document.querySelectorAll('tb-datetime.tous-pick')].map(e => e.getBoundingClientRect().height);
+```
+
+---
+
+### 现象 Y41：改过的时间范围刷新后又变回去了（或不想要记忆里的旧区间）
+
+2026-10-27 起，客户手动选过并**确认**的时间范围会按「客户 + 看板」记在浏览器里，
+刷新/重进看板优先用它（见
+[时间范围的记忆](/admin/06-customer-menu#时间范围的记忆刷新不再跳回默认)）。
+所以「刷新后不是我刚改的值」先分两种情况：
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 改完没刷新就丢了 | 查询设置里改了日期但**没点「查询」** | 点一次「查询」才会写记忆；没确认的输入不记 |
+| 刷新后回到默认 | 浏览器禁用了 localStorage（隐私模式 / 站点数据被清） | 记忆写不进去时静默降级，功能仍可用，只是不记忆 |
+| 刷新后回到默认 | 换了账号或换了看板 | 记忆按 `customerId` + `dashboardId` 隔离，这是设计行为 |
+| 一直停在几周前的区间 | 客户之前手动选过，记忆还在 | 切「实时」再切回「历史」即清；或删除对应键（见下） |
+| 分项/区域能耗停在旧区间 | 同上（这两个部件改完即存） | 同上 |
+
+**精确删除某块看板的记忆**（浏览器控制台）：
+
+```js
+// dashboardId 就是地址栏里 dashboardId= 后面那一段
+localStorage.removeItem('tb.energy.timeRange.<dashboardId>.query');     // 查询设置
+localStorage.removeItem('tb.energy.timeRange.<dashboardId>.analysis');  // 分析条件
+```
+
+**确认记忆到底存没存**：
+
+```js
+Object.keys(localStorage).filter(k => k.indexOf('tb.energy.timeRange.') === 0)
+  .map(k => k + ' = ' + localStorage.getItem(k));
+```
+
+期望能看到 `{"customerId":"…","grainLevel":"day","fromDate":"2026-09-01",…}`。
+若 `customerId` 为 `null` 而当前是客户账号，说明写入时没取到用户信息 ——
+升级部件（早期版本把 `AuthUser.customerId` 当对象取 `.id`，永远是 `undefined`）。
+
+> **别用「每次刷新都重新算今天往前 7 天」来"修"这个问题**：那会把客户选的固定区间
+> 变成滚动窗口，等于把记忆又抹掉。默认值与手动选择是两件事，只在「没记忆」时才用默认值。
+
+> **默认区间没有被固化**：只有手动改过并确认的才写记忆。没改过的客户，默认窗口
+> 仍随 `anchor` 天天滚动 —— 演示客户隔一个月登录照样落在演示数据那一段。

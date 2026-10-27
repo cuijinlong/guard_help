@@ -275,6 +275,82 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 部件底部的提示文案会跟着这个开关变，不要写死任何一句 ——
 同一个部件在两种看板里语义不同，写死一半就是错的。
 
+#### 演示数据的时间窗口（默认时间窗对齐）
+
+演示数据是**建客户那一刻**往前 **62 天**生成的一段历史快照（`DEMO_DAYS = 62`），
+窗口末端就是生成当天。客户如果隔一周或一个月才登录，「最近 7 天」里什么都没有 ——
+每块看板都是空白，看起来像功能坏了。
+
+**做法**：生成演示数据时把窗口记在客户的服务端属性 `energyDemoWindow` 上，
+所有部件的默认时间窗对着它算，而不是对着真实的今天。
+
+```json
+{"from":"2026-08-27","to":"2026-10-27","days":62,"generatedAt":1793076767584}
+```
+
+前端通过 `GET /api/energy/time-anchor` 拿到基准日：
+
+```json
+{"today":"2026-10-27","anchor":"2026-10-27","demo":true,
+ "windowFrom":"2026-08-27","windowTo":"2026-10-27","days":62}
+```
+
+| 账号类型 | `anchor` | `demo` |
+| --- | --- | --- |
+| 演示客户（客户属性存在） | 窗口末端（生成演示数据那天） | `true` |
+| 真实客户 / 租户管理员 / 系统管理员 | 真实的今天 | `false` |
+
+部件把 `anchor` 当作默认时间窗的右端：按日 → `anchor` 往前 6 天到 `anchor`。
+结果缓存在 `window.__energyAnchorMs` 上，一页 8 个部件只发一次请求；
+3 秒拿不到就按真实今天走，不能让看板开不出来。
+
+**覆盖的部件**：查询设置（历史能耗 / 峰谷分析 / 参数报表 / 基础报表 / 手工填报…）、
+分析条件（分项能耗 / 区域能耗 / 能耗概览）、峰谷平用电能耗统计、功率因数与负荷需量。
+
+> **为什么不让前端自己猜**：猜法只能是「往前找有数据的那天」，要么扫遥测（很贵），
+> 要么在每块部件里各写一遍。窗口是生成时就知道的确定事实，记一次、读一次，零计算。
+
+> **为什么不做「按天滚动补齐」**：那要写数据、要定时任务，还要处理「客户已经开始
+> 用真实数据」的边界。默认时间窗对齐是只读的，不和数据生成纠缠在一起。
+
+> **手动改过的区间会被记住**（2026-10-27 起）：客户调好区间并点「查询」后，
+> 刷新页面或下次进来仍按他选的查，不再跳回 `anchor` 的默认区间。
+> 规则见下面的[「时间范围的记忆」](#时间范围的记忆刷新不再跳回默认)。
+
+#### 时间范围的记忆（刷新不再跳回默认）
+
+默认区间是**算**出来的（`anchor` + `defaultRangeDays`），它回答的是「没人动过时
+该显示哪段」。客户一旦手动调过区间，这个默认值就不该再覆盖他的选择 ——
+否则「调好 → 刷新 → 又变回去」，客户会认为筛选没生效。
+
+| 项 | 规则 |
+| --- | --- |
+| 存哪 | 浏览器 `localStorage`，键 `tb.energy.timeRange.<dashboardId>.<query\|analysis>` |
+| 存什么 | `{customerId, grainLevel/format, fromDate/from, toDate/to, savedAt}` |
+| 何时写（查询设置） | 点**「查询」**时写 —— 改了日期但没查询，不算确认 |
+| 何时写（分析条件） | 改日期 / 切档位**立即**写（这个部件本来就是改完即发布） |
+| 何时读 | 部件初始化时，**优先于**顶部时间窗、`anchor` 和 `defaultRangeDays` |
+| 客户隔离 | `customerId` 不同不继承（同一台电脑换了账号登录不会串） |
+| 看板隔离 | 每个看板各存一份，历史能耗的区间不会带到峰谷分析 |
+| 精度校验 | 存的档位与字符串精度必须吻合（`day`↔`2026-09-01`），否则丢弃重算 |
+| 只记历史 | 切到「实时」会清掉记忆 —— 实时窗口的右端是「现在」，存下来没有意义 |
+| 默认值不固化 | 没手动改过就不写，所以默认区间仍随 `anchor` 天天滚动 |
+
+**想恢复成默认区间**：把「实时 / 历史」切到实时再切回历史；
+或者用浏览器的「清除站点数据」。也可以用控制台精确删掉某一块看板的记忆：
+
+```js
+// 只删当前看板：key 里的 id 就是地址栏 dashboardId 那一段
+localStorage.removeItem('tb.energy.timeRange.<dashboardId>.query');
+localStorage.removeItem('tb.energy.timeRange.<dashboardId>.analysis');
+```
+
+> **为什么不写进看板配置**：`configuration` 是模板，所有客户共用一份。
+> 一个客户改了区间，别的客户跟着变 —— 那是把个人偏好写进公共配置。
+>
+> **为什么不按「今天往前 7 天」重新算**：那等于把客户的固定区间又变成滚动窗口，
+> 他选的 9 月那一段会莫名其妙往前跑。记忆就是记忆，不做二次加工。
+
 #### 时间范围的日期选择器
 
 四个看板（历史能耗 / 峰谷分析 / 分项能耗 / 区域能耗）的时间范围都用
@@ -287,6 +363,9 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 | 按月 / 按年 | 默认取当前月 / 当前年（本身就"一段"，再往前推会跨到上月/上年） |
 | 起止对齐 | 按日 ≤ 30 天、按月 = 同一个月、按年 = 同一年；改哪端就以哪端为准 |
 | 值的形式 | 部件内部仍存 `"2026-10-27"` / `"2026-10"` / `"2026"` 字符串，`tsOf()` 现算毫秒 |
+| 输入框格式 | **`yyyy-MM-dd`**（按日）、`yyyy-MM`（按月）、`yyyy`（按年） |
+| 面板语言 | **全中文**：`十月` / `一 二 三 四 五 六 日` / `周三 10月21日` |
+| 间距与图标 | 文字左内边距 8px；日历图标 18px（框高 30px） |
 
 **为什么值不存两份**：`tb-datetime` 的 `ngModel` 是毫秒时间戳，而 `submit` /
 `parseDateInfo` / `clampRange` 都按字符串解析（字符串比较恰好等于日期先后）。
@@ -297,6 +376,24 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 改写，普通后代选择器的**每一段**都会追加 `[_ngcontent-x]`；而 `tb-datetime`
 内部 DOM 带的是它自己的 `[_ngcontent-y]`，规则一条都匹配不上
 （典型症状：宿主的高度生效了，内部尺寸纹丝不动）。
+
+> **`<style>` 要写在 `templateHtml` 里，不能写 `templateCss`**（2026-10-27 实测）。
+> `templateCss` 由 TB 作为组件 styles 注入，并把每条规则前缀成
+> `.widget-type-system-energy_management_xxx ...`；其中 `::ng-deep` **被原样保留**，
+> 而浏览器不认识这个伪元素 —— **整条规则被丢弃**。
+> 症状：写好的 30px 压缩样式一条不生效，日期框仍是 Material 默认的 56px 内框 /
+> 78px 外框（「峰谷平用电能耗统计」就是这么栽的）。
+> 把同样的规则搬进 `templateHtml` 的 `<style>` 里就好了 —— 那条路径由 Angular
+> 动态编译按封装策略改写，`::ng-deep` 会被降级成 `[_ngcontent-x]` 穿透。
+>
+> 自检：控制台查规则是否存在且命中
+>
+> ```js
+> // 规则被丢弃时只剩不带穿透的那条
+> [...document.styleSheets].flatMap(s => { try { return [...s.cssRules]; } catch { return []; } })
+>   .map(r => r.selectorText || '').filter(t => /tous-pick/.test(t));
+> // 期望看到 .tous-pick ::ng-deep ... 被改写后的 .xxx .tous-pick .mat-mdc-text-field-wrapper
+> ```
 
 **外框要自绘**：`appearance="outline"` 的框**不是** wrapper 的 border，而是
 `.mdc-notched-outline` 里三块 `notch-piece`（leading / notch / trailing）各画一段
@@ -314,6 +411,49 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 
 只压 wrapper 的 `height` 是压不住的 —— 内部 `infix` 仍是 34px，会溢出到框外，
 看起来就是"外框特别大、日历图标跑到框外面"。
+
+**中文化与格式在 `CustomDateAdapter` 里做，不改 `MAT_DATE_LOCALE`**：
+
+`MAT_DATE_LOCALE` 是全局单值 token，改成 `zh-CN` 会连带改变平台里所有 Material
+日期组件（设备安装日期、告警计划等）的格式，而且 `NativeDateAdapter` 走 Angular 的
+`formatDate()`，还要额外 `registerLocaleData(localeZh)`，否则运行时报
+「Missing locale data for the locale "zh-CN"」。
+
+`CustomDateAdapter`（`ui-ngx/src/app/shared/adapter/custom-datatime-adapter.ts`）
+只被 `mat-datetimepicker` 使用，影响面正好等于「时间选择器」本身：
+
+| 重写的方法 | 作用 |
+| --- | --- |
+| `format()` | 按 `displayFormat` 的字段组合反推档位，输出 `yyyy-MM-dd` / `yyyy-MM` / `yyyy` / `yyyy年M月` |
+| `getMonthNames()` | 返回中文月份（月份视图的 12 个格子） |
+| `getDayOfWeekNames()` | 返回中文星期（表头 `一 二 三 四 五 六 日`） |
+| `parse()` | 支持手打 `2026-10-27` / `2026-10` / `2026` |
+
+> **星期数组必须周日起首**（index 0 = 周日）。`mat-datetimepicker` 拿到数组后会按
+> `getFirstDayOfWeek()` 旋转：`weekdays.slice(n).concat(weekdays.slice(0, n))`。
+> en-GB 的 `weekInfo.firstDay` 是 1（周一），旋转后正好把周一排到第一格。
+> 若数组写成周一起首，旋转会让表头整体错位一格（表头写周二、格子却是周一）。
+
+> **按年档的格式是个坑**：`MatDatetimepickerInputDirective.getDisplayFormat()` 是个
+> switch，只写了 `date` / `datetime` / `time` / `month` 四个分支，**漏了 `year`** ——
+> 于是 `type="year"` 拿到 `undefined`，父类退回 DatePipe 默认格式，en-GB 下就是
+> `01/01/2026`（年份档里塞了个月日和它自己无关）。适配器把 `undefined` 精确映射成
+> 「只有年」，既修掉格式，也让按年档显示成 `2026` 而不是 `2026-01-01`。
+> 若将来库补上 `year` 分支，适配器就走不到这一条 —— 那时显示 `yyyy-MM-dd`，同样合规。
+
+**改完 `CustomDateAdapter` 必须重建前端**（它编译进 `ui-ngx` 的 JS，不是部件 JSON）：
+
+```bash
+cd ui-ngx
+node --max_old_space_size=8192 ./node_modules/@angular/cli/bin/ng build --configuration production
+jar cfM /tmp/ui-ngx.jar -C target/generated-resources .
+cp /tmp/ui-ngx.jar ~/Documents/dev_tools/maven_repository/rule-engine/org/thingsboard/ui-ngx/4.4.0/ui-ngx-4.4.0.jar
+cd ../guard-server && mvn -o package -DskipTests -q
+cp target/guard-server-4.4.0.jar ~/energy-app/
+cd ~/energy-app && docker compose --profile split restart energy-server
+```
+
+约 13 分钟（Angular 生产构建）。只改部件 JSON 时不需要这一步。
 
 ---
 
@@ -705,6 +845,83 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 
 ### 3.1 能耗概览 / 实时能耗
 
+#### 看板布局：一屏放不下就滚动，不要压缩（2026-10-27 定稿）
+
+能耗概览有 8 个部件，一屏（900px 高的笔记本屏）必然放不下。此前的
+`autoFillHeight: true` 会让 gridster 把 **30 行**压进 **12 行**的高度里 ——
+部件内部被裁切：日历只露半截、图表只剩标题、日期控件互相重叠。
+看起来像"页面太挤"，实际是布局策略选错了。
+
+| gridSettings | 值 | 为什么 |
+| --- | --- | --- |
+| `autoFillHeight` | `false` | 按行数算真实高度，超出视口就出**纵向滚动条**，部件保持自身尺寸 |
+| `columns` / `margin` | `24` / `10` | 与其它看板一致 |
+| `mobileRowHeight` | `70` | **只对移动端生效** |
+
+> **桌面端没有「固定行高」这个选项**，别去 `gridSettings` 里写 `rowHeight` ——
+> `dashboard.component.ts` 的 `detectRowSize()` 在「非 autofill + 非移动端」分支
+> 直接返回 `null`，那个值根本不会进 gridster。
+>
+> 桌面行高是 **gridster 按看板宽度等比算的**（实测 ≈ 宽度 × 0.034）：
+>
+> | 视口宽 | 每行高 | 34 行总高 |
+> | --- | --- | --- |
+> | 1366 | ≈ 46px | ≈ 1560px |
+> | 1680 | ≈ 59px | ≈ 2000px |
+> | 1920 | ≈ 69px | ≈ 2340px |
+>
+> 所以**高度只能靠行数（`sizeY`）调**，并且要按**最小 1366 宽**校准 ——
+> 在 1920 上刚好合身的行数，到 1366 上会把内容裁掉。
+
+**另：顶部那条红色进度条**
+
+它是 Material 的 `mat-progress-bar mode="indeterminate"`，绑的是**全局** `isLoading`
+（任何一次 HTTP 请求都会点亮）。能耗概览有 8 个部件并发取数 + 峰谷平/功率因数的
+周期刷新，红条会常驻不消失，看起来像一直加载失败。
+
+看板级开关（`configuration.settings`）关掉它：
+
+```json
+{ "suppressLoadingBar": true }
+```
+
+`realtime_energy`（实时能耗）早就开了同一个开关，原因是"每几秒拉一次遥测"。
+能耗概览按同一标准处理。**只影响这一块看板**，其它看板行为不变。
+
+**部件顺序（自上而下，两个新部件固定在最下面）**：
+
+| 行 | 部件 | 尺寸 | 说明 |
+| --- | --- | --- | --- |
+| 0 | 分析条件（能源品种） | 24×1 | 时间范围关闭，时间由峰谷平部件自管 |
+| 1 | 用电量统计卡 | 24×2 | 今日 / 本月 / 今年 / 总 |
+| 3 | 历史用电量详细（日历） | 12×6 | 6 周日历 + 图例，低于 6 行会被裁 |
+| 3 | 用电量统计（柱线） | 12×6 | |
+| 9 | 分项用电量对比（饼） | 12×6 | |
+| 9 | 用电量排名 | 12×6 | |
+| 15 | **峰谷平用电能耗统计** | 24×7 | 工具条 + 5 张档位卡 + 柱状图 |
+| 22 | **功率因数与负荷需量** | 24×8 | 仪表盘 + 需量曲线 + 3 张指标卡 |
+
+总 30 行 ≈ 2100px。改尺寸只改
+`configuration.states.default.layouts.main.widgets`，**不要**去改
+`configuration.widgets`（那里只有部件配置，没有尺寸）。
+
+```sql
+-- 核对布局（改完库要重启 energy-server，否则读到的是缓存）
+SELECT jsonb_pretty((configuration::jsonb)->'states'->'default'->'layouts'->'main'->'gridSettings')
+FROM dashboard WHERE title = '能耗概览';
+```
+
+> **同名的看板有两块**：`WHERE title='能耗概览'` 会更新**两行**
+> （同一租户下新旧两个实例，`created_time` 不同）。这是预期的 —— 两块本来
+> 就是同一个模板的副本。也正因如此，改看板时**别用 title 之外的模糊条件**，
+> 更不要漏掉 `WHERE`：`dashboard.configuration` 是整份 JSON，误更新会把
+> 别的看板覆盖成同一份布局。用 id 最稳 —— 先查出来，再用 id 更新：
+
+```sql
+SELECT id, title, created_time FROM dashboard WHERE title LIKE '%能耗%';
+```
+
+
 **看什么**：当前功率、今日电量、负荷率、三相电压电流。
 
 **数据键**：
@@ -783,7 +1000,44 @@ WHERE t.entity_id = '<场站资产id>'
 
 ---
 
-### 3.2 历史能耗
+#### 两个统计部件（峰谷平 / 功率因数与负荷需量）
+
+能耗概览底部的两块是**自绘 SVG 部件**，不引 ECharts（与其余 29 个部件同技术栈，
+不增加打包体积、不受第三方版本约束）。
+
+**峰谷平用电能耗统计**（`energy_management.tou_summary` → `GET /api/energy/tou-analysis`）
+
+| 选中档位 | 横轴每根柱 | 接口 `granularity` | 横轴标签 |
+| --- | --- | --- | --- |
+| 按日 | 该跨度里的**每个小时** | `hour` | 跨多天 → 每天一个「MM-DD」；单日 → 「HH:00」 |
+| 按月 | 每天的合计 | `day` | 「MM-DD」 |
+| 按年 | 每个自然月的合计 | `month` | 「M月」 |
+
+档位卡的档名（尖/峰/平/谷/深谷）和颜色**来自接口返回的 `types`**，
+按数量渲染 4 或 5 张，不在前端写死 —— 换了分时方案不用改代码。
+
+> **横轴标签为什么按天合并（2026-10-27 修）**：
+> 按日查 7 天 = 7×24 根小时柱，每 20 根抽一个标签，会得到
+> `01:00 / 21:00 / 17:00 / 13:00 …`。顺序其实是对的（第 0、20、40 个桶 =
+> 10-21 01:00、10-21 21:00、10-22 17:00），但小时数跨天回绕、标签里没有日期，
+> 看起来像时间倒流。现在标注在**每天第一根**柱上，文本用 `MM-DD` ——
+> 7 天 7 个标签，一眼看出是日期轴。
+
+**功率因数与负荷需量**（`energy_management.power_load`）
+
+| 口径 | 算法 | 为什么 |
+| --- | --- | --- |
+| 平均功率因数 | `PF = ΣP / ΣS`（按视在功率加权） | 多表直接算术平均是错的：10kVA 与 1000kVA 的表不等权 |
+| 容量 / 需量 | 每个桶**求和** | 取 MAX 会得到「最大那台表」的值；容量与需量必须同口径，负载率才有意义 |
+| 负载率 | 只在配了铭牌容量时算 | 未配置时用「实测峰值视在功率」兜底显示容量，但**不**算负载率 —— 分母自证的比值必然在 100% 附近 |
+
+数据键：`power_factor_total` / `power_total` / `apparent_power_total` / `demand_max`。
+口径不符时（如某台表只有有功没有视在）退回算术平均，并在副标题标注。
+
+**工具条里的日期选择器与其它部件同一规格**：30px 高、`yyyy-MM-dd`、图标 18px。
+样式写在 `templateHtml` 的 `<style>` 里（原因见
+[时间范围的日期选择器](#时间范围的日期选择器) 里的 `templateCss` 说明）。
+
 
 **布局（2026-10-26）**：
 
@@ -1110,11 +1364,39 @@ FROM diff GROUP BY entity_id;
 **两页的查询口径完全一致，只有分组维度不同**
 
 ```
-分析条件（analysis_bar）  电能品种 + 场站/全部 + 实时·历史 + 按日/按月/按年
+分析条件（analysis_bar）  电能品种 + 场站/全部 + 按日/按月/按年 + 起止日期
 统计图（asset_stats_chart）  堆叠柱：按日=小时柱 / 按月=天柱 / 按年=月柱
 分布（distribution_chart）   环形图 + 图例（label）
 排名（ranking_list）        分项页 1 个（设备）；区域页 2 个（区域 / 单元）
 ```
+
+**「实时 / 历史」切换默认隐藏，且隐藏时一律按历史走。**
+
+这两页回答的是「这段时间各分项用了多少」，天生是区间对比。多一个「实时」页签，
+用户点进去只会看到一段刚过去几分钟的曲线，与下面按日/按月/按年的档位互相矛盾
+（档位写着「按日」，横轴却只有 10 分钟）。
+
+隐藏不是靠 CSS，而是初始化时就把 `timeMode` 钉死成 `history`：
+
+```js
+scope.showTimeMode = settings.showTimeMode === true;
+scope.timeMode = (scope.showTimeMode && settings.timeMode === 'realtime') ? 'realtime' : 'history';
+```
+
+> **为什么不能只用 `*ngIf` 藏起来**：那样 `timeMode` 仍可能被
+> `settings.timeMode` 设成 `realtime`，界面上却没有开关能改回来 ——
+> 板面会永久停在实时窗口，而且从界面上找不到原因。
+> 开关和取值必须在同一处判断。
+
+实时模式本身没删，只是不再默认出现。现场调试要看「设备有没有在报数」时，
+把部件的 `showTimeMode`（【外观】→「显示实时/历史切换」）打开即可。
+
+> **`showTimeMode` 只在 `showTimeRange=true` 时可见。** 模板结构是
+> `<div class="eqab-right" *ngIf="showTimeRange">` 里再套
+> `<ul class="eqab-modes" *ngIf="showTimeMode">` —— 整块时间控件（实时/历史 +
+> 档位 + 日期）都在 `eqab-right` 里。
+> 「能耗概览」「综合能耗」两块看板配的是 `showTimeRange=false`，
+> 它们的分析条件只有品种与场站，本来就不显示实时/历史（不是这次改出来的）。
 
 配置差异**只有一处**：`analysis_bar.settings.siteChildType`
 （分项页 `分项`、区域页 `区域`）。其余部件的 `metricKey` / `agg` / 几何必须相同 ——
