@@ -703,7 +703,7 @@ bash scripts/10-cleanup-customer.sh --name '第一家合作企业' --yes
 | `widget_type` 部件 | 726 | 不动 |
 | `rule_chain` 规则链 | 2 | 不动 |
 | `device_profile` 设备档案 | 7 | 不动 |
-| `asset_profile` 资产档案 | 14 | 不动 |
+| `asset_profile` 资产档案 | 17 | 不动 |
 | 能源参数字典 / 费率模板 / 分时方案 | 租户级 | 不动 |
 
 实测销户前后对过数（2026-10-24）：
