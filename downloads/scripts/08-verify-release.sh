@@ -338,8 +338,8 @@ fi
 # ================================================================
 sec "D. 看板模板"
 TPL_N=$(DASH_DB "SELECT count(*) FROM dashboard WHERE customer_id IS NULL;" | tr -d ' ')
-eq "看板模板数" "${TPL_N:-0}" "23" \
-   '模板没导全：重跑 docker-01-install.sh，或确认 deploy 目录 data/json/tenant/dashboards 是 23 个文件'\
+eq "看板模板数" "${TPL_N:-0}" "24" \
+   '模板没导全：重跑 docker-01-install.sh，或确认 deploy 目录 data/json/tenant/dashboards 是 24 个文件'\
 
 TITLES=$(DASH_DB "SELECT title FROM dashboard WHERE customer_id IS NULL;" | tr -d '\r')
 has  "「峰谷时段」已改名" "$TITLES" '峰谷时段' \
@@ -427,8 +427,8 @@ for i in (d.get('items') or []):
     nm=i.get('name') or i.get('id')
     pages=[p.get('name') or p.get('id') for p in (i.get('pages') or [])]
     print(nm+':'+'/'.join(pages))" 2>/dev/null)
-  has "告警中心为一级链接（无子项）" "$CM_DETAIL" '告警中心:' \
-      '告警中心还挂着「告警列表/告警规则」子项：一键修复初始化'
+  has "告警事件为一级链接（无子项）" "$CM_DETAIL" '告警事件:' \
+      '告警事件还挂着「告警列表/告警规则」子项：一键修复初始化'
   # 自检必须是一级（原挂在设备运维下，2026-10-26 提升）
   has "平台自检为一级入口" "$CM_DETAIL" '平台自检:' \
       '客户菜单缺自检入口：一键修复初始化'
