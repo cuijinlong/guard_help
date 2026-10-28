@@ -53,7 +53,7 @@ bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
 
 ```bash
 ls ~/energy-app/guard-server-4.4.0.jar
-ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 23
+ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 24
 ```
 
 > **`.env` 是隐藏文件**，`ls` 看不到。看内容：`cat ~/energy-app/.env`。
