@@ -218,10 +218,22 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 
 ### 3.0.2 「查询设置」部件里的树长什么样
 
-带「查询设置」的看板（历史能耗 / 基础报表 / 参数报表 / 实时能耗 / 分项能耗…）
-左侧那棵树有两种维度，规则不同：
+> **2026-10-29 客户定稿：取消「查询维度」单选，一律按设备层级。**
+> 原来给的是「按设备层级 / 按分组维度」两个单选 + 一个分组根下拉。客户实际只用
+> 设备层级 —— 多出来的选项让每块看板多一行，还会被误点成按分项出数
+> （界面上看不出区别，数字口径却变了）。
+>
+> 现在维度在控制器里锁死 `scope.dimension = 'device'`，模板里不再给任何入口；
+> `showDimension` 这个设置项即使写成 `true` 也不起作用。
+> **按分组维度那条链路仍保留在代码与数据模型里**（`buildDimensions` 照旧解析
+> 「数据源绑定·维度N」），只是从本部件进不去 —— 将来要做独立的「按分项查询」
+> 部件时还能复用。
+>
+> 顺带：`onDimensionChange` 留了一行 `scope.dimension = 'device'; return;`，
+> 防止旧看板缓存里残留的点击把维度切走。
 
-**按设备层级** —— 场站是**根节点**，设备挂在它下面：
+带「查询设置」的看板（历史能耗 / 基础报表 / 参数报表 / 实时能耗 / 分项能耗…）
+左侧那棵树只有一种维度 —— **按设备层级**，场站是**根节点**，设备挂在它下面：
 
 ```
 单相场站                  ← 根：当前选中的场站（虚拟节点，不能勾选）
@@ -235,8 +247,8 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 把场站当根是为了让树先回答「这是哪个场站的表」—— 以前设备平铺，
 单相场站和三相场站的表混在一起，只能靠名字猜归属。
 
-**按分组维度** —— 根是维度容器（电能 / 用电分项 / 用能区域 / 用能性质 / 空间位置），
-**根下直接是分类节点，没有场站层**：
+**按分组维度的渲染规则（已不可达，留档备查）** —— 根是维度容器
+（电能 / 用电分项 / 用能区域 / 用能性质 / 空间位置），根下直接是分类节点、没有场站层：
 
 ```
 用电分项                  ← 根：维度名
@@ -247,14 +259,12 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 
 数据模型里每个维度下确实有一层「场站分组」（`asset.type='场站分组'`，label = 场站名），
 它是**内部隔离层**：同一客户多个场站时，各场的分类不能混在一起。
-界面只保留当前场站那一个分组，并把它的子节点提升到维度根下 ——
-客户看到的第一反应不能是「场站怎么跑到分项下面去了」：场站是**归属**，不是分项的子类目。
+渲染时只保留当前场站那一个分组，并把它的子节点提升到维度根下 ——
+场站是**归属**，不是分项的子类目。
 
 数据模型一行不动，只在渲染时穿透。所以「新建子分类 / 添加设备 / 拖拽落点」的真实
 挂载父仍是那个场站分组 —— 否则新节点会挂到维度容器下、脱离场站分区、聚合断掉。
-
-右上角切到哪个场站，按分组维度的树就只显示那个场站的分项/区域。
-如果切了场站树里还有别的场站的分类，那是缺陷。
+这段逻辑今天仍在 `buildDimensions` 里活着，只是查询设置不再提供入口。
 
 #### 勾选规则：父节点默认**不**连带子节点
 
@@ -412,6 +422,30 @@ localStorage.removeItem('tb.energy.timeRange.<dashboardId>.analysis');
 只压 wrapper 的 `height` 是压不住的 —— 内部 `infix` 仍是 34px，会溢出到框外，
 看起来就是"外框特别大、日历图标跑到框外面"。
 
+**下拉框同样是 TB 的控件，不是原生 `<select>`（2026-10-29 统一）**：
+
+查询设置的 6 个下拉（场站 / 能源品种 / 分组维度 / 指标参数 / 实时单位 / 间隔时间）
+全部用 `mat-select` + `mat-option`，事件写 `(selectionChange)="fn($event.value)"`，
+不是 `(change)="fn($event.target.value)"` —— 后者是原生 `<select>` 的写法，
+套在 `mat-select` 上**永远不触发**（下拉能点开、能选，但界面不变、也不查询）。
+
+Material 的 trigger 默认 48px 高、自身不带边框，外观全靠 `mat-form-field` 的
+outline 画框。直接放进这一列会和 30px 的日期框一高一低，所以整条压成同一套方框：
+
+| 目标 | 选择器 |
+| --- | --- |
+| 框体 30px / 1px `--eqp-border` / 3px 圆角 | `mat-select.eqp-select` 自身（`display:flex` + `height:30px`） |
+| trigger 压到 28px | `.eqp-select .mat-mdc-select-trigger` |
+| 文字 13px | `.eqp-select .mat-mdc-select-value-text` |
+| 箭头不撑高 | `.eqp-select .mat-mdc-select-arrow-wrapper` |
+
+面板（`.mat-mdc-select-panel`，选项 48px 高）走 Material 默认 —— 就是 TB 其它页面
+的下拉面板，不另写样式，否则又是"自创一套"。
+
+> **`mat-select` 的值不匹配时显示空白**，而原生 `<select>` 会回落到第一项。
+> 能源品种是异步加载的，加载完成前 `sourceId` 还是 null —— 必须给
+> `placeholder="加载中…"`，否则看板刚打开的那几秒是一个空框（实测冷启动可达数秒）。
+
 **中文化与格式在 `CustomDateAdapter` 里做，不改 `MAT_DATE_LOCALE`**：
 
 `MAT_DATE_LOCALE` 是全局单值 token，改成 `zh-CN` 会连带改变平台里所有 Material
@@ -456,6 +490,126 @@ cd ~/energy-app && docker compose --profile split restart energy-server
 约 13 分钟（Angular 生产构建）。只改部件 JSON 时不需要这一步。
 
 ---
+
+#### 查询设置的表单控件：一律 mat-form-field，32px
+
+2026-10-29 客户第三轮反馈：「input 框和 select 表单控件也不是 TB 的样式」。
+上一版是自己拿 `border` 画了个 30px 方框套在 `mat-select` 上 —— 看着像方框，
+但浮动标签、聚焦态、禁用态、hover 边框全是自绘的，和平台其它页面
+（设备管理、规则链配置）的输入框一眼能分出两套。
+
+现在 6 组控件（场站 / 能源品种 / 搜索 / 指标参数 / 实时单位 / 间隔时间）
+全部走 `<mat-form-field appearance="outline" subscriptSizing="dynamic">`，
+框、标签、箭头、聚焦色都由 TB 主题提供；本部件只压高度（32px，比平台标准
+40px 矮一点，因为这一列只有 300px 宽、要装 6 组）。
+
+**压高度必须同时改三个变量**，在元素上写 `height` 是没用的：
+
+```css
+.eqp-ff {
+  --mat-form-field-container-height: 32px;
+  --mat-form-field-container-vertical-padding: 8px;
+  --mat-mdc-form-field-label-transform:
+      translateY(calc(calc(6.7px + var(--mat-form-field-container-height) / 2) * -1)) scale(0.85);
+}
+```
+
+原因：`.mdc-text-field` 的高度就是 `height: var(--mat-form-field-container-height)`
+（TB 在根级设成 56px），元素上的 `height` 会被它覆盖；
+`.mat-mdc-form-field-infix` 的 `min-height` 和上下内边距也从同一个变量算出来。
+只改元素尺寸 = 改一半，框仍是 56px（实测过：写 `height:32px` 量出来 57px）。
+第三个变量是标签浮起后的位移，公式里含高度 —— 忘了改，标签会按 56px 的居中位算，
+直接压到文字上。
+
+**内部元素还必须 `::ng-deep`**：`mat-form-field` 是组件，
+`.mat-mdc-text-field-wrapper` / `.mat-mdc-form-field-infix` / `.mdc-floating-label`
+带的是组件自己的 `[_ngcontent-y]`，不带本模板的 `[_ngcontent-x]` ——
+`.eqp-ff .mat-mdc-text-field-wrapper { height: 32px }` 这种写法**一条都不命中**。
+日期框（`tb-datetime`）用的是同一招，两边因此天然一致。
+
+**按钮和分段控件也换成 TB 控件**：
+
+| 控件 | 原来 | 现在 |
+| --- | --- | --- |
+| 查询按钮 | 自绘 `<button class="eqp-btn">` | `mat-flat-button color="primary"`（32px） |
+| 实时 / 历史 | 两个 `<span>` 套 border | `mat-button-toggle-group`（28px） |
+| 按日 / 按月 / 按年 | 同上 | 同上 |
+
+分段控件的选中态要显式给主色：Material 默认是灰底，落在白面板里几乎看不出选了哪个。
+
+```css
+.eqp-seg ::ng-deep .mat-button-toggle-checked {
+  background: color-mix(in srgb, var(--eqp-primary) 12%, #fff);
+}
+.eqp-seg ::ng-deep .mat-button-toggle-checked .mat-button-toggle-label-content {
+  color: var(--eqp-primary); font-weight: 500;
+}
+```
+
+> `mat-button-toggle-group` 能用，是因为 `SharedModule` 导出了
+> `MatButtonToggleModule`，而动态部件模块是 `[SharedModule, WidgetComponentsModule, ...]`。
+> 换别的 Material 组件前先确认它在 `SharedModule` 的 exports 里。
+
+#### 树勾选框与设备名对齐（2026-10-29 修）
+
+症状：树里 **复选框比设备名低 8px**，一行 28px 像是歪的。两个页面（查询设置、
+一键抄表）都有。实测数据：背景框中心 `y=345`、名字中心 `y=337`，差 8px。
+
+根因是三件事叠在一起，缺一条都修不好：
+
+1. **`.mdc-checkbox` 的内部规则没穿透**。`.mat-mdc-checkbox` 是宿主、带本模板的
+   `[_ngcontent-x]`，普通选择器能中；但 `.mdc-checkbox` / `.mdc-checkbox__background` /
+   `.mat-mdc-checkbox-touch-target` 是组件内部 DOM，带自己的 `[_ngcontent-y]`。
+   于是宿主被压成 24px、内部还是 40px，方框画在 40px 容器的中心 —— 比 24px 的名字行低 8px。
+2. **`templateCss` 里的 `::ng-deep` 会被丢弃**。TB 会把 `templateCss` 的每条规则
+   前缀成 `.widget-type-system-energy_management_xxx ...`，`::ng-deep` 原样保留，
+   浏览器不认识这个伪元素，整条规则作废。所以一键抄表的勾选框压缩规则**必须**
+   写在 `templateHtml` 的 `<style>` 里 —— 那条路径由 Angular 动态编译改写，
+   `::ng-deep` 会降级成 `[_ngcontent-x]` 穿透。
+3. **`box-sizing` 必须是 `border-box`**。默认 `content-box` 时 `width/height: 24px`
+   只是内容区，加上 3px 上下内边距后实际 30px —— 比 28px 的行还高，方框又被挤下去。
+   `border-box` 后 24px 真含内边距，内容区 18px 正好是方框尺寸。
+
+修完还要补 1.5px：`.mdc-checkbox__background` 是 absolute，包含块是 padding box，
+`top: 0` 时方框中心仍比名字高 1.4px。三个部件统一用 `top: 1.5px; left: 3px;`。
+
+对齐自检（任一树看板，控制台）：
+
+```js
+const row = [...document.querySelectorAll('.eqp-node, .eqm-tree-row')]
+  .find(r => r.querySelector('mat-checkbox'));
+const bg = row.querySelector('.mdc-checkbox__background');
+const nm = row.querySelector('.eqp-node-name, .eqm-tree-node-name');
+const c = e => { const b = e.getBoundingClientRect(); return (b.top + b.bottom) / 2; };
+c(bg) - c(nm);   // 期望 |差值| ≤ 0.5
+```
+
+#### 树行距 28px（2026-10-29 客户要求 +2px）
+
+两个部件的行盒统一 28px：`line-height: 26px` + 上下 `padding: 1px`。
+改之前是 26px（`line-height: 24px`），客户要求「再调大 2 像素」。
+
+| 部件 | 选择器 | 当前值 |
+| --- | --- | --- |
+| 查询设置 | `.eqp-node` | `line-height: 26px; padding: 1px 6px` |
+| 一键抄表 | `.eqm-tree-row` | `line-height: 26px; padding: 1px 6px 1px 0` |
+
+> 两个部件必须一起改。「查询设置」和「一键抄表」的树是同一套视觉，
+> 只改一边立刻就能看出谁高谁低。
+
+#### 一键抄表的工具行与主按钮（2026-10-29）
+
+左侧面板 300px 宽，四个元素挤在一行会互相压：
+
+| 元素 | 位置 | 说明 |
+| --- | --- | --- |
+| 连叶子 | 最左 | **不能定死宽度**。原来 `.eqm-tree-actions .mat-mdc-checkbox { width: 24px }` 把它压成 24px，3 个字的 label 只剩几像素，直接折成两行。只有树行里的勾选框（没有文字 label）才该定宽度 |
+| 全选 / 清空 | 靠右 | 中间放 `<span class="flex-1">` 把它们推过去；挤在左边时连叶子没空间 |
+| 已选/总数 | 最右 | `margin-left: 6px` 与「清空」拉开 |
+
+主按钮 `.eqm-run-btn` 从 `flex: 1`（撑满整行）改成 `flex: 0 0 auto`：
+去掉右侧「抄选中的 N 台」提示后，撑满的按钮会独占 300px 面板宽度，看着像个页脚条。
+「勾了几台」已经由工具行右侧的 `已选/总数` 表达，不再重复。
 
 #### 三层计量树长什么样
 

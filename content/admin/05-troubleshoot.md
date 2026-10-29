@@ -226,6 +226,163 @@ curl -s --noproxy '*' -o /dev/null -w 'HTTP %{http_code}\n' \
 bash shiyongshouce/downloads/deploy/docker-98-rebuild.sh ... --yes
 ```
 
+### 现象 D2：新机器一键装完，**没有 demo 演示账号**（2026-10-29）
+
+**症状**：按手册跑完 `docker-98-rebuild.sh`，能登录 `customer@…`，但 `demo@126.com`
+不存在 —— 而日常演示、截图、排障一直用的是 demo 这个账号。
+
+**根因**：不是 `13-demo-account.sh` 写错了，是它**从来没被调用过**。
+
+`98-rebuild.sh` 的第 2 步只同步 `0[2-9]-*` 这一段脚本：
+
+```bash
+cp "$HERE/../scripts/"0[2-9]-* "$APP_HOME/scripts/"   # ← 13 不在范围里
+```
+
+`13-demo-account.sh` 编号是 13，既没被复制进部署目录，也没有任何步骤调它。
+`docker-00-prepare.sh` 那边其实用的是 `0[2-9]-*` **加** `[1-9][0-9]-*`（含 13），
+所以全新安装时文件是有的、只是没人跑；而 `--keep-data` 分支连文件都没有。
+
+**已修**（2026-10-29）：
+
+1. `98-rebuild.sh` 的同步范围补上 `1[0-9]-*`，`--keep-data` 分支也能拿到 13；
+2. 新增「步骤 5b/9　创建演示账号」，在真实客户建好后调
+   `13-demo-account.sh`，默认 `demo@126.com / demo123456`、客户名「平台演示中心」；
+3. 凭据文件 `DEPLOY-CREDENTIALS.txt` 多一行「演示账号」；
+4. 加开关 `--no-demo` 可跳过。
+
+**为什么演示账号用独立客户，不复用 `--customer`**：
+`--customer` 是客户的**真实数据**，而演示数据要能 `--reset` 随时重刷。
+混在一起，重置演示就会把真实客户的数据一起清掉。
+
+**演示账号创建失败不阻断重装**：它只是「方便演示」的附加项，
+真客户已经可用时不该因为演示数据没建起来就判定整次安装失败 ——
+脚本会打 `!` 警告并指向 `/tmp/rebuild-demo.log`。
+
+**手工补建**（老部署目录里已经有 13 的情况）：
+
+```bash
+cd ~/energy-app
+BASE=http://127.0.0.1:8090 bash scripts/13-demo-account.sh \
+  --tenant-email <**租户管理员**邮箱> --tenant-pass '<密码>'
+# 幂等：重复执行会复用「平台演示中心」并重置密码，不会建第二个客户
+```
+
+> **`--tenant-email` 必须是 TENANT_ADMIN，不能填系统管理员**。
+> 用 SYS_ADMIN（如 `langmen@…`）会报「系统管理员不能直接建客户（TB 会返回 403）」——
+> 建客户是租户级动作，系统管理员要先切到某个租户才有上下文。
+> 98 脚本传的是 `--tenant` 那个账号，正常配置下就是租户管理员。
+
+---
+
+### 现象 D3：客户账号登录，**所有看板里的部件都不显示**（2026-10-29 现场）
+
+**症状**：客户能登录、侧边栏有菜单、看板也能打开，但每块看板里要么空白、
+要么只有一句「加载部件配置时出现问题。关联的部件类型可能已被移除。」
+
+**这与现象 D 是同一类**，但触发路径不同 —— 现象 D 是**前缀写错**（`tenant.` / `system.`），
+这里是**前缀对了、部件却不在客户可见集合里**。
+
+TB 的渲染链路是：
+
+```
+看板配置里的 typeFullFqn  →  GET /api/widgetType?fqn=…  →  拿 descriptor  →  渲染
+```
+
+第二步只要不是 200，用户就看到「部件类型可能已被移除」。
+而菜单验收、看板可打开验收、接口有数验收**全都通过** ——
+「看板能打开」和「部件能渲染」中间隔着这一次 fqn 解析。
+
+**定位（一条命令，客户 token 视角）**：
+
+```bash
+cd ~/energy-app
+CTOK=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"customer@126.com","password":"12345678"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+CID=$(curl -s --noproxy '*' http://127.0.0.1:8090/api/auth/user \
+  -H "X-Authorization: Bearer $CTOK" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['customerId']['id'])")
+
+# ① 客户能看到多少个我方部件（正常应为 39 个左右；0 = 部件没装进库）
+curl -s --noproxy '*' "http://127.0.0.1:8090/api/widgetTypes?pageSize=1000&page=0" \
+  -H "X-Authorization: Bearer $CTOK" \
+  | python3 -c "
+import json,sys
+rows=(json.load(sys.stdin) or {}).get('data') or []
+print('energy_management 部件:', sum(1 for w in rows if str(w.get('fqn','')).startswith('energy_management.')))"
+
+# ② 单个 fqn 能不能被客户加载（200 = 能；404 = 库里没有；403 = 权限/归属错）
+curl -s --noproxy '*' -o /dev/null -w 'HTTP %{http_code}\n' \
+  -H "X-Authorization: Bearer $CTOK" \
+  'http://127.0.0.1:8090/api/widgetType?fqn=system.energy_management.query_panel'
+```
+
+**按结果分支**：
+
+| ① 的计数 | ② 的状态码 | 含义 | 修 |
+| --- | --- | --- | --- |
+| 0 | 404 | `widget_type` 表里根本没装我方部件 | 见下方 A |
+| 39 | 200 | 部件本身没问题，看板里写的是别的 fqn | 见下方 B |
+| 0 | 403 | 部件装在了某个租户下，没按系统租户存 | 见下方 C |
+
+**A. 部件没装进库**
+
+`widget_type` 由后端启动时的系统数据加载读
+`$APP_HOME/data/json/system/widget_types/*.json` 写入。
+先确认文件在、再确认加载没报错：
+
+```bash
+ls ~/energy-app/data/json/system/widget_types/energy_management_*.json | wc -l   # 期望 39
+docker compose logs energy-server 2>&1 | grep -i "loadSystemWidgets\|Unable to load widget type" | tail -20
+```
+
+文件不在 → 部署目录没组装全（重跑 `docker-00-prepare.sh` 或整个 98）。
+文件在但库里没有 → 那批 JSON 解析失败，日志里会有具体文件名。
+
+**B. 看板里写的是别的 fqn**
+
+把该客户每个看板里出现的 fqn 与「客户可见集合」对一遍（`08-verify-release.sh`
+的 F4 段已经内置这条断言，直接跑它最省事）：
+
+```bash
+cd ~/energy-app
+bash scripts/08-verify-release.sh \
+  --tenant <租户邮箱> --tenant-pass '<密码>' \
+  --customer <客户邮箱> --customer-pass '<密码>' 2>&1 | grep -E "部件类型|能加载"
+# 期望：客户看板引用的部件类型数（35）/ 客户能加载全部部件类型（缺 0 个）（0）
+```
+
+> **fqn 有两种写法**：看板里写 `system.energy_management.query_panel`（带归属前缀），
+> `/api/widgetTypes` 返回 `energy_management.query_panel`（存储形式）。
+> 比对前必须去掉 `system.` / `tenant.` —— 直接比会 100% 误报「全部缺失」
+> （实测本地 35 个引用全被判缺，就是这么来的）。
+
+**C. 部件装错租户**
+
+```bash
+docker compose exec -T postgres psql -U postgres -d thingsboard -tA -c "
+SELECT tenant_id, count(*) FROM widget_type
+WHERE fqn LIKE 'energy_management.%' GROUP BY tenant_id;"
+# 期望：13814000-1dd2-11b2-8080-808080808080 = 系统级，且只有这一行
+```
+
+出现别的租户 id → 那批部件是某次在租户上下文里保存的。
+把它们改回系统租户，并确认 `widgets_bundle_widget` 也有对应关联（否则「添加部件」
+列表里看不到）：
+
+```bash
+docker compose exec -T postgres psql -U postgres -d thingsboard -c "
+UPDATE widget_type SET tenant_id = '13814000-1dd2-11b2-8080-808080808080'
+WHERE fqn LIKE 'energy_management.%';"
+```
+
+**修完要硬刷新浏览器**（Ctrl/Cmd+Shift+R）：descriptor 是从后端现取的，
+但前端会缓存已解析过的部件定义。
+
+---
+
 ### 现象 E：客户登录后落在空白的门户页
 
 **根因**：`customer.additionalInfo.homeDashboardId` 没设。
@@ -4337,7 +4494,8 @@ for a, b in combinations(widgets, 2):
 
 ```
 基础报表    qp(0,0,6×16) + chart(6,0,18×8) + detail(6,8,18×8)
-抄表功能    qp(0,0,6×15) + board(6,0,18×8) + batch(6,8,18×7)
+抄表功能    board(0,0,24×15)          ← 2026-10-28 起不再挂 query_panel：
+                                      选表已在「一键抄表」页签内，台账页不该有查询设置
 我的账单    qp(0,0,6×16) + crosstab(6,0,18×16) + list(0,16,24×10) + analysis(0,26,24×10)
 ```
 
