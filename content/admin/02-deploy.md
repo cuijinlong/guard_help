@@ -583,6 +583,65 @@ DEMO_EMAIL=demo@your.com DEMO_PASS='Your@123456' DEMO_NAME='演示中心' \
 > 也没有任何步骤调用它。详见
 > [常见故障 · 现象 D2](05-troubleshoot.html#现象-d2新机器一键装完没有-demo-演示账号2026-10-29)。
 
+#### 只改了部件 JSON：一条命令，**2 秒，不重启**
+
+改了 `guard-server/src/main/data/json/system/widget_types/*.json`（部件模板、样式、
+控制器脚本）**不要**跑 98 重装 —— 那要 7 分钟，而这件事只需要 2 秒：
+
+```bash
+cd /你的路径/iot-rule-engine
+bash shiyongshouce/downloads/scripts/31-deploy-widget.sh energy_management_meter_reading_board
+# 然后浏览器硬刷新：Ctrl/Cmd + Shift + R
+```
+
+也可以一次推多个、或全部：
+
+```bash
+bash shiyongshouce/downloads/scripts/31-deploy-widget.sh meter_reading_board meter_plan
+bash shiyongshouce/downloads/scripts/31-deploy-widget.sh --all
+bash shiyongshouce/downloads/scripts/31-deploy-widget.sh --check meter_reading_board   # 只校验
+```
+
+**为什么不用重启**（这是最容易踩反的一条）：
+
+部件定义存在两处，读它们的**不是同一个时机**：
+
+| 位置 | 谁在读 | 生效时机 |
+| --- | --- | --- |
+| 数据库 `widget_type.descriptor` | 前端 `GET /api/widgetType?fqn=…` | **改完立即生效** |
+| `$APP_HOME/data/json/system/widget_types/*.json` | 后端启动时 `loadSystemWidgets()` | 每次启动**覆盖**数据库 |
+
+所以：
+
+- 只改库 → 前端马上用上新的，但**下次重启会被文件覆盖回去**（且不报错）；
+- 只改文件 → **必须重启**才生效（因为装载只在启动时发生）。
+
+脚本把两件事一起做完：推库（立刻生效）+ 同步文件（重启后还在）。
+
+> **实测**：`UPDATE` 后 2 秒内 `/api/widgetType` 就返回新内容，
+> 容器 `StartedAt` 完全没变 —— 确认没有重启。
+> 整套脚本跑完 **1.3–2.1 秒**（单个部件，含回读验证）。
+
+**脚本会同步哪些字段**：`descriptor` / `name` / `description` /
+`deprecated` / `tags`。
+
+> 顶层字段必须一起推。只推 `descriptor` 的话，你把 JSON 里的 `name` 改掉、
+> 库里还是旧的 —— 前端显示的是库里的 `name`，改动完全不生效。这一点实测踩过。
+
+**脚本做的检查**（任一不过就停，不留半套）：
+
+1. 容器在跑、源目录存在；
+2. JSON 语法（报**行号:列号**）、顶层是对象、有 `fqn`、有 `descriptor.templateHtml`；
+3. 内容里不含 `$w$`（会破坏 SQL 定界符）；
+4. 推完回读数据库，与文件逐字段比对；
+5. 部署目录副本与源文件 md5 一致（否则重启会被旧文件覆盖）。
+
+**不需要重启，但需要硬刷新**：浏览器会缓存已经解析过的部件定义。
+普通刷新（F5）可能仍显示旧界面，用 Ctrl/Cmd + Shift + R。
+
+**改 `ui-ngx/src/**` 不适用这个脚本** —— 那是编译进 jar 的前端产物，
+必须走 `npm run build:prod` + 替换 ui-ngx jar + 重打包（见下方「只改了前端」）。
+
 #### 改完后端，先跑自检（30 秒）
 
 `docker-97-preflight.sh` 检查「源码 / 部署 jar / 脚本 / 运行服务 / 手册」五处是否一致：

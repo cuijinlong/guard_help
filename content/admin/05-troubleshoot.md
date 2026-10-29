@@ -275,6 +275,76 @@ BASE=http://127.0.0.1:8090 bash scripts/13-demo-account.sh \
 
 ---
 
+### 现象 D0：改完部件 JSON，前端没变化（或者：为什么每次都要重启？）
+
+**先说结论：改部件 JSON 不需要重启后端，但必须同步两处。**
+
+部件定义有两份拷贝，**读它们的时机不同**：
+
+| 位置 | 谁在读 | 什么时候生效 |
+| --- | --- | --- |
+| 数据库 `widget_type.descriptor` | 前端 `GET /api/widgetType?fqn=…` | **改完立即生效** |
+| `$APP_HOME/data/json/system/widget_types/*.json` | 后端启动时 `loadSystemWidgets()` | 每次启动**覆盖**数据库 |
+
+于是有三种错法，症状各不相同：
+
+| 你做了什么 | 结果 |
+| --- | --- |
+| 只改库（不重启） | 前端**立刻**用上新的 —— 但下次重启被文件覆盖回去，静默退回旧版 |
+| 只改文件（不重启） | **完全看不到变化**，因为装载只在启动时发生 |
+| 只改库 + 重启 | 重启时文件覆盖了库 → **改动静默丢失**，白重启一次 |
+
+正确做法是一条命令做完两件事：
+
+```bash
+cd ~/iot-rule-engine
+bash shiyongshouce/downloads/scripts/31-deploy-widget.sh energy_management_meter_reading_board
+# 浏览器硬刷新：Ctrl/Cmd + Shift + R
+```
+
+**实测耗时对比**：
+
+| 方式 | 耗时 |
+| --- | --- |
+| `31-deploy-widget.sh`（推库 + 同步文件 + 回读验证） | **1.3–2.1 秒** |
+| `docker compose restart energy-server` | 约 2–3 分钟（等 healthy） |
+| `docker-98-rebuild.sh` | 约 7 分钟 |
+
+**"改了什么"对应的三种更新方式**，别搞混：
+
+| 改了哪里 | 怎么生效 | 要重启吗 |
+| --- | --- | --- |
+| `widget_types/*.json`（部件模板/样式/脚本） | `31-deploy-widget.sh` | **不用** |
+| `tenant/dashboards/*.json`（看板布局） | 推 `dashboard.configuration`（见下方 SQL） | **不用** |
+| `ui-ngx/src/**`（前端源码） | `npm run build:prod` → 重打 ui-ngx jar → 重打后端 jar | 要（换 jar） |
+| `guard-server/src/**/*.java`（后端代码） | `mvn package` → `cp` jar → 重启 | 要 |
+
+**看板布局的推法**（同样不用重启）：
+
+```bash
+cd ~/iot-rule-engine
+python3 - <<'EOF'
+import json, io
+d = json.load(io.open('guard-server/src/main/data/json/tenant/dashboards/meter_reading.json', encoding='utf-8'))
+io.open('/tmp/up.sql', 'w', encoding='utf-8').write(
+    "UPDATE dashboard SET configuration = $w$" + json.dumps(d['configuration'], ensure_ascii=False)
+    + "$w$::json WHERE title = '" + d['title'] + "';")
+EOF
+docker exec -i energy-postgres psql -U postgres -d thingsboard < /tmp/up.sql
+rm -f /tmp/up.sql
+```
+
+**为什么改了还看不到**（三个与更新方式无关的原因）：
+
+1. **浏览器缓存**：普通刷新不行，要 Ctrl/Cmd + Shift + R；
+2. **改的是客户看板副本**：客户看板里存的是 `typeFullFqn`，本身不含部件模板 ——
+   改部件会一起生效。但如果改的是**看板自己的 `configuration`**，那只影响
+   租户那份，客户那份要单独推（或用「一键修复初始化」重绑）；
+3. **后端真的需要重启**：只有当改的是 `InstallScripts` / `SystemDataLoaderService`
+   这类**装载逻辑**时才需要。改 JSON 内容不需要。
+
+---
+
 ### 现象 D3：客户账号登录，**所有看板里的部件都不显示**（2026-10-29 现场）
 
 **症状**：客户能登录、侧边栏有菜单、看板也能打开，但每块看板里要么空白、
