@@ -574,6 +574,88 @@ PYEOF
   if [[ -n "$F3_BAD" ]]; then
     echo "      ↳ 失效看板：$F3_BAD" >&2
   fi
+
+  # ---- F4：客户能否加载看板里的**每一个部件类型** ----
+  #
+  # ★ 为什么必须查（2026-10-29 现场反馈）：
+  #   新机器一键装完，客户登录后「所有仪表板里面的部件都不显示」。
+  #   TB 的渲染路径是：看板里写 typeFullFqn（如 system.energy_management.query_panel）
+  #   → 前端 GET /api/widgetType?fqn=… → 拿 descriptor 渲染。
+  #   这一步 404/403 时，用户看到的只有一句「关联的部件类型可能已被移除」，
+  #   而 F/F2/F3 全都通过（菜单在、看板能打开、接口有数）——
+  #   **看板能打开 ≠ 部件能渲染**，中间隔着这一次 fqn 解析。
+  #
+  # 判据：客户名下每个看板里出现的 fqn，都必须在「客户可见的部件集合」里。
+  #   一次列表查询拿全集 + 本地比对，比逐个 curl 快得多（736 个部件 1 次请求）。
+  WN_FQNS=$(CAPI '/api/widgetTypes?pageSize=1000&page=0' | python3 -c "
+import json,sys
+d=json.load(sys.stdin) or {}
+print(' '.join(sorted({str(w.get('fqn','')) for w in (d.get('data') or []) if w.get('fqn')})))" 2>/dev/null)
+  if [[ -z "$WN_FQNS" ]]; then
+    bad "客户可见部件列表为空" '查 /api/widgetTypes 失败：客户登录态或权限异常'
+  else
+    WN_DETAIL=$(python3 - "$BASE" "$CTOK" "$CDASH" "$WN_FQNS" <<'PYEOF'
+import json, sys, urllib.request
+
+base, tok, cdash_raw, known = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4].split()
+# ★ fqn 有两种写法，必须规范化后再比：
+#   看板里写 system.energy_management.query_panel（带归属前缀），
+#   /api/widgetTypes 返回 energy_management.query_panel（存储形式）。
+#   直接比会 100% 误报「全部缺失」—— 实测本地 35 个引用全被判缺。
+def norm(fqn):
+    for pre in ('system.', 'tenant.'):
+        if fqn.startswith(pre):
+            return fqn[len(pre):]
+    return fqn
+
+known = {norm(k) for k in known}
+
+def get(path):
+    req = urllib.request.Request(base + path, headers={'X-Authorization': 'Bearer ' + tok})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode('utf-8') or '{}')
+
+try:
+    dashes = (json.loads(cdash_raw) or {}).get('data') or []
+except Exception:
+    dashes = []
+
+used, missing, broken = {}, [], []
+for d in dashes:
+    title = d.get('title') or '?'
+    did = (d.get('id') or {}).get('id')
+    if not did:
+        continue
+    try:
+        full = get('/api/dashboard/' + did)
+    except Exception as e:
+        broken.append(f'{title}(读取失败)')
+        continue
+    ws = ((full.get('configuration') or {}).get('widgets') or {})
+    for w in (ws.values() if isinstance(ws, dict) else []):
+        fqn = w.get('typeFullFqn')
+        if not fqn:
+            continue
+        used.setdefault(fqn, title)
+        if norm(fqn) not in known and fqn not in [m.split('|')[0] for m in missing]:
+            missing.append(fqn + '|' + title)
+
+print(len(used))
+print(len(missing) + len(broken))
+print(' '.join(missing[:8]))
+print(' '.join(broken[:8]))
+print(' '.join(sorted(used)[:6]))
+PYEOF
+)
+    W_U=$(printf '%s' "$WN_DETAIL" | sed -n '1p')
+    W_BAD=$(printf '%s' "$WN_DETAIL" | sed -n '2p')
+    W_BADL=$(printf '%s' "$WN_DETAIL" | sed -n '3p')
+    W_BRKL=$(printf '%s' "$WN_DETAIL" | sed -n '4p')
+    ge "客户看板引用的部件类型数" "${W_U:-0}" 1 \
+       '客户名下看板没读到任何 typeFullFqn：看板 configuration 是空的'
+    eq "客户能加载全部部件类型（缺 ${W_BAD:-0} 个）" "${W_BAD:-1}" "0" \
+       "这些 fqn 不在客户可见的部件集合里，打开看板只会显示「关联的部件类型可能已被移除」。缺：${W_BADL} ${W_BRKL} —— 跑一键修复初始化，或确认 widget_type 已按系统租户装载（tenant_id=13814000-…）"
+  fi
 else
   ok "跳过客户侧检查（未提供客户账号或登录失败）"
 fi

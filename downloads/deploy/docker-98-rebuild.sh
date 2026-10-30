@@ -18,6 +18,7 @@
 #   --app-home DIR     部署目录，默认 ~/energy-app
 #   --rebuild-web      强制重建 AI 前端产物（默认源码没变就复用，省 1 分钟）
 #   --drop-images      连镜像一起删（最干净，但重建慢 10-20 分钟）
+#   --no-demo          不建演示账号（默认会建 demo@126.com / demo123456）
 #   --no-verify        跳过最后四步验收
 #   --keep-data        不卸载数据库，只换 jar 并重建租户（走 B 路）
 #   --yes              不交互确认
@@ -36,6 +37,7 @@ CUSTOMER=""    ; CUST_PASS=""     ; CUST_TITLE="演示客户"
 APP_HOME="$HOME/energy-app"
 DROP_IMAGES="false"
 NO_VERIFY="false"
+SKIP_DEMO="false"
 KEEP_DATA="false"
 ASSUME_YES="false"
 REBUILD_WEB_OPT=""
@@ -59,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --rebuild-web)    REBUILD_WEB_OPT="--rebuild-web"; shift ;;
     --drop-images)    DROP_IMAGES="true"; shift ;;
     --no-verify)      NO_VERIFY="true"; shift ;;
+    --no-demo)        SKIP_DEMO="true"; shift ;;
     --keep-data)      KEEP_DATA="true"; shift ;;
     --yes|-y)         ASSUME_YES="true"; shift ;;
     -h|--help)        sed -n '2,30p' "$0"; exit 0 ;;
@@ -166,8 +169,11 @@ if [[ "$KEEP_DATA" == "true" ]]; then
   # 早先这里只拷 02/03/04/06，05、07、08 都漏了，
   # 走 --keep-data 之后手册里让跑的 08-verify-release.sh 就不存在。
   mkdir -p "$APP_HOME/scripts"
-  cp "$HERE/../scripts/"0[2-9]-* "$APP_HOME/scripts/" 2>/dev/null || true
-  chmod +x "$APP_HOME/scripts/"0[2-9]-* 2>/dev/null || true
+  # ★ 范围必须覆盖 10-19：13-demo-account.sh（演示账号）就在这一段。
+  #   2026-10-29 现场反馈「一键装完没有 demo 账号」—— 根因就是这里只拷 0[2-9]，
+  #   13 既没被复制、也没被任何步骤调用，等于这个脚本在部署目录里根本不存在。
+  cp "$HERE/../scripts/"0[2-9]-* "$HERE/../scripts/"1[0-9]-* "$APP_HOME/scripts/" 2>/dev/null || true
+  chmod +x "$APP_HOME/scripts/"0[2-9]-* "$APP_HOME/scripts/"1[0-9]-* 2>/dev/null || true
   ok "jar 与模板已替换（.env 与数据库保留）"
 else
   PREP_ARGS=()
@@ -180,6 +186,20 @@ fi
 N=$(ls "$APP_HOME/data/json/tenant/dashboards" 2>/dev/null | wc -l | tr -d ' ')
 [[ "$N" -ge 20 ]] || die "部署目录的仪表板模板只有 ${N} 个，预期 ≥20 —— 换文件没生效"
 ok "仪表板模板 ${N} 个"
+
+# 部件模板也必须够数（2026-10-29 补）。
+#
+# ★ 为什么单独查这一项：后端装载部件的条件是
+#       if (Files.exists(widgetTypesDir)) { ... }
+#   —— **目录不存在就静默跳过**，不报错、不中断启动。
+#   于是「部署目录少拷了 widget_types」会装出一个
+#   「菜单在、看板能打开、每个部件都显示『关联的部件类型可能已被移除』」的系统，
+#   而此前这里只校验了 dashboards 的数量，正好漏掉最关键的这一半。
+M=$(ls "$APP_HOME/data/json/system/widget_types"/energy_management_*.json 2>/dev/null | wc -l | tr -d ' ')
+ALL_M=$(ls "$APP_HOME/data/json/system/widget_types"/*.json 2>/dev/null | wc -l | tr -d ' ')
+[[ "$ALL_M" -ge 500 ]] || die "部署目录的部件模板只有 ${ALL_M} 个（含我方 ${M} 个），预期 ≥500 —— 同步 widget_types 失败"
+[[ "$M" -ge 35 ]] || die "部署目录的我方部件只有 ${M} 个，预期 ≥35 —— 部件模板没同步到 $APP_HOME/data/json/system/widget_types"
+ok "部件模板 ${ALL_M} 个（我方 ${M} 个）"
 
 # ---------------------------------------------------------------- 3. 建库
 log "步骤 3/9　建库并导入部件（约 1–2 分钟）"
@@ -205,6 +225,43 @@ log "步骤 5/9　建租户与客户（演示数据在这一步生成）"
   || { tail -40 /tmp/rebuild-onboard.log; die "建租户失败，日志：/tmp/rebuild-onboard.log"; }
 ok "租户与客户已创建"
 sed -n 's/^  ✓ /     /p' /tmp/rebuild-onboard.log | head -20 || true
+
+# ---------------------------------------------------------------- 5b. 演示账号
+#
+# ★ 2026-10-29 现场反馈：一键装完没有 demo 演示账号。
+#   根因不是 13-demo-account.sh 写错了，而是它从来没被本脚本调用过
+#   （第 2 步只同步 0[2-9]-*，13 连部署目录都没进去）。
+#
+# 为什么单独建一个演示客户，而不是直接复用上面的 --customer：
+#   --customer 是**客户的真实数据**，演示数据要能随时 --reset 重刷；
+#   两者混在一起，重置演示就会把真实客户的数据一起清掉。
+#   演示账号固定 demo@126.com / demo123456（13 脚本的默认值），
+#   与真实客户账号并存、互不影响。
+#
+# 失败不阻断整条重装：演示账号是"方便演示"的附加项，
+# 真客户已经可用时不该因为演示数据没建起来就判定安装失败。
+DEMO_EMAIL="${DEMO_EMAIL:-demo@126.com}"
+DEMO_PASS="${DEMO_PASS:-demo123456}"
+DEMO_NAME="${DEMO_NAME:-平台演示中心}"
+if [[ "$SKIP_DEMO" == "true" ]]; then
+  warn "已跳过演示账号（--no-demo）"
+elif [[ -f "$APP_HOME/scripts/13-demo-account.sh" ]]; then
+  log "步骤 5b/9　创建演示账号（$DEMO_EMAIL）"
+  if ( cd "$APP_HOME" && BASE=http://127.0.0.1:8090 \
+        bash scripts/13-demo-account.sh \
+          --tenant-email "$TENANT" --tenant-pass "$TENANT_PASS" \
+          --email "$DEMO_EMAIL" --password "$DEMO_PASS" --name "$DEMO_NAME" ) \
+      >/tmp/rebuild-demo.log 2>&1; then
+    ok "演示账号已就绪：$DEMO_EMAIL / $DEMO_PASS（客户「$DEMO_NAME」）"
+    sed -n 's/^  ✓ /     /p' /tmp/rebuild-demo.log | head -10 || true
+  else
+    warn "演示账号创建失败（不影响真实客户使用），日志：/tmp/rebuild-demo.log"
+    tail -15 /tmp/rebuild-demo.log | sed 's/^/     /' || true
+  fi
+else
+  warn "部署目录里没有 scripts/13-demo-account.sh —— 跳过演示账号"
+  warn "修复：把仓库 shiyongshouce/downloads/scripts/13-*.sh 拷到 $APP_HOME/scripts/"
+fi
 
 # ---------------------------------------------------------------- 6. 结构验收
 FAILED=0
@@ -289,6 +346,7 @@ CRED="$APP_HOME/DEPLOY-CREDENTIALS.txt"
   echo "系统管理员     $ADMIN / $ADMIN_PASS"
   echo "租户管理员     $TENANT / $TENANT_PASS"
   echo "客户用户       $CUSTOMER / $CUST_PASS"
+  [[ "$SKIP_DEMO" == "true" ]] || echo "演示账号       $DEMO_EMAIL / $DEMO_PASS（客户「$DEMO_NAME」）"
   echo "租户名称       $TENANT_TITLE"
   echo "客户名称       $CUST_TITLE"
   echo

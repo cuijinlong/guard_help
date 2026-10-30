@@ -345,6 +345,138 @@ rm -f /tmp/up.sql
 
 ---
 
+### 现象 D2b：页面上的英文改不成中文 / 改完没生效（2026-10-29）
+
+**症状**：「网关」专题页（企业管理 → 或者直接访问 `/entities/gateways`）里
+标题是 `Gateway list`、表头是 `Created time` / `Gateway name`、
+右侧按钮是 `General configuration` / `Remote Shell`。
+
+**先分清英文属于哪一层** —— 三层的改法完全不同，改错了就「改了没反应」：
+
+| 层 | 例子 | 改哪里 | 重启 |
+| --- | --- | --- | --- |
+| 翻译键 | `{{ 'gateway.xxx' \| translate }}` | `POST /api/translation/custom/zh_CN` | 不用 |
+| 看板硬编码 | widget 标题、表头、面包屑 | `resource` 表 `data` | 不用 |
+| 部件模板 | 终端里的 `echo('...')` | `31-deploy-widget.sh` | 不用 |
+
+**① 翻译键 —— 必须走 API，不能直接写库**
+
+```bash
+TOKEN=$(curl -s -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+curl -s -X POST http://127.0.0.1:8090/api/translation/custom/zh_CN \
+  -H "X-Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"gateway":{"statistics":{"memory":"内存"},"status-widget":{"status":"状态"}}}'
+```
+
+- 生产环境前端从 `/api/translation/full/zh_CN` 拉翻译，这个接口会把
+  资源里的 en_US + zh_CN + 自定义翻译叠在一起，所以补键**不用重打 jar**。
+- **直接 `INSERT INTO custom_translation` 不生效** —— 服务端有内存缓存，
+  必须走 API 才会发缓存失效事件。这一步踩过，记住。
+
+**② 看板里的硬编码文案 —— 改 `resource` 表**
+
+```bash
+# 导出
+docker exec -t energy-postgres psql -U postgres -d thingsboard -tAc \
+  "SELECT encode(data,'base64') FROM resource WHERE resource_key='gateways_dashboard.json'" \
+  | base64 -d > /tmp/d.json
+# 改 /tmp/d.json 里的显示字段（见下面的「只翻显示字段」），再写回
+docker exec -i energy-postgres psql -U postgres -d thingsboard <<SQL
+UPDATE resource SET data = decode('$(base64 -i /tmp/d.json | tr -d '\n')','base64')
+WHERE resource_key='gateways_dashboard.json';
+SQL
+```
+
+- 生效是**立即的**：`/api/resource/dashboard/system/...` 每次实时读库。
+- **库里的版本和仓库 `data/resources/` 下的源文件可能不是同一份**
+  （实测库里 48 个 widget、源文件 49 个）。改库让界面立刻变，
+  **同时改源文件**，否则下次一键安装会被覆盖回英文。
+
+**③ 只翻显示字段，别碰技术字段**
+
+| 可以翻 | 绝对不能翻 |
+| --- | --- |
+| `settings.entitiesTitle` / `title` / `entityNameColumnTitle` | `dataKeys[].name`（遥测 / 属性技术键） |
+| `dataKeys[].label` | `entityType`、`aggregationType`、`filter.type` |
+| `states.*.name`（面包屑） | `GPIO 1`、`RemoteLoggingLevel` 这类属性名 |
+| `headerButton[].name` | `targetDashboardStateId` 等引用 |
+
+把 `dataKeys[].name` 翻成中文是最容易犯的错：表头看起来变中文了，
+但数据全部变空 —— 因为那是去设备上取数的键，不是给人看的字。
+
+**网关页为什么内置了英文**：`gateway-management-extension.js` 里自带一份英文
+`gateway` 字典，前端逻辑是「当前语言的翻译里有 `gateway` 就用它，没有就用内置英文」。
+所以补 zh_CN 翻译就能盖住，不需要改那个 JS。
+
+---
+
+### 现象 D2c：网关专题页中文改完，重启后全变回英文（2026-10-29）
+
+**症状**：把 `/entities/gateways` 的英文改成中文，浏览器硬刷新验证通过。
+**重启一次 energy-server，又变回 `Gateway list` / `Created time` / `Remote Shell`。**
+
+**根因（两层，都要修）**：
+
+**① 有个 git 同步在每次启动覆盖 `resource` 表**
+
+```bash
+# 日志里只有一行不起眼的记录
+docker logs energy-server | grep "Updating system resource"
+# Updating system resource gateways_dashboard.json
+```
+
+`transport.gateway.dashboard.sync.enabled` 默认 **true**，
+启动时从 `github.com/thingsboard/gateway-management-extensions-dist.git`
+拉官方看板，直接 `createOrUpdateSystemResource` 写库。
+
+**修法**：`~/energy-app/docker-compose.yml` 的 `energy-server` 环境变量加
+
+```yaml
+TB_GATEWAY_DASHBOARD_SYNC_ENABLED: "false"
+```
+
+已同步过的部件/脚本/图片留在库里，关掉不会丢。以后要跟进官方新版，
+临时改回 `true` 启动一次，再重跑中文补丁。
+
+**② `POST /api/translation/custom/zh_CN` 是整体替换**
+
+补第二个词的时候，第一次补的会**全部消失**。必须「先读 → 合并 → 再写」：
+
+```python
+cur = GET('/api/translation/custom/zh_CN')      # 现有
+merge(cur, {"gateway": {"logs": "日志"}})        # 合并
+POST('/api/translation/custom/zh_CN', cur)      # 整体写回
+```
+
+**③ 翻 `dataKeys[].label` 之前先看它有没有被当数据键**
+
+网关详情顶部卡片里写死了 `data[0].Name` / `data[0].Status`，
+而 `data[0]` 的字段名取的是 dataKey 的 **label**。
+把 label 翻成中文后 `data[0].Name` 变 `undefined` ——
+界面上「网关名称」显示成字符串 `null`，「状态」「版本」整块消失，**不报错**。
+
+判据：label 在**同一个 widget** 里被 `data[n].<label>` 引用 → 保留英文。
+这类 label 不显示给用户（显示的是翻译键），保留英文没有副作用。
+
+**一键处理**（幂等，自带备份与自检）：
+
+```bash
+cd ~/energy-app
+python3 scripts/33-zh-gateway-dashboard.py --check     # 看会改哪些、跳过哪些
+python3 scripts/33-zh-gateway-dashboard.py            # 打补丁
+python3 scripts/33-zh-gateway-dashboard.py --restore  # 回到英文原版
+```
+
+**验证**：客户账号登录 → 设备管理 → 网关管理，列表页表头应是
+`创建时间 / 网关名称 / 状态 / 启用连接器 / 版本`，点进去详情页右侧是
+`通用配置 / 连接器配置 / 日志 / 统计 / 远程终端 / RPC 调用`。
+
+---
+
 ### 现象 D3：客户账号登录，**所有看板里的部件都不显示**（2026-10-29 现场）
 
 **症状**：客户能登录、侧边栏有菜单、看板也能打开，但每块看板里要么空白、
