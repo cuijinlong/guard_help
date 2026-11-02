@@ -73,6 +73,26 @@ bash scripts/10-cleanup-customer.sh --name '某某公司' --yes
 
 ---
 
+## 数据从哪来：模拟 / 真实，可任选可并存
+
+平台有两种数据源，**写的是不同设备，互不覆盖**，场站总量是两者之和：
+
+| | 谁控制 | 怎么开 | 怎么关 |
+| --- | --- | --- | --- |
+| **真实 RTU** | 硬件自己 | 上电、连 WiFi 就开始报 | 断电 / 断网 |
+| **模拟上报** | 脚本 | `--sim-only` 常驻 | `Ctrl-C` |
+
+```bash
+bash scripts/29-rtu-demo-up.sh --status      # 谁在报、谁停了（最常用）
+bash scripts/29-rtu-demo-up.sh --sim-only    # 只开模拟（纯演示）
+bash scripts/29-rtu-demo-up.sh --no-sim      # 只靠真实表（纯现场）
+bash scripts/29-rtu-demo-up.sh               # 两者并存
+```
+
+详见 [⑦ 设备接入](/admin/device-access#-两路数据可以并存也可以只开一路)。
+
+---
+
 ## 平台长什么样
 
 ```

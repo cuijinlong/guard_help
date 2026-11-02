@@ -478,6 +478,73 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
     return ran, len(blocks), errors
 
 
+def check_freshness(repo: Path, days: int = 7) -> list[str]:
+    """
+    代码更新了、手册没跟上 → 列出提示（不阻断）。
+
+    <p>为什么需要（2026-11-02 客户要求）：客户原话「随着不断的开发也要不断的
+    提醒更新手册」。check-docs 只能发现「数字不一致」，发现不了
+    「新增了一个功能但手册完全没提」—— 后者才是手册最容易烂的地方。
+
+    <p>判据：取三个代码目录里**最新**的改动时间，与手册 content/ 里
+    **最新**的改动时间比。若代码新出 `days` 天以上，说明这一轮开发
+    没有同步手册，提示去核对。
+
+    <p>为什么是「提示」不是「失败」：很多改动（重构、性能优化、
+    内部日志）确实不需要改手册。硬卡会让这条检查被绕过或加 `--skip`，
+    反而失效。提示 + 明确列出「哪些页可能要改」更有效。
+    """
+    watch = [
+        repo / 'guard-server' / 'src' / 'main' / 'java',
+        repo / 'guard-server' / 'src' / 'main' / 'data' / 'json',
+        repo / 'nenghaobao' / 'widgets',
+        repo / 'shiyongshouce' / 'downloads' / 'scripts',
+    ]
+    doc_dir = repo / 'shiyongshouce' / 'content'
+
+    def newest(p: Path, only_md: bool = False) -> float:
+        if not p.exists():
+            return 0.0
+        best = 0.0
+        for f in p.rglob('*'):
+            if not f.is_file():
+                continue
+            if only_md and f.suffix != '.md':
+                continue
+            if any(seg in f.parts for seg in ('node_modules', 'target', '.git',
+                                              '__pycache__', 'backup')):
+                continue
+            try:
+                best = max(best, f.stat().st_mtime)
+            except OSError:
+                pass
+        return best
+
+    code_t = max((newest(w) for w in watch), default=0.0)
+    # ★ 只算 .md（2026-11-02）：content/ 下还有 manifest.json（导航配置）。
+    #   把它算进来等于「改了导航就算手册更新」，而正文可能一个字没动 ——
+    #   那正是这个检查要抓的情况。
+    doc_t = newest(doc_dir, only_md=True)
+    if code_t == 0.0 or doc_t == 0.0:
+        return []
+    gap = (code_t - doc_t) / 86400.0
+    if gap < days:
+        return []
+
+    import datetime as _dt
+    code_s = _dt.datetime.fromtimestamp(code_t).strftime('%Y-%m-%d')
+    doc_s = _dt.datetime.fromtimestamp(doc_t).strftime('%Y-%m-%d')
+    return [
+        f'代码最后改动 {code_s}，手册最后改动 {doc_s}（差 {gap:.0f} 天）',
+        '这一轮改动对应的手册页更新了吗？对照 AGENTS.md 的 E33 触发清单：',
+        '  · 改脚本/参数 → admin/00-index.md + 对应功能页',
+        '  · 改数据模型/字典 → admin/04-data-model.md + admin/08-ops-sql.md',
+        '  · 改部署链路 → admin/01-install.md + admin/02-deploy.md',
+        '  · 改看板/部件口径 → 对应功能页 + user/03-pages.md',
+        '  · 修了客户能感知的 bug → admin/09-troubleshoot.md',
+    ]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description='手册与代码一致性检查')
     ap.add_argument('-v', '--verbose', action='store_true', help='打印每项的来源与匹配文本')
@@ -647,6 +714,18 @@ def main() -> int:
         return 1
 
     print(f'\n✓ 全部一致（{len(CHECKS)} 项）')
+
+    # ---------------- 手册新鲜度（提示，不阻断） ----------------
+    hints = check_freshness(REPO)
+    if hints:
+        print()
+        print('⚠ 手册可能没跟上代码：')
+        for h in hints:
+            print('  ' + h)
+        print('  （只是提示，不影响退出码；确认无需改动可忽略）')
+    else:
+        print('✓ 手册新鲜度正常（代码与手册改动时间接近）')
+
     return 0
 
 
