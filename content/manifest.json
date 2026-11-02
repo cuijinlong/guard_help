@@ -1,7 +1,7 @@
 {
   "title": "能源管理平台 · 使用手册",
   "version": "v2.0",
-  "updated": "2026-10-23",
+  "updated": "2026-11-02",
   "sections": [
     {
       "id": "user",
@@ -54,64 +54,54 @@
           "file": "admin/00-index.md"
         },
         {
-          "id": "docker",
-          "title": "① Docker",
-          "file": "admin/01-docker.md"
+          "id": "install",
+          "title": "① 安装环境（Docker）",
+          "file": "admin/01-install.md"
         },
         {
           "id": "deploy",
-          "title": "② 平台部署",
+          "title": "② 包干到底部署",
           "file": "admin/02-deploy.md"
         },
         {
-          "id": "cassandra",
-          "title": "②b Cassandra（可选存储）",
-          "file": "admin/02b-cassandra.md"
+          "id": "onboard",
+          "title": "③ 开户与销户",
+          "file": "admin/03-onboard.md"
         },
         {
-          "id": "init",
-          "title": "③ 数据初始化",
-          "file": "admin/03-init.md"
+          "id": "data-model",
+          "title": "④ 数据模型（表/字典/属性）",
+          "file": "admin/04-data-model.md"
+        },
+        {
+          "id": "data-flow",
+          "title": "⑤ 数据流（采集→汇总→看板）",
+          "file": "admin/05-data-flow.md"
+        },
+        {
+          "id": "rules",
+          "title": "⑥ 规则（告警/派生指标）",
+          "file": "admin/06-rules.md"
         },
         {
           "id": "device-access",
-          "title": "④ 设备接入",
-          "file": "admin/04-device-access.md"
+          "title": "⑦ 设备接入（RTU/演示）",
+          "file": "admin/07-device-access.md"
         },
         {
-          "id": "rtu-demo-env",
-          "title": "④b RTU 演示环境（双网关/全品种/电能质量）",
-          "file": "admin/10-rtu-demo-env.md"
-        },
-        {
-          "id": "data-verify-sql",
-          "title": "④c 数据验证 SQL（排查数据对不对）",
-          "file": "admin/11-data-verify-sql.md"
+          "id": "ops-sql",
+          "title": "⑧ 运维 SQL（查库/表/备份）",
+          "file": "admin/08-ops-sql.md"
         },
         {
           "id": "troubleshoot",
-          "title": "⑤ 常见问题",
-          "file": "admin/05-troubleshoot.md"
-        },
-        {
-          "id": "customer-menu",
-          "title": "⑥ 客户菜单功能（架构+统计SQL）",
-          "file": "admin/06-customer-menu.md"
-        },
-        {
-          "id": "data-pipeline",
-          "title": "⑦ 数据流处理（计量/倍率/增量/映射）",
-          "file": "admin/07-data-pipeline.md"
-        },
-        {
-          "id": "customer-lifecycle",
-          "title": "⑧ 客户生命周期（开户/演示数据/销户）",
-          "file": "admin/08-customer-lifecycle.md"
+          "title": "⑨ 排障",
+          "file": "admin/09-troubleshoot.md"
         },
         {
           "id": "dev-build",
-          "title": "⑨ 开发与构建（改代码→生效）",
-          "file": "admin/09-dev-build.md"
+          "title": "⑩ 开发与构建",
+          "file": "admin/10-dev-build.md"
         }
       ],
       "description": "给平台方的：怎么部署、开租户、导入数据、排障"

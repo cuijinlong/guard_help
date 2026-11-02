@@ -1,4 +1,4 @@
-# ① Docker：安装、运维、卸载
+# ① 安装环境（Docker）
 
 > 这一页只管 Docker 本身。平台的部署在[② 平台部署](/admin/deploy)。
 >
@@ -7,7 +7,7 @@
 
 ---
 
-## 一、安装
+## 一、装 Docker
 
 ### 先检查有没有装
 
@@ -72,7 +72,7 @@ docker run --rm hello-world | head -3
 
 ---
 
-## 二、一次性调优（装完就做）
+## 二、调优（装完就做）
 
 ### 1. 配镜像加速 + 日志轮转
 
@@ -131,7 +131,7 @@ sudo rm -rf /var/lib/docker
 
 ---
 
-## 三、日常运维
+## 三、Docker 日常运维
 
 ### 看磁盘占用
 
@@ -256,87 +256,71 @@ docker compose exec postgres psql -U postgres -d thingsboard
 
 ---
 
-## 四、卸载 Docker
-
-> 这一节会把**整台机器上所有 Docker 项目**的镜像和卷都删掉。
-> 只想卸载本平台，看[② 平台部署](/admin/deploy)的「卸载平台」一节。
-
-### 第一步：确认没有别的项目在跑
-
-```bash
-docker ps -a
-docker volume ls
-```
-
-有别的项目的卷，先备份或迁走。
-
-### 第二步：停止本项目并删掉数据
-
-```bash
-cd ~/energy-app
-bash docker-99-uninstall.sh --purge --yes
-```
-
-### 第三步：卸载 Docker 引擎
-
-**Ubuntu / Debian**：
-
-```bash
-sudo apt-get purge -y docker-ce docker-ce-cli containerd.io \
-  docker-buildx-plugin docker-compose-plugin
-sudo apt-get autoremove -y
-```
-
-**CentOS / Rocky / RHEL**：
-
-```bash
-sudo dnf remove -y docker-ce docker-ce-cli containerd.io \
-  docker-buildx-plugin docker-compose-plugin
-```
-
-### 第四步：删除数据目录
-
-```bash
-sudo rm -rf /var/lib/docker
-sudo rm -rf /var/lib/containerd
-```
-
-如果改过 `data-root`，还要删那个目录：
-
-```bash
-sudo rm -rf /data/docker
-```
-
-### 第五步：删配置与用户组
-
-```bash
-sudo rm -rf /etc/docker
-sudo groupdel docker 2>/dev/null || true
-```
-
-### 第六步：验证
-
-```bash
-docker --version                  # 应提示 command not found
-ls /var/lib/docker                # 应提示 No such file or directory
-docker ps 2>&1 | head -2          # 应提示无法连接
-```
-
-三条都符合，才算卸干净。
-
 ---
 
-## 五、常见问题
+## 四、可选：遥测换成 Cassandra
 
-| 现象 | 原因 | 解决 |
-| --- | --- | --- |
-| `permission denied ... docker.sock` | 用户不在 docker 组 | `sudo usermod -aG docker $USER && newgrp docker` |
-| `Cannot connect to the Docker daemon` | 没启动 | `sudo systemctl start docker` |
-| 拉镜像 `EOF` / 超时 | 网络 | 配镜像加速（第二节） |
-| 磁盘满，`df` 显示 100% | 构建缓存 + 日志 | 第三节的清理三连 |
-| 日志文件几十 GB | 没配 log-opts | 第二节 daemon.json |
-| `port is already allocated` | 端口被占 | `lsof -nP -iTCP:端口 -sTCP:LISTEN` 找出占用者 |
-| 改 daemon.json 后 Docker 起不来 | JSON 语法错 | `sudo dockerd --validate` 看错误 |
-| 容器时区不对 | 容器默认 UTC | 本平台镜像已固定 Asia/Shanghai，无需额外配 |
+**默认不换。** 平台默认 `DATABASE_TS_TYPE=sql`，遥测与实体同库（`ts_kv` 分区表）。
+这个默认值在**单机、几十台表、几千万点**的规模下完全够用，而且备份/恢复简单。
 
-> 平台层面的故障（登录失败、报表空白、上报不通）见[常见问题](/admin/troubleshoot)。
+### 什么时候才该换
+
+| 规模 | 建议 |
+| --- | --- |
+| ≤ 100 台表，1 年内 | **保持 SQL** |
+| 100~500 台表，多点位 | SQL 仍可以，注意 `ts_kv` 分区与磁盘 |
+| > 500 台表 / 上亿点 / 要水平扩展 | 考虑 Cassandra |
+
+判据：`ts_kv` 单表超过 200GB，或遥测写入成为瓶颈。
+
+### 切换的两个坑
+
+**① 只改 `.env` 再重启 = 数据全丢**
+
+```
+遥测是按后端类型分库存的：
+  SQL          → postgres 的 ts_kv
+  Cassandra    → cassandra 的 thingsboard keyspace
+改 DATABASE_TS_TYPE 只是换了读取端，旧数据留在原库不动 ——
+页面表现为「设备有、数据全空」，看起来像坏了。
+```
+
+**切换前必须**：备份 `ts_kv`，切完之后重新灌数据（或写迁移脚本）。
+
+**② Cassandra 内存要求高**
+
+默认 JVM 堆 4GB 起步。**8GB 内存的机器开 Cassandra 会把平台挤到 swap**，
+表现为「Cassandra 无限重启 + 平台 502」。
+
+判据：`docker stats` 看 cassandra 容器 RSS 是否接近物理内存上限。
+8GB 机器建议直接放弃 Cassandra。
+
+### 验证真的在工作
+
+```bash
+# ① 后端确实是 cassandra 模式
+docker compose exec -T energy-server env | grep DATABASE_TS_TYPE
+# 期望：DATABASE_TS_TYPE=cassandra
+
+# ② Cassandra 里有数据
+docker compose exec -T cassandra nodetool tablestats thingsboard.ts_kv | head -20
+
+# ③ 平台能读出来（不是只看写）
+curl -s -H "X-Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8090/api/plugins/telemetry/DEVICE/<设备id>/values/timeseries?keys=energy&limit=5"
+```
+
+**三者都对才算切换成功。** ① 对但 ③ 空 → 数据没迁过来。
+
+### 集群运维速查
+
+| 要做什么 | 命令 |
+| --- | --- |
+| 看节点状态 | `nodetool status` |
+| 看表大小 | `nodetool tablestats thingsboard.ts_kv` |
+| 修复一致性 | `nodetool repair thingsboard` |
+| 清理已删数据 | `nodetool cleanup thingsboard` |
+| 快照备份 | `nodetool snapshot -t <tag> thingsboard` |
+
+> 平台的数据卷在 `~/energy-app`。**Cassandra 恢复比 SQL 麻烦得多**，
+> 这也是默认不用它的原因之一。

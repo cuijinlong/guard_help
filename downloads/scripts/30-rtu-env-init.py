@@ -167,11 +167,15 @@ def _pq_points():
         mp('THDib', 'current_thd_b', 'B相电流畸变率', '%'),
         mp('THDic', 'current_thd_c', 'C相电流畸变率', '%'),
         # 电能质量：闪变
-        mp('Pinst', 'flicker_pinst', '瞬时闪变视感度', ''),
+        # ★ 没有 flicker_pinst（2026-11-02 删）：Pinst 是 IEC 61000-4-15 的内部
+        #   中间量 S(t)，主流电表（PM8000 / PAC4200 / M4M / APView500）只输出
+        #   Pst 与 Plt。挂 Pinst 等于让客户去找一个不存在的寄存器。
         mp('Pst', 'flicker_pst', '短时闪变 Pst', ''),
         mp('Plt', 'flicker_plt', '长时闪变 Plt', ''),
+        # 中性线电流：三相四线表（N 线有 CT 时）能采
+        mp('In', 'current_n', '中性线电流', 'A'),
     ]
-    # 分次谐波 3/5/7/9/11/13 次（国标最关心的几次，全量 2~25 次在字典里）
+    # 分次谐波：3/5/7/9/11/13 次（国标最关心的几次，全量 2~31 次在字典里）
     for h in (3, 5, 7, 9, 11, 13):
         pts.append(mp('H%du' % h, 'voltage_harmonic_%d' % h, '%d次电压谐波含有率' % h, '%'))
     for h in (3, 5, 7, 9, 11, 13):
@@ -182,7 +186,7 @@ def _pq_points():
 # ============ 模拟设备清单 ============
 SIM_DEVICES = [
     {
-        'name': 'PowerMeter-3P-SIM', 'meterLevel': 1, 'site': 'three', 'gw': 'three',
+        'name': 'PowerMeter-3P-SIM', 'label': '三相电表', 'meterLevel': 1, 'site': 'three', 'gw': 'three',
         'profile': '电能表', 'model': 'DTSD341', 'brand': '威胜',
         'type1': 'elec', 'type2': 'normal', 'l1': 'elec_meter',
         'wiring': '3P4W',
@@ -190,7 +194,7 @@ SIM_DEVICES = [
         'points': _pq_points(),
     },
     {
-        'name': 'PowerMeter-1P-SIM', 'meterLevel': 2,
+        'name': 'PowerMeter-1P-SIM', 'label': '单相电表', 'meterLevel': 2,
         'site': 'single', 'gw': 'single',
         'profile': '单相电能表', 'model': 'DDSU666', 'brand': '正泰',
         'type1': 'elec', 'type2': 'normal', 'l1': 'elec_meter',
@@ -209,7 +213,7 @@ SIM_DEVICES = [
                    mp('THDi', 'current_thd_a', 'A相电流畸变率', '%')],
     },
     {
-        'name': 'WaterMeter-SIM', 'meterLevel': 2, 'site': 'single', 'gw': 'single',
+        'name': 'WaterMeter-SIM', 'label': '水表', 'meterLevel': 2, 'site': 'single', 'gw': 'single',
         'profile': '水表', 'model': 'LXSY-20', 'brand': '宁波水表',
         'type1': 'water', 'type2': 'normal', 'l1': 'water_meter',
         'wiring': '',
@@ -219,7 +223,7 @@ SIM_DEVICES = [
                    mp('T', 'temperature', '水温', '℃')],
     },
     {
-        'name': 'GasMeter-SIM', 'meterLevel': 2, 'site': 'single', 'gw': 'single',
+        'name': 'GasMeter-SIM', 'label': '燃气表', 'meterLevel': 2, 'site': 'single', 'gw': 'single',
         'profile': '燃气表', 'model': 'G2.5', 'brand': '秦川',
         'type1': 'gas', 'type2': 'normal', 'l1': 'gas_meter',
         'wiring': '',
@@ -229,7 +233,7 @@ SIM_DEVICES = [
                    mp('P', 'gas_pressure', '燃气压力', 'kPa')],
     },
     {
-        'name': 'SteamMeter-SIM', 'meterLevel': 2, 'site': 'three', 'gw': 'three',
+        'name': 'SteamMeter-SIM', 'label': '蒸汽表', 'meterLevel': 2, 'site': 'three', 'gw': 'three',
         'profile': '蒸汽表', 'model': 'LUGB', 'brand': '横河',
         'type1': 'steam', 'type2': 'normal', 'l1': 'steam_meter',
         'wiring': '',
@@ -240,7 +244,7 @@ SIM_DEVICES = [
                    mp('P', 'steam_pressure', '蒸汽压力', 'MPa')],
     },
     {
-        'name': 'HeatMeter-SIM', 'meterLevel': 2, 'site': 'three', 'gw': 'three',
+        'name': 'HeatMeter-SIM', 'label': '热力表', 'meterLevel': 2, 'site': 'three', 'gw': 'three',
         'profile': '热力表', 'model': 'CRL-G', 'brand': '天罡',
         'type1': 'heat', 'type2': 'normal', 'l1': 'heat_meter',
         'wiring': '',
@@ -252,7 +256,7 @@ SIM_DEVICES = [
                    mp('Tr', 'return_temp', '回水温度', '℃')],
     },
     {
-        'name': 'AHU-SIM', 'meterLevel': 0, 'site': 'three', 'gw': 'three',
+        'name': 'AHU-SIM', 'label': '新风机组', 'meterLevel': 0, 'site': 'three', 'gw': 'three',
         'profile': '新风机组', 'model': 'ZK-30', 'brand': '盾安',
         'type1': 'env', 'type2': 'fresh_air_unit', 'l1': 'env_device',
         'wiring': '',
@@ -264,7 +268,7 @@ SIM_DEVICES = [
                    mp('Freq', 'frequency', '风机频率', 'Hz')],
     },
     {
-        'name': 'Breaker-SIM', 'meterLevel': 2, 'site': 'three', 'gw': 'three',
+        'name': 'Breaker-SIM', 'label': '智能空开', 'meterLevel': 2, 'site': 'three', 'gw': 'three',
         # ★ 档案不能写 'default'（2026-11-02 实测）：default 档案没有 energyTypeCode，
         #   汇总直接 continue 跳过 → 动力分项永远是空的，且不报错。
         'profile': '智能空开', 'model': 'TGB3-63', 'brand': '天正',
@@ -632,7 +636,7 @@ def ensure_gateway(api, name, site, customer_id, log):
           'simulated': not name.startswith('ED1-')}
     if dev is None:
         api.post('/api/device', {
-            'name': name, 'label': name, 'type': '网关',
+            'name': name, 'label': '数据网关', 'type': '网关',
             'customerId': {'entityType': 'CUSTOMER', 'id': customer_id},
             'additionalInfo': ai,
         })
@@ -644,7 +648,7 @@ def ensure_gateway(api, name, site, customer_id, log):
     else:
         log('  · 网关「%s」已存在' % name)
         # 更新已有设备不能带 customerId（owner 只能用专门的 owner 接口改）
-        upd = {'id': dev['id'], 'name': name, 'label': name, 'type': '网关',
+        upd = {'id': dev['id'], 'name': name, 'label': '数据网关', 'type': '网关',
                'additionalInfo': ai}
         if dev.get('customerId'):
             upd['customerId'] = dev['customerId']
@@ -670,7 +674,7 @@ def ensure_device(api, spec, site, customer_id, gw_id, log):
 
     if dev is None:
         api.post('/api/device', {
-            'name': name, 'label': name, 'type': spec['profile'],
+            'name': name, 'label': spec.get('label') or name, 'type': spec['profile'],
             'customerId': {'entityType': 'CUSTOMER', 'id': customer_id},
             'additionalInfo': ai,
         })
@@ -681,7 +685,8 @@ def ensure_device(api, spec, site, customer_id, gw_id, log):
         log('  + 设备「%s」已建' % name)
     else:
         log('  · 设备「%s」已存在' % name)
-        upd = {'id': dev['id'], 'name': name, 'label': name, 'type': spec['profile'],
+        upd = {'id': dev['id'], 'name': name,
+               'label': spec.get('label') or name, 'type': spec['profile'],
                'additionalInfo': ai}
         if dev.get('customerId'):
             upd['customerId'] = dev['customerId']
@@ -1075,6 +1080,14 @@ def main():
         real_targets = []
     else:
         real_targets = ['PowerMeter-DDSU666', 'Sensor-HZ8706', 'Relay-8CH']
+    # ★ 真实设备也要有**人话 label**（2026-11-02 客户要求）：
+    #   设备技术名（PowerMeter-DDSU666 / Relay-8CH）只用于唯一性与匹配，
+    #   界面上一律显示 label。空 label 会退回 name，客户看到的就是技术名。
+    REAL_LABELS = {
+        'PowerMeter-DDSU666': '正泰单相电表 DDSU666',
+        'Sensor-HZ8706': '温湿度传感器',
+        'Relay-8CH': '8路继电器',
+    }
     for nm in real_targets:
         d = next((x for x in api.paged('/api/tenant/devices') if x.get('name') == nm), None)
         if d is None:
@@ -1092,7 +1105,8 @@ def main():
         cur_owner = (d.get('customerId') or {}).get('id')
         if cur_owner != customer_id:
             assign_owner(api, 'DEVICE', d['id']['id'], customer_id, log)
-        upd = {'id': d['id'], 'name': nm, 'label': d.get('label') or nm,
+        upd = {'id': d['id'], 'name': nm,
+               'label': REAL_LABELS.get(nm) or d.get('label') or nm,
                'type': d.get('type'), 'additionalInfo': ai}
         upd['customerId'] = {'entityType': 'CUSTOMER', 'id': customer_id}
         api.post('/api/device', upd)

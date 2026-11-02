@@ -95,8 +95,15 @@ def count_rules(_repo) -> int:
 
 
 def count_energy_kinds(_repo) -> int:
+    """用能品种数：读 dictionaries.energyKinds。
+
+    <p>★ 不要读顶层 `kinds`（2026-11-02 修）：那是旧结构，
+    含 cooling/air 共 8 项，而实际写进字典的是 `dictionaries.energyKinds` 5 项
+    （电/水/燃气/蒸汽/热力）—— 环境（env）不在品种字典里，它是设备一级类型。
+    读旧结构会让手册写「8 个品种」，而客户在「品种指标」页只看到 5 个。
+    """
     doc = json.loads(_read(RES_ENERGY / 'energy_library.json'))
-    return len(doc.get('kinds', []))
+    return len((doc.get('dictionaries') or {}).get('energyKinds') or [])
 
 
 def _elec_params():
@@ -113,8 +120,15 @@ def count_elec_params(_repo) -> int:
 
 
 def count_elec_keys(_repo) -> int:
-    """电能二级 key 总数"""
-    return sum(len(p.get('children', [])) for p in _elec_params())
+    """标准 key 总数：读 dictionaries.standardKeys。
+
+    <p>★ 不要读顶层 kinds[].params[].children（2026-11-02 修）：
+    那是旧结构，合计 48 项，而且只有电能。实际下发给 RTU 的是
+    `dictionaries.standardKeys`（137 项，含五个品种 + 电能质量 77 项）。
+    读旧结构时手册写 48，客户在「品种指标」里却看到 137 —— 对不上。
+    """
+    doc = json.loads(_read(RES_ENERGY / 'energy_library.json'))
+    return len((doc.get('dictionaries') or {}).get('standardKeys') or [])
 
 
 def count_tou_schemes(_repo) -> int:
@@ -228,60 +242,47 @@ class Check:
 
 CHECKS = [
     Check('asset_profiles', '资产档案', count_asset_profiles, [
-        ('03-init.md', r'\| 资产档案 \| 建租户时自动 \| (\d+) 个'),
-        ('03-init.md', r'- 资产档案（(\d+) 个）'),
-        ('02-deploy.md', r'\| 资产档案 \| (\d+) 个 \|'),
-        ('02-deploy.md', r'资产档案 (\d+) 个 / 设备档案'),
+        ('04-data-model.md', r'\| 资产档案 \| (\d+) 个业务档案'),
     ]),
     Check('device_profiles', '设备档案', count_device_profiles, [
-        ('03-init.md', r'\| 设备档案 \| 建租户时自动 \| (\d+) 个'),
-        ('03-init.md', r'## 四、设备档案（(\d+) 个）'),
-        ('02-deploy.md', r'\| 设备档案 \| (\d+) 个 \|'),
-        ('02-deploy.md', r'/ 设备档案 (\d+) 个'),
+        ('04-data-model.md', r'\| 设备档案 \| (\d+) 个业务档案'),
     ]),
     Check('rules', '告警 + 派生指标', count_rules, [
-        ('03-init.md', r'\| 告警规则 \+ 派生指标 \| 建租户时自动 \| (\d+) 条'),
-        ('03-init.md', r'- 设备档案上的告警规则 \+ 派生指标（(\d+) 条）'),
-        ('02-deploy.md', r'\| 告警 / 派生指标 \| (\d+) 条 \|'),
+        ('04-data-model.md', r'\| 告警 \+ 派生指标 \| (\d+) 条'),
     ]),
     Check('kinds', '能源品种', count_energy_kinds, [
-        ('03-init.md', r'\| 能源参数字典 \| 建租户时自动 \| (\d+) 品种'),
+        ('04-data-model.md', r'\| 能源参数字典 \| (\d+) 品种'),
     ]),
-    Check('elec_params', '电能一级指标', count_elec_params, [
-        ('03-init.md', r'\| 电能 \| `elec` \| kWh \| (\d+) 项一级指标'),
-    ]),
-    Check('elec_keys', '电能二级 key', count_elec_keys, [
-        ('03-init.md', r'\d+ 项一级指标（(\d+) 个二级 key）'),
+    Check('elec_keys', '标准 key 总数', count_elec_keys, [
+        ('04-data-model.md', r'/ (\d+) 个标准 key'),
+        ('02-deploy.md', r'标准 key \*\*(\d+)\*\* 个'),
     ]),
     Check('tou', '分时时段方案', count_tou_schemes, [
-        ('03-init.md', r'\| 分时时段方案 \| 建租户时自动 \| (\d+) 套'),
-        ('03-init.md', r'## 五、分时时段方案（(\d+) 套）'),
+        ('04-data-model.md', r'\| 分时时段方案 \| (\d+) 套 \|'),
     ]),
     Check('rate_templates', '费率模板', count_rate_templates, [
-        ('03-init.md', r'\| 费率模板（示例价） \| 建租户时自动 \| (\d+) 个'),
+        ('04-data-model.md', r'\| 费率模板（示例价） \| (\d+) 个 \|'),
     ]),
     Check('org_tabs', '组织页签', count_org_tabs, [
-        ('03-init.md', r'选中组织 → (\d+) 个页签'),
+        # 组织页签数量已不在运维手册里单列（属于客户使用手册范畴）
     ]),
     Check('verify_items', '发布验收项数', count_verify_items, [
-        ('03-init.md', r'\*\*期望\*\*：`通过 (\d+) 项`'),
-        ('00-index.md', r'期望 `通过 (\d+) 项`'),
+        # 验收项数由 06-verify-e2e.sh 自己打印，手册不再复述
     ]),
     Check('dashboards', '看板模板', count_dashboards, [
         ('02-deploy.md', r'wc -l\s+# 必须是 (\d+)'),
     ]),
     Check('tenant_menu', '租户菜单', count_tenant_menu, [
-        ('03-init.md', r'\| 租户菜单 \| 建租户时自动 \| (\d+) 个顶层项'),
-        ('02-deploy.md', r'\| 租户菜单 \| (\d+) 个顶层项 \|'),
+        ('04-data-model.md', r'\| 租户菜单 \| (\d+) 个顶层项 \|'),
     ]),
     Check('customer_menu', '客户菜单', count_customer_menu, [
-        ('03-init.md', r'\| 客户菜单 \| 建客户时自动 \| (\d+) 个顶层项'),
-        ('02-deploy.md', r'\| 客户菜单 \| (\d+) 个顶层项 \|'),
+        # 客户菜单项数已在客户使用手册维护
     ]),
     Check('deploy_widgets', '部署物料部件文件数', count_deploy_widgets, [
-        ('10-rtu-demo-env.md', r'交付的部件文件 \| (\d+) 个'),
+        ('02-deploy.md', r'交付的部件文件 \| (\d+) 个 \|'),
     ]),
 ]
+
 
 
 
@@ -336,13 +337,13 @@ def check_troubleshoot_numbering() -> list[str]:
     """故障手册的「现象 X」编号必须唯一。
 
     为什么需要（2026-10-25 实测踩过）：
-      往 05-troubleshoot.md 里新增「现象 P / Q」时，没注意文末**已经**有
+      往 09-troubleshoot.md 里新增「现象 P / Q」时，没注意文末**已经**有
       一组 P / Q（安装类故障），于是同一篇里出现两组同号章节。
       后果是交叉引用失真：正文写「见现象 Q」，读者不知道指哪一个。
       这种错误 check-docs 原来完全查不到（它只核对数量），所以补上。
     """
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        'content', 'admin', '05-troubleshoot.md')
+                        'content', 'admin', '09-troubleshoot.md')
     if not os.path.exists(path):
         return []
     seen: dict[str, int] = {}
@@ -394,9 +395,10 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
     #   给出一个错误的核对方法 —— 比没有更糟。让它们进自动化校验，
     #   表名/列名一改就会被抓出来，而不是等用户复制执行时才发现。
     sql_docs = [
-        ('05-troubleshoot.md', '## 14. 运维常用 SQL'),
-        ('06-customer-menu.md', None),
-        ('07-data-pipeline.md', None),
+        ('08-ops-sql.md', '## 1. 字典：六类主数据齐不齐'),
+        # 合并说明（2026-11-02）：原 06-customer-menu.md / 07-data-pipeline.md /
+        # 11-data-verify-sql.md 的 SQL 已全部并入 08-ops-sql.md，
+        # 分散在多页会让同一张表出现多种查法、且改表名时要改四处。
         # 客户手册「看懂分析页」也给了对照 SQL —— 客户/运营会直接复制执行，
         # 写错一条就等于教错核对方法，所以一并跑通。
         ('../user/03-pages.md', None),
@@ -490,6 +492,10 @@ def main() -> int:
         except Exception as e:                      # 提取失败也算失败，但要能看出原因
             rows.append((c.label, '提取失败', str(e)[:28], 'ERR'))
             failed += 1
+            continue
+
+        # targets 为空的检查 = 手册已不再复述这个数字，跳过
+        if not c.targets:
             continue
 
         declared_values = []

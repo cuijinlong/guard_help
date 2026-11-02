@@ -1,0 +1,371 @@
+# ⑨ 排障
+
+页面不对、数据不出、装不上。**按症状找，不按编号找。**
+
+> 每一节都是「症状 → 判据 → 修」。
+> 数据为空先看 [⑤ 数据流](/admin/data-flow) 的八步断点表，
+> 查库用 [⑧ 运维 SQL](/admin/ops-sql)。
+
+---
+
+## 一、登录与账号
+
+| 症状 | 判据 | 修 |
+| --- | --- | --- |
+| 提示「用户名或密码错误」（401） | 账号存在但密码没设好 | 见下文「账号建了但登不进」 |
+| 账号建好了，激活链接打不开 / 跳到 `:80` | 建用户时没关邮件激活 | 用 `09-onboard-customer.sh` 重建（它跳过邮件） |
+| 能登录，页面白屏 / 一直转圈 | 前端资源与后端版本不匹配 | 强刷 `Cmd+Shift+R`；仍不行看下面的「白屏」 |
+| 客户登录落在空白门户页 | 租户菜单没绑到客户 | `GET /api/customer/{id}` 看 `customMenuId` 是否为空 |
+| 客户点按钮弹「您没有权限执行此操作」 | 客户角色权限不足 | 用租户管理员调该接口，确认是权限问题而非 bug |
+
+### 账号建了但登不进
+
+TB 新建用户默认**没有密码、`enabled=false`**，直接登录会返回
+`User account is not active`。必须走两步：
+
+```
+GET  /api/user/{id}/activationLink            → 拿激活 token
+POST /api/noauth/activate?activateToken=...   → 真正设密码并置 active
+```
+
+手工建账号时漏任一步就永远登不进去。开户脚本已内置这两步，
+三个参数坑见 [③ 开户与销户](/admin/onboard#14-三个必须知道的坑)。
+
+### 页面白屏
+
+| 判据 | 原因 | 修 |
+| --- | --- | --- |
+| 控制台看到 chunk 404 | `index.html` 引用了不存在的 chunk | 重新构建并**重打 jar**（见 [⑩](/admin/dev-build)） |
+| CSS 被当成 `application/json` | 两个构建抢同一输出目录 | 检查有没有残留的 `ng build` 进程 |
+| 控制台无报错，纯白 | 前端版本与后端接口不匹配 | 确认 jar 里的前端产物是最新的 |
+
+**判据**：`curl -I http://ip/` 看 `Content-Type`。
+`text/html` 才对；`application/json` 说明静态资源被 API 路由截了。
+
+---
+
+## 二、菜单与权限
+
+| 症状 | 判断 | 修 |
+| --- | --- | --- |
+| 客户登录后左侧是 TB 原生菜单 | `customer.custom_menu_id` 为空 | `09-onboard-customer.sh` 会绑；手工绑见下 |
+| 租户菜单只剩几项，原生菜单像被删了 | `custom_menu.config` 被覆盖 | 从备份恢复 `custom_menu` 表 |
+| 点某菜单被「弹回」能耗概览 | 菜单指向的看板 id 不存在 | 查菜单 `config` 里的 dashboardId |
+| 菜单里还是旧名字（如「设备运维」） | 菜单配置未更新 | 改 `custom_menu.config` JSON，秒级生效 |
+| 客户能读写别的客户的场站结构 | 接口只校验租户，没校验 customer | 后端问题，不是配置 |
+
+### 客户菜单怎么绑
+
+```bash
+# ① 找到该客户的菜单（租户级模板）
+GET /api/customMenu            # 找到 name 匹配的那个
+
+# ② 绑到客户
+POST /api/customer
+{"id": {...}, "title": "客户名", "customMenuId": {"entityType":"CUSTOM_MENU","id":"<菜单id>"}}
+```
+
+**菜单是复制不是引用**：每个客户一份 `custom_menu` 记录，
+改模板不影响已开户的客户。这也是销户要删菜单的原因。
+
+---
+
+## 三、部件与看板
+
+| 症状 | 判据 | 修 |
+| --- | --- | --- |
+| 「加载部件配置时出现问题。关联的部件类型可能已被移除」 | `widget_type` 里没有该 fqn | 重新发布部件（见 [⑩](/admin/dev-build)） |
+| 部件全空 + 控制台刷 `00000000-…` 的 404 | 看板配的数据源别名指向不存在的实体 | 清空该部件的 `datasources`，走账号可见范围 |
+| 客户看板持续刷同一个 id 的 403/404 | 看板引用了**租户级**实体 id | 用租户级副本重建，或清 datasources |
+| 部件显示「部件无数据可显示」但脚本会自己取数 | 部件仍按「有数据源」模式跑 | 设 `datasources: []` 并确认部件支持自取数 |
+| 客户看板与租户模板不一致 | 开户时复制的是旧版模板 | 重新复制看板（`09` 幂等，会跳过已有的） |
+| 表格没边框 / 表头像普通文字 | 部件 CSS 被 TB 全局样式覆盖 | 样式写 `templateCss` 用普通选择器，别用 `::ng-deep` |
+
+### 改完部件 JSON 前端没变化
+
+| 层次 | 判据 | 修 |
+| --- | --- | --- |
+| 浏览器缓存 | 硬刷新后变了 | `Cmd+Shift+R` |
+| 部件版本 | 库里有两条同名 fqn，看板取 version 大的 | 更新**系统级**那条（`tenant_id` 为 NULL） |
+| 部署物料 | 干净库装的是旧部件 | 跑 `scripts/32-check-deploy-sync.sh` |
+| jar | 容器挂的是 jar，不是工作目录 | 重新 `mvn package` + 重启容器 |
+
+**判据**：`GET /api/widgetType?widgetTypeId=<id>` 看返回的
+`controllerScript` 里有没有你刚加的代码。有 → 前端缓存；没有 → 没发布成功。
+
+### 看板布局问题
+
+| 症状 | 原因 |
+| --- | --- |
+| 改了大屏部件尺寸，页面还是原宽度 | 尺寸在 `states.<state>.layouts.<layout>.widgets` 里，不在 `widgets` 里 |
+| 右侧下方有空缺（部件少一块高度） | `sizeY` 之和没铺满，gridster 会留白 |
+| 部件互相挤压 / 按钮点不到 | 部件内绝对定位 + TB 操作区（右上角 56×56）冲突 |
+| 看板高度超出屏幕 | 桌面端 `rowHeight` 不生效，高度只能靠 `sizeY` 调 |
+
+**布局的两处结构必须对齐**：
+
+```
+configuration.widgets.<id>                             存部件配置
+configuration.states.<state>.layouts.<layout>.widgets  存尺寸与位置
+```
+
+只改一处 → 尺寸不生效或部件消失。
+
+---
+
+## 四、设备有数，看板是 0
+
+这是最常见的一类。**先分清是哪一层空的**：
+
+| 现象 | 空在哪 | 去查 |
+| --- | --- | --- |
+| 设备详情「最新遥测」也空 | ① 采集 | [⑦ 设备接入](/admin/device-access) |
+| 设备有数，资产 `*_total` 空 | ⑤ 汇总 | [⑧ §5](/admin/ops-sql#5-资产汇总看板为什么是空的) |
+| 资产有数，页面还是 0 | ⑥ 部件取数 | 本节下文 |
+| 资产有数，但数值太小/太大 | ⑦ 倍率或口径 | [⑤ 数据流](/admin/data-flow) |
+
+### 资产汇总是空的
+
+```bash
+# 手工触发一次（最常见的原因就是没等定时任务）
+curl -X POST -H "X-Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:8090/api/energy/asset-totals/rebuild' \
+  -H 'Content-Type: application/json' -d '{"days":2}'
+```
+
+**触发后仍为空**，按这四条查：
+
+| 判据 | 原因 |
+| --- | --- |
+| 设备 `meterLevel` 是 0 或空 | 被当成非计量，不进汇总 |
+| 档案没有 `energyTypeCode` | `profileEnergyCode` 返回 null → 直接跳过 |
+| 设备没挂到场站（缺 `SiteContains`） | 归不到任何节点 |
+| 「不参与厂站能耗计算」被勾选 | 显式排除 |
+
+第一条 SQL 见 [⑧ §5.2](/admin/ops-sql#52-哪些设备参与了汇总)。
+
+### 部件一直「加载中…」
+
+| 判据 | 原因 |
+| --- | --- |
+| Network 里有请求 pending | 后端在跑重查询（汇总/大窗口） |
+| 请求 200 但返回空数组 | 部件选错了取数实体（如选了品种资产） |
+| 请求 400 `Number of intervals is to high` | 桶数超上限，应压 interval（数据层已修） |
+| 完全没有请求 | 部件脚本报错，看 Console |
+
+### 顶栏显示「数据源（10 台）」，下面全是 0
+
+这是**取了设备池但当计量点用**的典型症状：数据源解析到 10 台设备，
+但其中只有 8 台是计量器具（2 台是网关/传感器），且资产汇总没写。
+
+判据：`/api/energy/meters` 返回的 `role` 字段是不是 `meter`。
+
+---
+
+## 五、场站与设备树
+
+| 症状 | 判据 | 修 |
+| --- | --- | --- |
+| 切换场站后树不更新 | 部件只在 `onInit` 读了一次场站 | 部件必须订阅 `stateChanged()` 并跟 cookie |
+| 顶栏没有场站选择器 | 看板 `settings.showStationSelect` 不为 `true` | 改看板 JSON |
+| 树里混着别的场站的表 | 判据用了 `additionalInfo.siteId` 而不是关系 | 补 `SiteContains`（[⑧ §6.1](/admin/ops-sql#61-场站--区域--分项归属)） |
+| 树「场站跑到分项下面」 | 维度树的 `siteChildType` 配错 | 改分析条件部件的 `siteChildType` |
+| 切到没建分组的场站，树还是上一个 | 部件没清空旧状态 | 部件 bug |
+| 设备分组「添加设备」列出别的场站 | 过滤条件缺场站 | 部件 bug |
+| **场站过滤后为空，却显示了全部表** | 有「退回全量避免空树」的保护 | **删掉这个保护**：空树是诚实的，混合树是误导 |
+| 树里出现 `当前场站` / `全部场站` | 占位词没换成真实场站名 | 名字取不到就显示 id 前 8 位，让客户来问 |
+
+### 场站选择的唯一真相源
+
+**右上角场站选择器是全局唯一真相源**，树必须持续跟随：
+
+```
+tb-station-select 写 StationContextService
+  → DashboardPageComponent#applyStationToState
+    → state 的 siteCtx
+      → 部件订阅 stateChanged()
+```
+
+**跨看板可靠通道是 cookie**：生产构建拿不到 Angular 注入器
+（`window.ng` 只有 `ɵcompilerFacade`），cookie 是唯一稳定的跨边界载体。
+
+### 场站 Id 要校验有效性
+
+| 判据 | 含义 |
+| --- | --- |
+| 在 `/api/energy/visible-sites` 里，但没表 | 真没挂表 → 提示「去设备档案挂表」 |
+| **不在清单里** | Id 不成立 → 静默丢弃或换成有效场站 |
+
+客户浏览器里可能残留已删除场站的 id。三处都要校验：启动后、场站巡检、
+建树前最后一道。漏任一条，失效 id 就会漏到界面上。
+
+---
+
+## 六、部件开发
+
+| 报错 / 症状 | 原因 | 修 |
+| --- | --- | --- |
+| `Widget Error: Cannot read properties of undefined` | 脚本顶层读了 `self.ctx`（此时还没注入） | 上下文一律在 `onInit` 里绑 |
+| `Unexpected identifier 'xxx'`（xxx 是普通词） | 注释里写了裸反引号，提前结束模板字符串 | 见下 |
+| 页面卡死 / 变更检测无限循环 | 模板调用了返回新数组的函数 | 改用 `scope.xxx` 缓存 |
+| `mat-tab` 页签不显示 | `mat-tab` 上用了 `*ngIf` | 用 `[hidden]` 或改结构 |
+| `[(ngModel)]="obj?.a"` 整块不渲染 | Angular JIT 直接失败 | 换成 `[ngModel]` + `(ngModelChange)` |
+| dev 模式报 NG0100 | `mat-select` 用了 `placeholder` | 改 `mat-label` |
+| 部件自绘控件与其他看板两套样式 | 没复用 TB 组件 | 用 `tb-datetime` / `mat-select` 等原生组件 |
+| N 个 worker 轮询队列只处理前 N 条 | 并发写法错误 | 用显式分批 |
+
+### 反引号这个坑踩过三次
+
+部件源码的两种形态都是**反引号模板字符串**：
+
+```js
+const controllerScript = `...`;       // ① src/*.js 片段拼进去
+export const DATA_LAYER = `...`;      // ② 共享数据层自身
+```
+
+在注释里写 `` `type1` ``、`` `elec` ``，那个反引号会**提前结束字符串**，
+后面的中文注释被当代码 → 报 `Unexpected identifier 'type1'`。
+
+**规矩**：
+
+1. 模板字符串内的注释一律不用反引号，要强调用「」或裸写标识符
+2. 报错是普通单词 → **先找最近的注释里的反引号**，别查那个单词的拼写
+3. 错误行号是模板**结束**的位置，不是真正出问题的位置
+
+定位脚本：
+
+```python
+s = open('nenghaobao/widgets/lib/energy-data.mjs').read()
+i = s.index('export const DATA_LAYER = `') + len('export const DATA_LAYER = `')
+j = i
+while j < len(s) and not (s[j] == '`' and s[j-1] != '\\'):
+    j += 1
+print('模板长度', j-i, '结束于第', s[:j].count(chr(10))+1, '行')
+```
+
+结束行远早于预期 → 有裸反引号。
+
+---
+
+## 七、安装与升级
+
+| 症状 | 判据 | 修 |
+| --- | --- | --- |
+| 全新库安装到「建库」就失败 | 见下 | — |
+| 重装脚本崩了，`APP_HOME: unbound variable` | 脚本从错误目录调用 | 在部署目录执行 |
+| 装完自检 `missing=2`（费率 + 电表 Key 节点） | 租户级主数据未铺 | 重跑 `02-onboard.sh` |
+| 跑完验收再跑初始化，报「Σ峰谷 ≠ energy」 | 演示数据被重复写入 | 清遥测后重跑 |
+| 切 Cassandra 后大面积「0 台 / 没有数据」 | 遥测后端切换后数据在新库 | 重新灌数据，或切回 SQL |
+| Cassandra 无限重启，平台 502 | 内存不足 / 数据目录权限 | 见 [① 安装 · Cassandra](/admin/install#cassandra) |
+
+### 安装到「建库」就失败
+
+**先分清是哪个失败**：
+
+| 日志 | 原因 |
+| --- | --- |
+| `No qualifying bean of type ...` | Spring 装配范围问题（install 的 `@ComponentScan` 缺包） |
+| `NoSuchFileException: .../sql/schema-entities.sql` | 部署物料 `data/sql` 缺文件 |
+| `relation "..." does not exist` | 库非空且版本不匹配 |
+| `Connection refused` | 数据库没起 / 密码错 |
+
+**装配问题的判据**：报的是 bean 找不到，而库操作还没开始 →
+`ThingsboardInstallApplication` 的扫描范围要包含那个包。
+
+**缺 sql 的判据**：
+
+```bash
+ls ~/energy-app/data/sql/*.sql | wc -l    # 必须 8
+```
+
+不满 8 个就从源码拷（**不要用 `rsync --delete` 同步整个 `data/`**）：
+
+```bash
+cp -R guard-server/src/main/data/sql ~/energy-app/data/sql
+```
+
+### 升级后
+
+| 现象 | 原因 |
+| --- | --- |
+| 报 `resource sql/schema-views.sql not found` | jar 里的 sql 与 data 目录版本不一致 |
+| 页面还是旧文案 | 只 `ng build` 没重打 jar（容器挂 jar，不是工作目录） |
+
+**判据**：`ls -l ~/energy-app/guard-server-4.4.0.jar` 时间戳变了吗？
+没变 = 没打进去。
+
+---
+
+## 八、数据口径对不上
+
+| 症状 | 原因 | 修 |
+| --- | --- | --- |
+| 峰谷分析的数和台账对不上 | 峰谷按「时段切片」，台账按「抄表周期」 | 口径不同，不是 bug |
+| 分项图例显示设备名，不是分项名 | 部件取了 `name` 而非维度节点名 | 部件 bug |
+| 分项与区域总量对不上 | 同一台表挂到两个区域，双算 | 清多余关系（[⑧ §6.1](/admin/ops-sql#61-场站--区域--分项归属)） |
+| 历史能耗只有 A 相和总有功 | 单相表本来没有 B/C 相 | 正常 |
+| 分项显示 kWh 但装的是水表 | 品种判定错（档案缺 `energyTypeCode`） | 补档案品种 |
+| 数字是天文数字（如 31272 kW·h） | 开关次数被写进 `energy` 键 | 改测点映射 |
+| 某天数据莫名偏低 | 汇总窗口没对齐整天 | 见 [⑤](/admin/data-flow) |
+
+### 单位混算（最容易忽略）
+
+资产汇总按品种分键写：电→`energy_total`，水→`water_total`，
+气→`gas_total`，汽→`steam_total`，热→`heat_total`。
+
+**热力（GJ）绝不能写进 `energy_total`（kWh）** —— 曾经漏了 `heat` 分支，
+于是「锅炉 312 kW·h」看着像电量，实际是 312 GJ 热量。
+
+---
+
+## 九、诊断三步法
+
+不要一上来就翻代码。**按这个顺序，90% 的问题在三步内定位**：
+
+```
+① 看现象属于哪一层
+     采集 → 存储 → 汇总 → 部件 → 前端
+     （表见 [⑤ 数据流] 的八步断点表）
+
+② 拿一条 SQL 验证那一层
+     有数据 = 这层没问题，往下游查
+     没数据 = 停在这层，别往下查
+
+③ 只有确认是代码问题时才看代码
+```
+
+**为什么强调顺序**：页面空白这一个现象，可能是八层里任何一层。
+直接从最上游（设备上报）查起，永远比从页面往下猜快。
+
+### 三个「看起来像 bug 其实不是」
+
+| 现象 | 真相 |
+| --- | --- |
+| 分项能耗选电能是空的 | 水/气/汽/热分项不写 `energy_total`，切品种才出数 |
+| 告警中心切场站是一条都没有 | 告警挂在设备上，场站筛选走关系链 |
+| 单相表没有 B/C 相数据 | 1P2W 物理上就没有，不是丢数 |
+
+---
+
+## 十、收集现场信息
+
+上报问题时带上这五项，能省一半来回：
+
+```bash
+# ① 版本
+curl -s http://127.0.0.1:8090/api/noauth/energy/health
+
+# ② 容器状态
+docker ps --format '{{.Names}}\t{{.Status}}'
+
+# ③ 后端最近错误
+docker logs --tail 100 energy-server 2>&1 | grep -iE "error|exception" | tail -20
+
+# ④ 数据是否在动（换成一个真实设备 id）
+docker exec energy-postgres psql -U postgres -d thingsboard -c "
+SELECT kd.key, count(*), max(to_timestamp(ts/1000)) AS 最新
+FROM ts_kv t JOIN ts_kv_dictionary kd ON kd.key_id=t.key
+WHERE t.entity_id='<设备id>' GROUP BY 1 LIMIT 10;"
+
+# ⑤ 浏览器控制台截图（Network 里失败的请求 + Console 报错）
+```

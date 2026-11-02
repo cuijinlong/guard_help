@@ -60,14 +60,37 @@ PG_DB="${PG_DB:-thingsboard}"
 # 实测 2026-10-23：脚本按 sql 写死，Cassandra 后端下盘点显示「0 个数据点」，
 # 因为 PG 里的 ts_kv 只是验收用的**镜像视图**，不代表真实数据 ——
 # 客户销户后 Cassandra 里那几万点会永久残留，正是最该防的「数据污染」。
+# ── 遥测后端判定：按可信度依次取，**不能猜**（2026-11-02 修）
+#
+# ★ 旧写法 `TS_BACKEND="${TS_BACKEND:-cassandra}"` 是错的：
+#   本脚本通常从 shiyongshouce/downloads/scripts/ 调用，那里没有 .env，
+#   于是永远落到 cassandra —— 而现网默认部署是 sql（docker-compose 里
+#   `DATABASE_TS_TYPE: ${DATABASE_TS_TYPE:-sql}`）。
+#
+#   后果不只是文案写错：SQL 部署下 ts_outside() 会整段跳过，
+#   「非目标遥测点数不变」这道隔离校验就**静默失效**了 ——
+#   销户脚本少一道保险，比报错严重得多。
+#
+#   所以：① 容器 env（最权威，就是运行中的那份配置）
+#       ② 部署目录 .env
+#       ③ 兜底 sql（与 docker-compose 的默认值保持一致）
 TS_BACKEND="${DATABASE_TS_TYPE:-}"
 if [[ -z "$TS_BACKEND" ]]; then
-  # 部署目录的 .env 是唯一可信来源（脚本可能从别处调用）
-  for f in "$HERE/../.env" "$HERE/.env"; do
-    [[ -f "$f" ]] && TS_BACKEND=$(sed -n 's/^DATABASE_TS_TYPE=//p' "$f" | tail -1) && break
+  # ① 从运行中的容器读 —— 这是唯一「与实际后端一致」的来源
+  TS_BACKEND=$(docker inspect "${APP_CONTAINER:-energy-server}" \
+    --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+    | sed -n 's/^DATABASE_TS_TYPE=//p' | head -1 || true)
+fi
+if [[ -z "$TS_BACKEND" ]]; then
+  # ② 部署目录的 .env（脚本可能从别处调用，往上找两层）
+  for f in "$HERE/../.env" "$HERE/.env" "$HERE/../../.env" "$HERE/../../../.env"; do
+    [[ -f "$f" ]] || continue
+    TS_BACKEND=$(sed -n 's/^DATABASE_TS_TYPE=//p' "$f" | tail -1)
+    [[ -n "$TS_BACKEND" ]] && break
   done
 fi
-TS_BACKEND="${TS_BACKEND:-cassandra}"
+# ③ 兜底与 docker-compose 默认值一致（sql），不是 cassandra
+TS_BACKEND="${TS_BACKEND:-sql}"
 
 # 列出某台设备实际有遥测的 key（跨后端通用：走 TB API，不碰存储层）
 telemetry_keys() {

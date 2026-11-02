@@ -74,6 +74,44 @@ def paged(base, path, token):
 
 
 # ---------------------------------------------------------------- 负载曲线
+# ---------------------------------------------------------------- 电能质量异常
+#
+# 模拟「三相电改造后真实会遇到的电能质量事件」，让电能质量分析页有东西可看。
+#
+# 设计原则：
+#   · **按时段注入**，每天重复 —— 而不是随机撒。随机值在趋势图上是噪点，
+#     看不出"某段时间有问题"；固定时段在按日/按周视图里是规整的异常块，
+#     客户一眼就能定位。
+#   · 每个时段只打一类问题，对应分析页的一个页签：
+#       0  电压暂降 + 三相不平衡  → 「电压偏差」「三相不平衡」
+#       2  频率偏低               → 「频率偏差」
+#       6  谐波超标               → 「谐波检测」
+#       19 闪变超标               → 「电压闪变」
+#   · 数值按国标限值**明确越线**，且留出可读的裕度（不是刚好压线）：
+#       GB/T 12325 电压偏差 ±7%      → 打到 -10%
+#       GB/T 15945 频率偏差 ±0.2Hz   → 打到 49.62（-0.38）
+#       GB/T 14549 电压 THD ≤5%      → 打到 7~9%
+#       GB/T 15543 不平衡度 ≤2%      → 打到 4~6%
+#       GB/T 12326 长时闪变 Plt ≤0.8 → 打到 0.9~1.1
+#
+# 关掉：`--no-pq-anomaly`（真实 RTU 现场演示、不想造假异常时用）
+PQ_ANOMALY = True
+
+PQ_SLOTS = {
+    0:  'voltage',     # 00:00  午夜负荷切换 → 电压暂降 + 不平衡
+    2:  'frequency',   # 02:00  夜间轻载 → 频率偏低
+    6:  'harmonic',    # 06:00  早班整流/变频设备集中启动 → 谐波
+    19: 'flicker',     # 19:00  晚高峰大功率设备频繁启停 → 闪变
+}
+
+
+def pq_anomaly_of(hour):
+    """该小时要注入哪类电能质量异常；无异常返回 None。"""
+    if not PQ_ANOMALY:
+        return None
+    return PQ_SLOTS.get(hour)
+
+
 def load_factor(hour, kind):
     """一天内的负载系数，让曲线有形而不是一条直线（只影响大小，不影响单调性）"""
     if kind == 'elec':
@@ -109,12 +147,21 @@ class Sim:
         self.kind = kind
         self.reading = None      # 首次从平台读回来，避免重启后表底倒流
 
-    def payload(self, hours):
-        hour = time.localtime().tm_hour
+    def payload(self, hours, hour=None):
+        """生成一轮上报数据。
+
+        <p>★ hour 必须可传入（2026-11-02 修）：回填 30 天时旧代码用的是
+        `time.localtime().tm_hour` —— 也就是**当前这个小时**，
+        于是 30×24 个点全都套用同一个负载系数，日曲线是一条平线，
+        按小时注入的电能质量异常也永远命不中。
+        回填循环会传入对应的小时，实时上报不传、取当前小时。
+        """
+        if hour is None:
+            hour = time.localtime().tm_hour
         f = load_factor(hour, self.kind)
 
         if self.kind == 'elec3':
-            return self._elec3(f, hours)
+            return self._elec3(f, hours, hour)
         if self.kind == 'elec1':
             return self._elec1(f, hours)
         if self.kind == 'water':
@@ -132,7 +179,7 @@ class Sim:
         return {}
 
     # ---- 三相电表：含电能质量全场景 ----
-    def _elec3(self, f, hours):
+    def _elec3(self, f, hours, hour):
         power = round(180 * f * random.uniform(0.95, 1.05), 2)          # kW
         energy = round(power * hours, 4)
         if energy <= 0:
@@ -142,16 +189,26 @@ class Sim:
         self.reading = round(self.reading + energy, 3)
         pf = round(random.uniform(0.90, 0.97), 3)
 
+        anom = pq_anomaly_of(hour)
         # GB/T 12325：220V ±7% → 204.6~235.4；留余量取 214~231
         base_v = random.uniform(218.0, 229.0)
         sketch = [random.uniform(-0.006, 0.006) for _ in range(3)]
         v = [round(base_v * (1 + s), 2) for s in sketch]
+        if anom == 'voltage':
+            # A 相跌到额定 -10%（超 ±7% 限值），B/C 相偏高 —— 电压偏差与
+            # 三相不平衡两件事同时成立，对应「电压偏差」「三相不平衡」两个页签
+            v = [round(220 * random.uniform(0.885, 0.905), 2),
+                 round(220 * random.uniform(1.030, 1.055), 2),
+                 round(220 * random.uniform(0.995, 1.015), 2)]
         p_each = power / 3.0
         cur = [round(p_each * 1000 / x / pf, 2) if x else 0 for x in v]
         vavg = round(sum(v) / 3, 2)
 
         # 不平衡度 = 最大偏差 / 平均，GB/T 15543 ≤ 2%
         unb = round(max(abs(x - vavg) for x in v) / vavg * 100, 2)
+        if anom == 'voltage' and unb < 4.0:
+            # 上面的 sketch 抖动可能碰巧让三相接近，异常时段强制拉到越线区间
+            unb = round(random.uniform(4.2, 6.5), 2)
         # 序分量：正序 ≈ 平均，负序 ≈ 不平衡引起的逆向分量，零序三相四线很小
         u1 = round(vavg, 2)
         u2 = round(vavg * unb / 100 * 0.6, 2)
@@ -159,6 +216,9 @@ class Sim:
         iavg = round(sum(cur) / 3, 2)
 
         freq = round(random.uniform(49.95, 50.05), 2)
+        if anom == 'frequency':
+            # GB/T 15945 限值 ±0.2Hz（小系统 ±0.5）→ 打到 -0.38Hz，明确越线
+            freq = round(random.uniform(49.58, 49.72), 2)
         out = {
             'energy': energy,
             'energy_reading': self.reading,
@@ -171,6 +231,9 @@ class Sim:
             'voltage_avg': vavg,
             'current_a': cur[0], 'current_b': cur[1], 'current_c': cur[2],
             'current_avg': iavg,
+            # 中性线电流：三相四线表（N 线有 CT）能采。平衡负载时接近 0，
+            # 不平衡时随负序/零序上升 —— 与 voltage_unbalance 保持同步的物理含义
+            'current_n': round(iavg * (0.02 + unb / 100 * random.uniform(0.8, 1.2)), 2),
             'power_a': round(p_each, 2), 'power_b': round(p_each, 2),
             'power_c': round(p_each, 2),
             # 电能质量：电压偏差（相对 220V 额定）
@@ -195,14 +258,31 @@ class Sim:
             'current_thd_b': round(random.uniform(3.0, 12.0), 2),
             'current_thd_c': round(random.uniform(3.0, 12.0), 2),
             # 闪变（GB/T 12326：Pst ≤ 1.0，Plt ≤ 0.8）
-            'flicker_pinst': round(random.uniform(0.15, 0.95), 2),
+            # ★ 不产出 flicker_pinst（2026-11-02）：IEC 61000-4-15 的内部中间量
+            #   S(t)，主流电表只输出 Pst / Plt，没有这个寄存器。
             'flicker_pst': round(random.uniform(0.20, 0.90), 2),
             'flicker_plt': round(random.uniform(0.15, 0.75), 2),
         }
+        if anom == 'harmonic':
+            # 电压 THD 打到 6.5~9.2（限值 5%），电流 THD 打到 25~45
+            for ph in ('a', 'b', 'c'):
+                out['voltage_thd_%s' % ph] = round(random.uniform(6.5, 9.2), 2)
+                out['current_thd_%s' % ph] = round(random.uniform(25.0, 45.0), 2)
+        elif anom == 'flicker':
+            # Pinst 瞬时值先跳上去，Pst/Plt 跟着越线（Plt 限值 0.8）
+            # Pinst 不产出（见上）；Pst/Plt 直接越线
+            out['flicker_pst'] = round(random.uniform(1.25, 1.85), 2)
+            out['flicker_plt'] = round(random.uniform(0.90, 1.15), 2)
         # 分次谐波：3/5/7/9/11/13 次，含率随次数递减
-        for hk, scale in ((3, 1.8), (5, 1.2), (7, 0.8), (9, 0.5), (11, 0.35), (13, 0.25)):
-            out['voltage_harmonic_%d' % hk] = round(random.uniform(0.1, scale), 2)
-            out['current_harmonic_%d' % hk] = round(random.uniform(0.5, scale * 3), 2)
+        # 分次谐波 2~31 次：国产主流带谐波的三相表实现到 31 次（IEC 61000-4-7
+        # 要求到 40/50 次，但产品寄存器普遍是 31）。含率随次数递减。
+        boost = 4.0 if anom == 'harmonic' else 1.0
+        scales = tuple((h, max(0.12, 1.8 * (3.0 / h) ** 0.9)) for h in range(2, 32))
+        for hk, scale in scales:
+            out['voltage_harmonic_%d' % hk] = round(
+                random.uniform(0.1 * boost, scale * boost), 2)
+            out['current_harmonic_%d' % hk] = round(
+                random.uniform(0.5 * boost, scale * 3 * boost), 2)
         return out
 
     # ---- 单相电表 ----
@@ -216,17 +296,22 @@ class Sim:
         self.reading = round(self.reading + energy, 3)
         v = round(random.uniform(219.0, 231.0), 2)
         pf = round(random.uniform(0.90, 0.98), 3)
+        # ★ 只产出 1P2W 真能采集的量（2026-11-02）。
+        #   DDSU666 / DDS1352 这类单相导轨表是 DL/T 645 基础型：
+        #   电压、电流、有功、功率因数、频率、正向有功电度 + 尖峰平谷。
+        #   **没有谐波测量单元**，所以不产出 voltage_thd / current_thd ——
+        #   新字典里 1P2W 的 keysByWiring 也不含这两项，两边必须一致。
         return {
             'energy': energy,
             'energy_reading': self.reading,
+            'power_a': power,
             'power_total': power,
+            'power_factor_a': pf,
             'power_factor_total': pf,
             'frequency': round(random.uniform(49.96, 50.04), 2),
             'voltage_a': v,
             'current_a': round(power * 1000 / v / pf, 2),
             'voltage_deviation_a': round((v - 220) / 220 * 100, 2),
-            'voltage_thd_a': round(random.uniform(1.2, 3.6), 2),
-            'current_thd_a': round(random.uniform(3.0, 11.0), 2),
         }
 
     # ---- 水 / 气 / 汽 ----
@@ -325,7 +410,7 @@ def classify(name, profile):
 
 
 def push(base, token, sim, hours, dry, reading_only=False):
-    payload = sim.payload(hours)
+    payload = sim.payload(hours)   # hour=None → 取当前小时
     if reading_only:
         # 去掉增量类键，只留累积量 —— 模拟现场仪表的能力边界
         for k in ('energy',):
@@ -376,7 +461,7 @@ def backfill(base, token, sims, days, dry, reading_only=False):
         #   抄表判 abnormal（实测 2026-11-02，每台表都有 1 次）。
         #
         #   读不到当前值（新设备）时才退回 1000。
-        probe = sim.payload(1.0)
+        probe = sim.payload(1.0)   # 探针：取当前小时即可
         per_hour = float(probe.get('energy') or 0.0005)
         cur = latest_reading(base, token, sim.id) if not dry else None
         if cur is None:
@@ -387,10 +472,26 @@ def backfill(base, token, sims, days, dry, reading_only=False):
         sim.reading = round(start_reading, 3)
 
         points = []
-        for d in range(days, 0, -1):
+        # ★ 时间轴必须对齐「自然日整点」（2026-11-02 修）。
+        #
+        #   旧写法 ts = now - d*86400 + h*3600 —— 基线是**当前时刻**，
+        #   于是 h=0 落在"d 天前的此刻"（实测本地 21:00），而不是当天 00:00。
+        #   连带两个后果：
+        #     ① 每个点的分钟/秒是乱的，不是整点；
+        #     ② h 表示的不是实际落在的小时 —— 按小时注入的电能质量异常
+        #        全部挤到同一个钟点上（实测 30 天异常全落在 21 点）。
+        #
+        #   现在以「N 天前 00:00（本地时间）」为起点，逐小时推进：
+        #   h 就是本地小时，与 load_factor / PQ_SLOTS 的口径完全一致。
+        midnight = time.mktime(
+            (time.localtime(now).tm_year, time.localtime(now).tm_mon,
+             time.localtime(now).tm_mday, 0, 0, 0, 0, 0, -1))
+        start_ts = midnight - days * 86400
+        for d in range(days):
             for h in range(24):
-                ts = int((now - d * 86400 + h * 3600) * 1000)
-                payload = sim.payload(1.0)
+                ts = int((start_ts + d * 86400 + h * 3600) * 1000)
+                # 传 h：让负载系数与电能质量异常都按"实际所在的小时"生成
+                payload = sim.payload(1.0, hour=h)
                 if reading_only:
                     # ★ 回填也必须遵守 --reading-only。
                     #   之前只在 push() 里 pop，回填直接调 sim.payload()，
@@ -432,6 +533,12 @@ def main():
     ap.add_argument('--backfill-days', type=int, default=0,
                     help='回填最近 N 天的历史数据（每小时一个点）。'
                          '演示前跑一次，看板立刻有曲线，不用等数据攒够')
+    ap.add_argument('--no-pq-anomaly', action='store_true',
+                    help='关闭电能质量异常注入（默认**开启**）。'
+                         '默认在每个整点触发一类异常：00 电压暂降+不平衡 / '
+                         '02 频率偏低 / 06 谐波超标 / 19 闪变超标，'
+                         '用来让「电能质量」分析页有东西可看。'
+                         '真实 RTU 现场、不想掺假异常时关掉')
     ap.add_argument('--reading-only', action='store_true',
                     help='只上报累积表底（energy_reading），不报本周期增量（energy）。'
                          '现场真实仪表就是这样 —— 平台必须能从表底差出用量。'
@@ -440,6 +547,9 @@ def main():
                     help='只给这个客户名下的模拟设备发数据（默认全部）。'
                          '多客户同租户时建议指定，避免一个客户的数据串到另一个')
     args = ap.parse_args()
+
+    global PQ_ANOMALY
+    PQ_ANOMALY = not args.no_pq_anomaly
 
     _, r = api(args.base, '/api/auth/login', None, 'POST',
                {'username': args.tenant, 'password': args.tenant_pass})

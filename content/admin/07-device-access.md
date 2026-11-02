@@ -1,4 +1,4 @@
-# 设备接入：RTU 与网关怎么上报
+# ⑦ 设备接入（RTU 与演示环境）
 
 > 数据进不来，后面全是空的。这一页只讲一件事：**怎么让现场设备把数据送上来。**
 >
@@ -86,7 +86,7 @@ curl -s --noproxy '*' -H "X-Authorization: Bearer $TOK" \
 ```
 
 平台已经给每个客户的新设备生成了 `rtu-config.csv`（含每台表的 token 与点位映射），
-在客户数据导入目录里。见[新客户上线](/admin/init)。
+在客户数据导入目录里。见[新客户上线](/admin/onboard)。
 
 ---
 
@@ -398,347 +398,196 @@ python3 scripts/23-demo-simulator.py \
 
 ---
 
-## 通道二：HTTP（适合脚本、单板机、调试）
-
-### 请求格式
-
-```
-POST http://平台IP:8090/api/v1/{AccessToken}/telemetry
-Content-Type: application/json
-
-{"energy":2.88,"power_total":2.88,"voltage_a":220.5}
-```
-
-### 命令行验证
-
-```bash
-curl -s --noproxy '*' -w '\nHTTP %{http_code}\n' \
-  -X POST 'http://127.0.0.1:8090/api/v1/设备的AccessToken/telemetry' \
-  -H 'Content-Type: application/json' \
-  -d '{"energy":2.88,"power_total":2.88,"voltage_a":220.5}'
-```
-
-**看到 `HTTP 200` 就是通了。**
-
-> 注意 `--noproxy '*'`：本机或公司网络里的代理会接管 `127.0.0.1`，
-> 不加这个参数会得到 `502` 或超时，很难查。
-
 ---
 
 ## 上报哪些字段
 
-**字段名必须与「能源参数字典」完全一致**，差一个字就存不进对应的参数位，
-报表展开到那一项就是空白。
+**唯一真相源是字典**（见 [④ 数据模型 · 标准 key](/admin/data-model#标准-key-的能力分级tier)）。
+这里只讲最容易写错的三处。
 
-> 查 key 最快的路径：租户 → **运营配置 → 品种指标**。
-> 选品种 → 看到该品种的设备类型 + 全部标准 key，点一下复制。
+### 1. 单相表不要写 B/C 相
 
-### 电表（26 项标准参数）
+键名以 `_b` / `_c` 结尾的，单相表（1P2W）**根本没有**。
+配了不会报错，但那些线永远是空的 —— 会让人以为表坏了。
 
-最常用的十几个：
+判据：`wiring=1P2W` 的设备，`keysByWiring` 只有 22 项，全都不含 `_b`/`_c`。
 
-| 字段 | 含义 | 单位 | 聚合 |
-| --- | --- | --- | --- |
-| `energy` | 本小时用电量（**增量**） | kWh | SUM |
-| `energy_reading` | 正向有功总电度（**累积表底**） | kWh | MAX |
-| `energy_day` | 当日累计 | kWh | MAX |
-| `power_total` | 总有功功率 | kW | AVG |
-| `power_a/b/c` | 分相有功功率 | kW | AVG |
-| `voltage_a/b/c` | 分相电压 | V | AVG |
-| `voltage_avg` | 平均相电压（三相汇总） | V | AVG |
-| `current_a/b/c` | 分相电流 | A | AVG |
-| `current_avg` | 平均相电流（三相汇总） | A | AVG |
-| `power_factor_total` | 总功率因数 | — | AVG |
-| `energy_peak` / `energy_flat` / `energy_valley` / `energy_deep` | 分时电量 | kWh | SUM |
-| `frequency` | 频率 | Hz | AVG |
-| `demand_max` | 最大需量 | kW | MAX |
-| `load_rate` | 负载率 | % | AVG |
-| `voltage_unbalance` | 电压不平衡度 | % | AVG |
+### 2. 增量与表底：两个都要报
 
-完整 26 项在**运营配置 → 品种指标**页面里看（可点 key 复制）。
-
-### 水 / 燃气 / 蒸汽（各 3 个）
-
-| 字段 | 含义 | 聚合 |
+| 键 | 语义 | 是否必须 |
 | --- | --- | --- |
-| `energy` | 本小时用量（增量） | SUM |
-| `power` | 瞬时流量 | AVG |
-| `energy_reading` | 累积表底 | MAX |
+| `energy_reading` | 累积表底（表盘上的数） | **强烈建议**，这是对账与差分的唯一依据 |
+| `energy` | 本周期增量 | 可选，但丢了就永久丢 |
 
-### 温湿度
+平台用量一律走「表底差」：`energy_reading(本期) − energy_reading(上期)`。
+所以**只报表底也能算用量**（后端会自动差分），但只报 `energy` 一旦漏点就无法恢复。
 
-| 字段 | 含义 |
-| --- | --- |
-| `temperature` | 温度（℃） |
-| `humidity` | 湿度（%） |
+详见 [⑤ 数据流 · 表底 vs 增量](/admin/data-flow#六表底-vs-增量)。
 
----
+### 3. 键名必须是字典里的标准名
 
-## ⚠ 增量与表底：最容易写错的地方
-
-**这是现场接入 90% 数据错误的来源，务必看清。**
-
-```
-energy          本小时用了多少    1.20  1.35  0.98   ← 每分钟/每小时都给一个新的小数值
-energy_reading  表上显示的总数    33705.42  33706.77  33707.75   ← 只增不减
-```
-
-三条铁律：
-
-1. **`energy` 必须是增量**，不是表底。写成表底，任何「求和」的报表都会得到天文数字。
-2. **`energy_reading` 必须单调递增**。换表、清零、回退都会破坏它，要在平台上登记换表事件。
-3. **相邻两点的 `energy_reading` 之差，必须等于后一点的 `energy`**：
-   ```
-   energy_reading[n] − energy_reading[n−1] == energy[n]
-   ```
-
-第三条是平台自检的核心断言。`04-verify-data.sh` 就是逐点验它。
-
-### 正确的写法
-
-```json
-{"energy": 1.20, "energy_reading": 33706.62}
-```
-
-下一分钟：
-
-```json
-{"energy": 1.35, "energy_reading": 33707.97}
-```
-
-`33707.97 − 33706.62 = 1.35` ✓
-
-### 错误的写法
-
-```json
-{"energy": 33706.62, "energy_reading": 33706.62}
-```
-
-把表底当成了增量 —— 月报表会算成几十万度。
-
-### 单相表不要写 B/C 相
-
-单相表只有 A 相。写了 `voltage_b: 0` 会让「相电压」报表把 0 当成真实读数，
-最小值永远贴着零。
-
-**只写 A 相和汇总项：**
-
-```json
-{"energy":1.2,"energy_reading":33706.6,"power_a":1.2,"power_total":1.2,
- "voltage_a":220.5,"voltage_avg":220.5,
- "current_a":5.9,"current_avg":5.9,
- "power_factor_a":0.92,"power_factor_total":0.92}
-```
-
-> 单相表的 `voltage_avg` / `current_avg` 就等于 A 相的值 —— 写上，
-> 三相汇总口径的报表才能把单相表一起算进去。
-
-**判断哪些键要配**：租户 → 运营配置 → **品种指标** →
-选「单相电能表」，灰显并标「单相不适用」的那些就是不用配的（B 相、C 相全部）。
+厂家代号（`U` / `I` / `P` / `Ep`）要靠规则链的 `renameKeys` 转成标准名，
+否则数据进不了业务视图。判据与 SQL 见 [⑤ 数据流](/admin/data-flow#七厂家指标名不一样)。
 
 ---
 
 ## 验一条数据真的上来了
 
-发完数据等 2 秒，然后查最新遥测：
+三步，每一步都要过，卡在哪一步就是那个环节的问题：
 
 ```bash
-TOK=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"tenant@your.com","password":"Tenant@123"}' \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+# ① 平台收到了（HTTP 200 = 接收成功）
+#    见上文的 curl 验证
 
-curl -s --noproxy '*' -H "X-Authorization: Bearer $TOK" \
-  "http://127.0.0.1:8090/api/plugins/telemetry/DEVICE/<设备ID>/values/timeseries?keys=energy,voltage_a" \
-  | python3 -m json.tool
+# ② 落库了（键名是标准名，不是厂家代号）
+docker exec energy-postgres psql -U postgres -d thingsboard -c "
+SELECT kd.key, count(*) AS 点数, max(to_timestamp(t.ts/1000)) AS 最新
+FROM ts_kv t JOIN ts_kv_dictionary kd ON kd.key_id = t.key
+WHERE t.entity_id = '<设备id>'
+GROUP BY 1 ORDER BY 2 DESC LIMIT 10;"
+
+# ③ 页面看得见
+#    设备详情 → 最新遥测；再打个测试告警看能否触发
 ```
 
-**看到你刚发的值和时间戳，就说明全链路通了。**
+**② 有数据但 ③ 没有** → 是通道之外的配置问题：
+设备没挂到场站（[④](/admin/data-model#场站归属只认关系不认属性)）、
+没标计量层级、或品种判错。
 
 ---
 
 ## 上报不通，按这个顺序查
 
-| 现象 | 原因 | 怎么办 |
+| 顺序 | 查什么 | 判据 |
 | --- | --- | --- |
-| HTTP 404 | 设备端点未装配 | 查 `SERVICE_TYPE=monolith` |
-| HTTP 401 / 403 | token 不对 | 重新复制令牌，注意别带空格 |
-| HTTP 200 但读不到 | 键名不在字典里 | 对照上面的字段表 |
-| MQTT 连不上 | 端口没映射 | `docker compose ps` 看 1883 |
-| MQTT CONNACK 拒绝 | token 错或设备被禁用 | 换 token 试 |
-| 数据上来了但报表空 | 设备未挂分项/场站 | 见下面的「挂到哪里」 |
-| 值是 0 | 上报真的发了 0 | 看 RTU 侧 |
+| 1 | `SERVICE_TYPE=monolith` 且 `HTTP_ENABLED=true` | 不是 → `/api/v1/...` 直接 404 |
+| 2 | 端口映射 `1883->1883` | 只有 `8090/tcp` → `.env` 缺 `MQTT_PORT` |
+| 3 | 访问令牌对不对 | 错的令牌返回 401，且不带原因 |
+| 4 | 设备名是否与平台一致 | 网关模式下按**设备名**匹配，对不上会落到别的设备 |
+| 5 | 时间戳 | 设备时钟偏差 > 5 分钟会被丢弃 |
+| 6 | 键名 | 厂家代号能入库，但看板读不到（见上一节） |
 
-### 设备要挂到场站和分项
+**常见现场问题**：
 
-数据上来了，但报表里看不到 —— 十有八九是设备没挂到分项。
+| 现象 | 原因 |
+| --- | --- |
+| WiFi 连不上 | 路由器开了「防蹭网」/ 双频合一（2.4G 与 5G 同名） |
+| 上报成功但没数据 | 设备名与平台不一致（网关模式） |
+| 数据落在了别的设备上 | 同上，网关按名字匹配 |
+| 一会有一会没有 | 信号弱 / 设备频繁重连 / 时钟漂移 |
 
-平台要靠两条关系才能把数据算进报表：
+---
+
+## 演示环境（无真实设备时）
+
+平台自带一套**纯模拟**的演示环境，用来演示、培训、验收。
+不依赖任何硬件，脚本在服务器侧按小时生成数据。
+
+### 拓扑
 
 ```
-场站 --Contains--> 分项 --Contains--> 设备
+单相园区·平台演示中心（办公园区）
+└─ ED1-Gateway          真实 RTU（HaaS506-ED1）或脚本模拟
+   ├─ PowerMeter-DDSU666   单相电表（真实）→ 插座分项 · 公共区域
+   ├─ Sensor-HZ8706        温湿度传感器（真实）→ 公共区域
+   └─ Relay-8CH            8 路继电器（真实）← 可控 → A栋办公区
+   ＋ PowerMeter-1P-SIM    单相模拟表（照明总表）→ 照明分项 · 公共区域
+   ＋ WaterMeter-SIM       水表（模拟）→ 给排水分项 · 公共区域
+   ＋ GasMeter-SIM         燃气表（模拟）→ 炊事分项 · 食堂区域
+
+三相园区·平台演示中心（生产园区）
+└─ ED2-Gateway          模拟（脚本发数据）
+   ├─ PowerMeter-3P-SIM    三相电表 3P4W ← 电能质量全场景
+   ├─ SteamMeter-SIM       蒸汽表 → 蒸汽分项 · 锅炉房
+   ├─ HeatMeter-SIM        热力表 → 锅炉分项 · 锅炉房
+   ├─ AHU-SIM              新风机组（env）← 可控 → 办公区
+   └─ Breaker-SIM          智能空开（带计量）← 可控 → 动力分项 · 生产车间
 ```
 
-命令行挂：
+### 三个脚本
+
+| 脚本 | 作用 |
+| --- | --- |
+| `29-rtu-demo-up.sh` | **一键**：客户 / 场站 / 设备 / 回填 30 天 / 重算汇总 |
+| `30-rtu-env-init.py` | 只建/补齐数据（幂等） |
+| `31-rtu-simulate.py` | 只发数据（持续上报 / 回填历史） |
 
 ```bash
-# 设备挂分项
-curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOK" \
-  -H 'Content-Type: application/json' \
-  -d '{"from":{"entityType":"ASSET","id":"<分项ID>"},
-       "to":{"entityType":"DEVICE","id":"<设备ID>"},
-       "type":"Contains","typeGroup":"COMMON"}' \
-  'http://127.0.0.1:8090/api/relation'
+# 一键（推荐）
+bash scripts/29-rtu-demo-up.sh
+
+# 只发数据（演示期间常驻）
+bash scripts/29-rtu-demo-up.sh --sim-only --interval 30
+
+# 关闭电能质量异常注入（真实现场演示时不造假异常）
+python3 scripts/31-rtu-simulate.py --interval 30 --no-pq-anomaly
 ```
 
-页面里挂：设备 → 编辑 → 所属分项。
+### 电能质量覆盖
 
-### 设备要标计量层级
+三相模拟表按**专业电能质量表**的能力布局（tier = `harmonic` / `pq`）：
 
-分项汇总、总分差、待机识别都靠 `meterLevel` 这个属性：
+| 场景 | 遥测键 | 国标限值 | 正常态 |
+| --- | --- | --- | --- |
+| 三相电压趋势 | `voltage_a/b/c`、`voltage_avg` | 220V ±7% | 218~229 V |
+| 电压偏差 | `voltage_deviation_a/b/c` | ±7%（GB/T 12325） | −3%~+4% |
+| 频率偏差 | `frequency`、`frequency_deviation` | 50 ± 0.2 Hz | 49.95~50.05 |
+| 三相不平衡 | `voltage_unbalance` | ≤ 2%（GB/T 15543） | ≤ 1.2% |
+| 序分量 | `voltage_seq_*`、`current_seq_*` | —— | 负序 ≈ 不平衡×0.6 |
+| 谐波畸变 | `voltage_thd_*`、`current_thd_*` | 电压 ≤ 5%（GB/T 14549） | 1.2~3.8% |
+| 分次谐波 | `*_harmonic_2..31` | 分次限值 | 按次数递减 |
+| 电压闪变 | `flicker_pst`、`flicker_plt` | Pst ≤ 1.0，Plt ≤ 0.8 | 0.20~0.90 |
+| 中性线电流 | `current_n` | —— | 随不平衡上升 |
 
-| 值 | 含义 | 例子 |
+> **不产出 `flicker_pinst`**：它是 IEC 61000-4-15 的内部中间量，
+> 主流电表（PM8000 / PAC4200 / M4M / APView500）只输出 Pst / Plt。
+
+### 异常场景：每天四个整点各打一类问题
+
+**默认开启**，让电能质量分析页有东西可看。`--no-pq-anomaly` 关闭。
+
+| 时刻 | 注入类型 | 打到什么程度 | 对应页签 |
+| --- | --- | --- | --- |
+| 00:00 | 电压暂降 + 不平衡 | A 相 −11%，不平衡 8~9.5% | 电压偏差 / 三相不平衡 |
+| 02:00 | 频率偏低 | 49.58~49.72 | 频率偏差 |
+| 06:00 | 谐波超标 | 电压 THD 6.5~9.2% | 谐波检测 |
+| 19:00 | 闪变超标 | Pst 1.25~1.85，Plt 0.90~1.15 | 电压闪变 |
+
+**为什么固定时段而不是随机**：随机值在趋势图上是噪点，看不出「哪段时间有问题」；
+固定时段在按日/按周视图里是规整的异常块，一眼能定位到班次。
+
+### RPC（远程控制）
+
+可控设备在平台上有 `rpcCommands` 属性，记着它接受哪些指令。
+
+| 设备 | 方法 | 参数 |
 | --- | --- | --- |
-| 1 | 一级（进线总表） | 厂区总表 |
-| 2 | 二级（分项总表） | 车间总表 |
-| 3 | 三级（末端表） | 单台设备 |
+| Relay-8CH（真实） | `setRelay` | `{"ch":1..8,"state":true}` |
+| | `setGroupRelay` | `{"chs":[1,2,3],"state":true}` |
+| | `setAllRelay` | `{"state":true}` |
+| | `readMeterNow` | `{}` 立即抄表 |
+| AHU-SIM | `setMode` | `{"mode":"auto/manual/off"}` |
+| | `setFanSpeed` | `{"freq":0..50}` |
+| Breaker-SIM | `setState` | `{"state":true/false}` |
+| | `getState` | `{}` |
 
-页面里：设备 → 属性 → `meterLevel`。
-命令行：
+**从平台下发**：设备详情页 → **RPC** 面板 → 选方法、填参数。
 
 ```bash
-curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOK" \
-  -H 'Content-Type: application/json' \
-  -d '{"meterLevel":2}' \
-  "http://127.0.0.1:8090/api/plugins/telemetry/DEVICE/<设备ID>/SERVER_SCOPE"
+curl -X POST "http://127.0.0.1:8090/api/rpc/oneway/<设备id>"   -H "X-Authorization: Bearer $TOKEN" -H 'Content-Type: application/json'   -d '{"method":"setRelay","params":{"ch":1,"state":true},"timeout":10000}'
 ```
+
+> 真实设备的 RPC 由 RTU 执行；模拟设备由脚本记录（不改变实际状态）。
+
+---
 
 ## 装完 RTU 之后：四条链路逐条验
 
-「RTU 装上就能用」这句话要拆成四段验证。每段都能在页面上看到结果，
-不用翻日志 —— 哪一段断了自己就露出来。
+按顺序，不要跳。前一条不通，后一条必然也不通。
 
-| 环节 | 依赖什么 | 在哪看结果 | 断了会怎样 |
+| # | 链路 | 怎么验 | 不通说明 |
 | --- | --- | --- | --- |
-| 采集 | RTU + Access Token + 通道端口 | 客户 → 设备管理 → 选设备 → 最新遥测 | 页面一行数据都没有 |
-| 分析 | 遥测键名匹配字典 | 能耗查询 / 峰谷分析 / 分项能耗 | 有数据但报表空白或全算「平」 |
-| 评估 | 设备档案上的 4 条告警规则 | 告警中心 | 数据正常但从不产生告警 |
-| 预测 | AI 服务（`ngx-ai`） | 能耗优化 → 负载预测 | 页面打不开或提示服务不可用 |
-
-### 1. 采集：先让一台表出数
-
-```bash
-# 换成你自己的设备令牌
-curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/v1/DEVICE_TOKEN/telemetry \
-  -H 'Content-Type: application/json' \
-  -d '{"energy":1234.5,"energy_reading":1234.5,"power_total":12.3,"voltage_a":220.1}'
-```
-
-返回 `200`。然后看页面：客户 → 设备管理 → 该设备 → 最新遥测，
-应出现这 4 个键。
-
-**键名必须和字典一致**（`energy` / `energy_reading` / `power_total` / `voltage_a` …），
-字典全表见上一节。键名写错不会报错，数据也存进去了，只是所有报表都不认它。
-
-### 2. 分析：三张报表都能出数
-
-依次打开：历史能耗 → 峰谷分析 → 分项能耗。
-
-- **历史能耗**：曲线有数 = 数据进了时序库
-- **峰谷分析**：峰/平/谷都有值 = 分时方案生效（全算「平」说明租户缺 `tou_scheme`）
-- **分项能耗**：能看到这台表 = 设备已挂到分项，且档案标了 `isMeter`
-
-### 3. 评估：告警规则是「继承来的」
-
-电表档案上预装了 4 条告警（电压越限 / 功率因数偏低 / 三相不平衡度超限 / 闲时能耗超标），
-**新接入的设备只要选了该档案就自动带**，不需要逐台配。
-
-验证：发一条越限数据
-
-```bash
-curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/v1/DEVICE_TOKEN/telemetry \
-  -H 'Content-Type: application/json' \
-  -d '{"voltage_a":180,"power_factor_total":0.75}'
-```
-
-等 10–30 秒，告警中心应出现「电压越限」「功率因数偏低」。
-再发一条正常值（`220` / `0.95`），告警应自动清除。
-
-**闲时能耗超标**这一条不靠遥测阈值，而是读服务端的日结算结果：
-
-```bash
-# 模拟"今天超标"（真实场景由闲时能耗模块每天自动写）
-curl -s --noproxy '*' -X POST \
-  -H "X-Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
-  -d '{"idle_exceed":1}' \
-  "http://127.0.0.1:8090/api/plugins/telemetry/DEVICE/$DEV/timeseries/SERVER_SCOPE"
-```
-
-等 10 秒出现「闲时能耗超标」MINOR；发 `0` 转「已清除」。
-阈值在「组织与场站 → 场站 → 闲时能耗」里配。
-
-> 告警没出现，先看设备档案是不是「单相电能表 / 电能表」——
-> 选成「默认」档案就没有这套规则。租户 → 设备档案 → 计算字段可核对。
-
-### 4. 预测：这一环**不是** RTU 带来的
-
-负载预测、用能建议、用能质量跑在 AI 服务（`ngx-ai`）里，和 RTU 是两条独立链路：
-
-- RTU 负责**产生数据**
-- AI 服务负责**基于历史数据做预测**
-
-所以「只装 RTU」能拿到采集 + 分析 + 评估；预测还需要 AI 服务在跑，
-并且该场站已有足够历史数据（建议 ≥ 14 天）。
-
-判断方法：客户 → 能耗优化 → 负载预测。打不开说明 AI 服务没起，
-见[常见问题](/admin/troubleshoot)的 AI 服务一节；能打开但没有曲线，
-说明历史数据不够，先让 RTU 稳定上报几天。
-
-### 一把过：用自检页确认
-
-客户 → 设备运维 → **平台自检**。
-「遥测数据」项显示有值 = 采集通了；其余项逐条对着看，
-缺什么、怎么补、看手册哪一页，页面上直接写着。
-
----
-
-## 换成自己的真实数据（清掉演示数据）
-
-演示数据只用于快速验收，接入真实设备后建议清掉，免得报表里真假混在一起。
-
-**页面上**：客户 → 设备运维 → 平台自检 → 「清除演示数据」。
-只删带 `demo` 标记的场站、分项、设备与遥测；你自己新建的资产和设备不受影响。
-
-**命令行**：
-
-```bash
-# 登录拿 token
-TOK=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"customer@126.com","password":"12345678"}' \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
-
-# 看看现在有多少演示数据
-curl -s --noproxy '*' -H "X-Authorization: Bearer $TOK" \
-  http://127.0.0.1:8090/api/energy/demo-data
-
-# 清除
-curl -s --noproxy '*' -X DELETE -H "X-Authorization: Bearer $TOK" \
-  http://127.0.0.1:8090/api/energy/demo-data
-```
-
-清除后按上面的「四条链路」重新验一遍 —— 这次数据全部来自你自己的 RTU。
-
----
-
-## 现场上线前的一张检查表
-
-- [ ] `SERVICE_TYPE=monolith`，`HTTP_ENABLED=true`，`MQTT_ENABLED=true`
-- [ ] `docker compose ps` 里能看到 `1883->1883/tcp`
-- [ ] 防火墙放行 1883（MQTT）和 8090（HTTP）
-- [ ] 每台表都有 Access Token，记在 `rtu-config.csv` 里
-- [ ] 设备档案选对（单相表选「单相电能表」，三相选「电能表」）
-- [ ] 设备挂到了正确的分项，分项挂到了场站
-- [ ] `meterLevel` 标了 1/2/3
-- [ ] 发一条测试数据，读回来值和时间都对
-- [ ] 跑 `bash scripts/04-verify-data.sh`，`energy` 与 `energy_reading` 守恒
+| 1 | 采集 | 设备详情「最新遥测」有数据 | 见上文「上报不通」 |
+| 2 | 分析 | 实时/历史/分项三张报表都能出数 | 设备没挂场站 / 没标层级 |
+| 3 | 评估 | 告警规则是「继承来的」（挂档案） | 挂错设备了，见 [⑥](/admin/rules) |
+| 4 | 汇总 | 场站/分项资产有 `energy_total` | 没重算，见 [⑤](/admin/data-flow) |

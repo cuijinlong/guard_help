@@ -1,14 +1,27 @@
-# 数据验证 SQL（RTU 演示环境）
+# ⑧ 运维 SQL
 
-> 这一页的 SQL 都是**实际跑过、结果确认过**的，不是凭 schema 猜的。
-> 每条都标了「回答什么问题」和「怎样算正常」，异常时看那一行就知道卡在哪。
->
-> **为什么需要它**：演示环境出问题时，页面只会告诉你「没有数据」。
-> 到底是没有设备、没有属性、没有遥测，还是属性有但口径不对 ——
-> 页面看不出来，只有查库能看出来。下面按「从上游到下游」的顺序排：
-> 字典 → 档案 → 设备属性 → 遥测 → 资产汇总。
+查数据对不对、库里有什么、怎么备份清理。**所有 SQL 都在真实库跑通过**。
+
+> 库是空的？先看 [② 包干到底部署](/admin/deploy)。
+> 表结构和字段含义见 [④ 数据模型](/admin/data-model)。
 
 ---
+
+## 按症状找 SQL
+
+| 你看到的现象 | 跑第几节 |
+| --- | --- |
+| 「品种指标」页是空的 / 只有电 | §1 字典 |
+| 设备属性对不上、类型混乱 | §2 设备三层属性 |
+| 设备列表有，但没数据 | §3 遥测 |
+| 电能质量页指标不全 | §4 电能质量 |
+| **设备有数、看板是 0** | §5 资产汇总（最常见） |
+| 设备不在场站/区域/分项下 | §6 归属关系 |
+| 分项显示 kWh 但装的是水表 | §6.2 按品种分键 |
+| 数字是天文数字 | §6.3 哨兵读数 |
+| 抄表读不出表底 | §8 抄表 |
+| 磁盘满了 / 要备份 | §9 表结构与空间、§10 备份 |
+| 不知道从哪查 | §11 一键体检与排查顺序 |
 
 ## 0. 怎么进库
 
@@ -79,7 +92,7 @@ SELECT
   COUNT(*) FILTER (WHERE code LIKE 'voltage_harmonic_%') AS 电压分次谐波,
   COUNT(*) FILTER (WHERE code LIKE 'current_harmonic_%') AS 电流分次谐波,
   COUNT(*) FILTER (WHERE code LIKE 'flicker_%')          AS 闪变,
-  COUNT(*) FILTER (WHERE code LIKE '%_seq_%')            AS 序分量,
+  COUNT(*) FILTER (WHERE code LIKE '%\_seq\_%' ESCAPE '\') AS 序分量,
   COUNT(*) FILTER (WHERE code LIKE 'voltage_deviation_%')AS 电压偏差
 FROM (
   SELECT jsonb_array_elements(dic.json_v::jsonb -> 'standardKeys') ->> 'code' AS code
@@ -167,7 +180,7 @@ WITH dict AS (
 l1kind AS (
   SELECT l1 ->> 'code' AS code, l1 ->> 'energyKind' AS kind FROM dict
 )
-SELECT d.name, t1.v AS 品种, dt.v AS 一级类型, k.kind AS 字典里的品种
+SELECT d.name, t1.str_v AS 品种, dt.str_v AS 一级类型, k.kind AS 字典里的品种
 FROM device d
 JOIN attribute_kv t1 ON t1.entity_id=d.id AND t1.attribute_type=2
      AND t1.attribute_key=(SELECT key_id FROM key_dictionary WHERE key='type1')
@@ -616,7 +629,193 @@ ORDER BY lv.long_v DESC NULLS LAST;
 
 ---
 
-## 9. 一键体检
+
+---
+
+## 8.5 按功能对照查（页面数字从哪来）
+
+每个功能页读的东西不同。**页面数字不对时，先用这张表定位该查哪**。
+
+| 功能页 | 主要读 | 关键点 |
+| --- | --- | --- |
+| 能耗概览 | 资产 `energy_total` / `energy_day` | 跨场站概览，顶栏无场站选择器 |
+| 实时能耗 | 设备 `energy` / `power_total` | 走查询设置的设备树 |
+| 历史能耗 | 设备 `energy_reading` 差分 | 单相表只有 A 相 |
+| 分项能耗 | 分项资产各品种 `*_total` | 选电能时水/气/汽/热为空，正常 |
+| 区域能耗 | 区域资产各品种 `*_total` | 同一台表挂两个区域会双算 |
+| 峰谷分析 | 设备 `energy_reading` 按小时切片 | 与台账口径不同，不是 bug |
+| 用能账单 | `billing` / `billing_detail` | 金额 = 电度 + 基本 + 力调 + 其他 |
+| 抄表台账 | `billing_detail` 或 `energy_reading` 区间差 | 「用量来源」列说明用的是哪种 |
+| 电能质量 | 设备 `voltage_thd_*` / `unbalance` / `flicker_*` | 逐桶判极值，不用均值 |
+| 告警事件 | `alarm` 表 | 只读未清除的（`clear_ts IS NULL`） |
+
+### 口径提示（对不上时先看这三条）
+
+| 差异 | 原因 |
+| --- | --- |
+| 峰谷合计 ≠ 台账用量 | 峰谷按「时段切片」，台账按「抄表周期」，边界不同 |
+| 分项合计 > 场站总量 | 有表挂了两个分项，重复计 |
+| 场站总量 = 分项合计 × 2 | 总表与分表都被当成根，`parentDeviceId` 没配 |
+
+### 一张表看清「每个页面读什么键」
+
+```sql
+-- 某客户下所有资产，各自有哪些品种的汇总键、多少点
+SELECT a.type AS 资产类型, a.name AS 资产,
+       kd.key,
+       count(*) AS 点数,
+       round(sum(t.dbl_v)::numeric, 2) AS 合计,
+       to_timestamp(max(t.ts)/1000) AS 最新
+FROM ts_kv t
+JOIN key_dictionary kd ON kd.key_id = t.key
+JOIN asset a ON a.id = t.entity_id
+WHERE a.customer_id = '<客户id>'
+  -- ★ 括号不能省：AND 优先级高于 OR，写成
+  --   `customer_id = X AND key LIKE ... OR key = 'energy_day'`
+  --   后半段会返回**所有客户**的 energy_day（能跑、不报错、结果错）。
+  -- 另：LIKE 里的 `_` 是通配符，要匹配字面下划线必须转义。
+  AND (kd.key LIKE '%\_total' ESCAPE '\' OR kd.key = 'energy_day')
+GROUP BY 1, 2, 3
+ORDER BY 1, 2, 3;
+```
+
+**判据**：场站有电/水/气三项、分项有对应品种项、区域有对应品种项 ——
+三者对得上才说明汇总完整。
+
+---
+
+## 9. 表结构与空间
+
+### 9.1 哪些表在长
+
+```sql
+-- 按表大小排序（找出真正占盘的）
+SELECT c.relname AS 表,
+       pg_size_pretty(pg_total_relation_size(c.oid)) AS 总大小,
+       pg_size_pretty(pg_relation_size(c.oid))       AS 表本体,
+       coalesce(st.n_live_tup, 0)                    AS 行数
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_stat_user_tables st ON st.relid = c.oid
+WHERE n.nspname = 'public' AND c.relkind = 'r'
+ORDER BY pg_total_relation_size(c.oid) DESC
+LIMIT 20;
+```
+
+**99% 的情况 `ts_kv` 占绝大部分**。它是分区表：
+
+```sql
+-- 看分区与各自大小
+SELECT child.relname AS 分区,
+       pg_size_pretty(pg_total_relation_size(child.oid)) AS 大小
+FROM pg_inherits
+JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+JOIN pg_class child  ON pg_inherits.inhrelid  = child.oid
+WHERE parent.relname = 'ts_kv'
+ORDER BY pg_total_relation_size(child.oid) DESC
+LIMIT 12;
+```
+
+### 9.2 两张「键名字典」不要搞混
+
+| 表 | 管什么 | 谁写 |
+| --- | --- | --- |
+| `key_dictionary` | **属性**键名（`type1`、`meterLevel`…） | 属性写入时 |
+| `ts_kv_dictionary` | **遥测**键名（`energy`、`voltage_a`…） | 遥测写入时 |
+
+查属性用前者，查遥测用后者。**用错了会得到空结果，但不报错。**
+
+### 9.3 删数据的正确姿势
+
+```sql
+-- ✅ 按条件删（走索引，安全）
+DELETE FROM ts_kv
+WHERE entity_id = '<设备id>'
+  -- ★ 必须先把 now() 转 bigint 再减：epoch 是 numeric，
+  --   写 (extract(...) * 1000)::bigint - 90*86400000 会先算整型乘法再相减，
+  --   在 32 位整型下溢出（实测 integer out of range）。
+  AND ts < ((extract(epoch from now()) * 1000)::bigint - 7776000000);
+
+-- ❌ 绝不 DROP 分区来"清理"
+--    一个分区里混着所有客户的数据，DROP 会跨客户删
+```
+
+删完回收空间：
+
+```sql
+VACUUM (VERBOSE, ANALYZE) ts_kv;
+-- 分区表要对父表执行，PG 会递归
+```
+
+> **`ts_kv` 没有 `VACUUM FULL` 的必要**（会长时间锁表），
+> 空间由 autovacuum 逐步回收。
+
+### 9.4 索引现状
+
+```sql
+SELECT indexname, indexdef FROM pg_indexes
+WHERE tablename = 'ts_kv' AND schemaname = 'public';
+```
+
+正常应有 `(entity_id, key, ts)` 相关索引。**查遥测按 `entity_id + key + ts`
+范围**是最常见的访问模式，缺索引会让看板加载从秒级变成分钟级。
+
+---
+
+## 10. 备份与恢复
+
+### 10.1 只备份结构（换机器重装用）
+
+```bash
+docker exec energy-postgres pg_dump -U postgres -d thingsboard \
+  --schema-only > backup/schema-$(date +%m%d).sql
+```
+
+### 10.2 备份实体，不含遥测（最常用）
+
+遥测通常占 95% 以上，**只备份实体能秒级完成**：
+
+```bash
+docker exec energy-postgres pg_dump -U postgres -d thingsboard \
+  -t tenant -t customer -t asset -t device -t device_profile -t asset_profile \
+  -t relation -t attribute_kv -t key_dictionary \
+  -t dashboard -t widget_type -t widgets_bundle -t custom_menu \
+  -t tb_user -t user_credentials \
+  -t rate_template -t tou_scheme -t calculated_field \
+  > backup/entities-$(date +%m%d-%H%M).sql
+```
+
+### 10.3 全量备份（含遥测）
+
+```bash
+docker exec energy-postgres pg_dump -U postgres -d thingsboard -Fc \
+  > backup/full-$(date +%m%d).dump
+
+# 恢复
+docker exec -i energy-postgres pg_restore -U postgres -d thingsboard \
+  --clean --if-exists < backup/full-1102.dump
+```
+
+> `-Fc`（自定义格式）比纯 SQL 小、能并行恢复。**大库一律用 `-Fc`。**
+
+### 10.4 单个客户迁移
+
+```bash
+# ① 导出该客户的全部实体（把 <cid> 换成客户 uuid）
+docker exec energy-postgres pg_dump -U postgres -d thingsboard \
+  --column-inserts \
+  -t customer -t asset -t device -t relation -t attribute_kv -t dashboard \
+  --where="customer_id = '<cid>'" > backup/customer-<cid>.sql
+
+# ② 遥测单独导（按 entity_id 过滤，pg_dump 不支持 where 时用 COPY）
+```
+
+**注意**：`pg_dump --where` 只对部分表有效，
+复杂场景推荐用 `09-onboard-customer.sh` 重新建一遍 + 只迁遥测。
+
+---
+
+## 11. 一键体检
 
 不想逐条跑，用脚本（只读，不改数据）：
 
@@ -629,7 +828,7 @@ bash scripts/29-rtu-demo-up.sh --check
 
 ---
 
-## 10. 排查顺序（别跳步）
+## 12. 排查顺序（别跳步）
 
 页面显示「没有数据」时，**从上游往下查**，跳步会白查：
 
@@ -649,34 +848,16 @@ bash scripts/29-rtu-demo-up.sh --check
 
 ---
 
-## 11. 已知偏差（截至 2026-11-02）
+## 13. 已知偏差（截至 2026-11-02）
 
-如实记录，不粉饰。下面这些**当前确实是这个状态**，排查时别当成自己的错。
+如实记录，不粉饰。排查时别当成自己的错。
 
-### 11.1 单相园区的资产汇总为 0
+### 13.1 `repair-init` 会重建 10 台演示设备
 
-```
-三相园区·平台演示中心 | energy_total=0.649  energy_day=2281.5   ✓
-单相园区·平台演示中心 | energy_total=0.000  energy_day=0.0      ✗
-```
-
-单相园区下**确实有数据**（`WaterMeter-SIM` 当日 19.6、`GasMeter-SIM` 5.8，
-加上真实的 `PowerMeter-DDSU666`），但 `seedAssetTotals` 没给它写汇总。
-
-**排查入口**：用 §5.2 查单相园区的设备层级 —— 那几台都是 `level=2`，
-而三相园区有一台 `level=1` 的进线总表。怀疑汇总逻辑在「没有 level=1 时」
-的取数分支上有问题。
-
-**影响范围**：单相园区的场站看板显示 0；设备级数据、抄表、参数报表都不受影响。
-
-**临时规避**：给单相园区加一台 `meterLevel=1` 的表，或者在事件里按设备维度看。
-
-### 11.2 `repair-init` 会重建 10 台演示设备
-
-见 `/admin/rtu-demo-env` 第五节。演示前别点「一键修复初始化」，
+见 [⑦ 设备接入 · 演示环境](/admin/device-access#演示环境无真实设备时)。演示前别点「一键修复初始化」，
 误点了跑 `30-rtu-env-init.py --prune`。
 
-### 11.3 两个客户共用一套真实 RTU 设备
+### 13.2 两个客户共用一套真实 RTU 设备
 
 `PowerMeter-DDSU666` / `Sensor-HZ8706` / `Relay-8CH` 的名字写死在板子
 `main.py` 里，全局只有一套，只属于主演示客户「平台演示中心」。

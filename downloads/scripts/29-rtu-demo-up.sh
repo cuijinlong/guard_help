@@ -114,7 +114,7 @@ fi
 KEYS=$(curl -s --noproxy '*' -m 30 -H "X-Authorization: Bearer ${TOKEN}" \
   "$BASE/api/energy/core-dictionaries" \
   | "$PY" -c 'import sys,json;d=json.load(sys.stdin);print(len(d.get("standardKeys") or []))' 2>/dev/null)
-ok "标准 key ${KEYS:-?} 个（含电能质量 62 个）"
+ok "标准 key ${KEYS:-?} 个（电能 122 项，按 tier 分级；详见手册"电能质量覆盖"一节）"
 
 if [[ $SIM_ONLY == 1 || $CHECK_ONLY == 1 ]]; then
   if [[ $CHECK_ONLY == 1 ]]; then
