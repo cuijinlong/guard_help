@@ -79,6 +79,16 @@
           "file": "admin/04-device-access.md"
         },
         {
+          "id": "rtu-demo-env",
+          "title": "④b RTU 演示环境（双网关/全品种/电能质量）",
+          "file": "admin/10-rtu-demo-env.md"
+        },
+        {
+          "id": "data-verify-sql",
+          "title": "④c 数据验证 SQL（排查数据对不对）",
+          "file": "admin/11-data-verify-sql.md"
+        },
+        {
           "id": "troubleshoot",
           "title": "⑤ 常见问题",
           "file": "admin/05-troubleshoot.md"
