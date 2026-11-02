@@ -161,6 +161,19 @@ def count_verify_items(_repo) -> int:
     return int(m.group(1))
 
 
+def count_deploy_widgets(_repo) -> int:
+    """
+    部署物料里的部件 JSON 文件数。
+
+    <p>为什么以**文件数**为准，而不是 install 后 DB 里的行数：
+    后者混了 TB 内置部件，没法从代码精确算；文件数才是我们真正交付的东西。
+    手册验收写「系统部件 743 个」是 DB 行数，这里对应的是 583 个文件 ——
+    两者都要在手册里写清楚，别拿一个数去验另一件事。
+    """
+    return len(list((REPO / 'guard-server' / 'src' / 'main' / 'data'
+                     / 'json' / 'system' / 'widget_types').glob('*.json')))
+
+
 def count_dashboards(_repo) -> int:
     return len(list(DASHBOARDS.glob('*.json')))
 
@@ -265,8 +278,58 @@ CHECKS = [
         ('03-init.md', r'\| 客户菜单 \| 建客户时自动 \| (\d+) 个顶层项'),
         ('02-deploy.md', r'\| 客户菜单 \| (\d+) 个顶层项 \|'),
     ]),
+    Check('deploy_widgets', '部署物料部件文件数', count_deploy_widgets, [
+        ('10-rtu-demo-env.md', r'交付的部件文件 \| (\d+) 个'),
+    ]),
 ]
 
+
+
+def check_script_refs() -> list[str]:
+    """
+    手册里引用的脚本文件必须真实存在。
+
+    <p>为什么需要（2026-11-02 实测踩过）：admin/10 的部署清单原本写
+    `bash scripts/02-deploy.sh`，实际脚本叫 `docker-00-prepare.sh` ——
+    客户照着敲就是「No such file or directory」。
+
+    <p>改脚本名、删脚本、脚本挪目录，都必须同步改手册。
+    这个检查把「忘改」变成提交前就能看到的红字。
+
+    <p>只查 `scripts/<文件名>.<sh|py>` 这种带目录前缀的引用 ——
+    裸文件名（如 `main.py`）歧义太大，容易误报。
+    """
+    import os
+    import re
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    content = os.path.join(here, 'content')
+    scripts_dir = os.path.join(here, 'downloads', 'scripts')
+    deploy_dir = os.path.join(here, 'downloads', 'deploy')
+
+    def known(name: str) -> bool:
+        return (os.path.exists(os.path.join(scripts_dir, name))
+                or os.path.exists(os.path.join(deploy_dir, name)))
+
+    pat = re.compile(r'scripts/([A-Za-z0-9._\-]+\.(?:sh|py))')
+    errs: list[str] = []
+    seen: set[str] = set()
+    for root, _dirs, files in os.walk(content):
+        for fn in files:
+            if not fn.endswith('.md'):
+                continue
+            path = os.path.join(root, fn)
+            rel = os.path.relpath(path, content)
+            with open(path, encoding='utf-8') as f:
+                for lineno, line in enumerate(f, 1):
+                    for m in pat.finditer(line):
+                        name = m.group(1)
+                        if (rel, name) in seen:
+                            continue
+                        seen.add((rel, name))
+                        if not known(name):
+                            errs.append(f'{rel}:L{lineno} 引用了不存在的脚本 scripts/{name}')
+    return errs
 
 
 def check_troubleshoot_numbering() -> list[str]:
@@ -557,6 +620,17 @@ def main() -> int:
         print('  改编号（新章节用未占用的字母）后重跑。')
     else:
         print('\n✓ 故障手册章节编号唯一')
+
+    # ---------------- 手册引用的脚本必须存在 ----------------
+    script_errors = check_script_refs()
+    if script_errors:
+        failed += len(script_errors)
+        print(f'\n✗ 手册引用了 {len(script_errors)} 个不存在的脚本：')
+        for e in script_errors:
+            print(f'    · {e}')
+        print('  改脚本名/删脚本后，手册里的路径必须同步。')
+    else:
+        print('✓ 手册引用的脚本全部存在')
 
     if failed:
         print(f'\n✗ {failed} 项不一致 —— 改代码后要同步手册：')

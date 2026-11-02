@@ -49,6 +49,15 @@ bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
 
 **做了什么**：在 `~/energy-app` 备好全部文件，并生成 `.env`（数据库密码随机）。
 
+> **sql 与 Cassandra 建表脚本的源已改到 `guard-server/src/main/data/`**
+> （2026-11-02 移植，8 个 sql + 3 个 cql，与 `dao/` 逐字节一致）。
+> 此前 `data/sql` 是指向 `dao/` 的符号链接，dao 模块清理后就会断链，
+> install 直接报 `NoSuchFileException: schema-entities.sql`。
+> 想确认依赖已切断，跑这条 —— 输出为空就是干净的：
+> ```bash
+> grep -n "dao/src" shiyongshouce/downloads/deploy/docker-00-prepare.sh
+> ```
+
 **验证**：
 
 ```bash

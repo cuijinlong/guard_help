@@ -196,7 +196,9 @@ if [[ -d "$DATA_SRC_DIR" && -d "$DATA_DST_DIR" ]]; then
   # 3c-2. jar 里必须有 sql/schema-views.sql 与 sql/schema-functions.sql
   #
   # 为什么必须查：guard-server 是自带 DAO 源码的单体，不依赖 dao 模块，
-  # 所以 dao/src/main/resources/sql 不会自动进 jar。
+  # 所以 sql/*.sql 不会**自动**从源码目录进 jar —— 必须已在
+  # guard-server/src/main/resources/sql/ 里有一份（2026-11-02 已就位）。
+  # 部署物料用的那份在 guard-server/src/main/data/sql/（外部目录）。
   # 升级时 SystemPatchApplier 要读这两个文件来刷新视图/函数，
   # 缺了会抛 IllegalArgumentException: resource sql/schema-views.sql not found，
   # **整个系统补丁步骤失败** —— 部件更新也不会生效，且只在升级那一刻才暴露。
@@ -217,12 +219,15 @@ if [[ -d "$DATA_SRC_DIR" && -d "$DATA_DST_DIR" ]]; then
       ok "jar 含升级所需 SQL（schema-views / schema-functions）"
     else
       bad "jar 缺升级 SQL：${MISSING_SQL}" \
-          "把 dao/src/main/resources/sql/*.sql 拷到 guard-server/src/main/resources/sql/ 再打包"
+          "把 guard-server/src/main/data/sql/*.sql 拷到 guard-server/src/main/resources/sql/ 再打包"
     fi
   fi
 
   # SQL schema 与 Cassandra CQL：install 建库直接读它们
-  for pair in "dao/src/main/resources/sql:data/sql" "dao/src/main/resources/cassandra:data/cassandra"; do
+  # ★ 源目录改用 guard-server/src/main/data（2026-11-02 移植）：
+  #   原来是 dao/src/main/resources/*，dao 模块清理后这条检查会静默 continue，
+  #   等于永远不报问题 —— 比报错更危险。
+  for pair in "guard-server/src/main/data/sql:data/sql" "guard-server/src/main/data/cassandra:data/cassandra"; do
     S="$ROOT/${pair%%:*}"
     D="$APP_HOME/${pair##*:}"
     [[ -d "$S" ]] || continue

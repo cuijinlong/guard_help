@@ -475,8 +475,11 @@ def main():
         n = backfill(args.base, token, sims, args.backfill_days, args.dry_run,
                      args.reading_only)
         print('  回填 %d 个数据点%s' % (n, '（dry-run）' if args.dry_run else ''))
-        if args.once:
-            return 0
+        # ★ 不在这里 return（2026-11-02 修）：
+        #   `--once` 的语义是「发一轮实时数据」，回填是另一件事。
+        #   旧写法回填完直接 return 0，于是 `--once --backfill-days N`
+        #   只回填、不发当前点 —— 而 29 一键部署正是这个组合，
+        #   结果是部署完少了最后一轮实时数据。
 
     hours = args.hours if args.hours is not None else max(args.interval, 300) / 3600.0
     print('模拟设备 %d 台，本周期 %.4f 小时' % (len(sims), hours))

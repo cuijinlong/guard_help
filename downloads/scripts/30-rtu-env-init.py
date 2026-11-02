@@ -45,6 +45,7 @@ python3 scripts/30-rtu-env-init.py --base http://127.0.0.1:8090 \\
 import argparse
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -365,7 +366,7 @@ class Api:
         self.token = r['token']
         return self
 
-    def call(self, method, path, body=None, auth=True):
+    def call(self, method, path, body=None, auth=True, timeout=90):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self.base + path, data=data, method=method)
         if auth and self.token:
@@ -373,7 +374,7 @@ class Api:
         if data:
             req.add_header('Content-Type', 'application/json')
         try:
-            with urllib.request.urlopen(req, timeout=90) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 txt = resp.read().decode().strip()
                 if not txt:
                     return resp.status, {}
@@ -386,24 +387,54 @@ class Api:
                 return resp.status, txt
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode()[:300]
+        except (TimeoutError, urllib.error.URLError, ConnectionError, OSError) as e:
+            '''
+            传输层失败返回 0，不抛异常。
+
+            ★ 为什么（2026-11-02 干净库实测）：新建客户会**触发后端异步跑一整套
+              演示数据初始化**（2 场站 / 12 分项 / 21 设备 + 一批遥测），
+              期间 Tomcat 线程被占满，紧接着的查询排队超时（报 `timed out`）。
+              旧代码只捕 HTTPError，超时会直接往上抛，于是「客户建成功了脚本却报失败」
+              —— 干净环境首次部署必现。
+            0 是传输层信号，调用方（paged / ensure_customer）据此重试。
+            '''
+            return 0, '%s: %s' % (type(e).__name__, e)
 
     def get(self, path):
         return self.call('GET', path)[1]
 
-    def post(self, path, body):
+    def post(self, path, body, timeout=90):
+        """发 POST；dry-run 不写库。
+
+        <p>★ timeout 必须可调（2026-11-02 干净库实测）：`POST /api/customer` 在后端是
+        **同步**跑完整套演示数据初始化的（4 个维度根 / 2 个场站 /
+        12 个分项 / 21 台设备 / 一批遥测 + 费率），实测 60~120s。
+        90s 不够 → 客户已经建好了脚本却报 `timed out`，
+        干净环境首次部署必翻车。默认值不动，只有客户创建这类
+        重请求单独放宽。
+        """
         if self.dry:
             self.writes += 1
             return 200, {}   # dry-run: 不写库
-        code, r = self.call('POST', path, body)
+        code, r = self.call('POST', path, body, timeout=timeout)
         if code not in (200, 201, 204):
             raise RuntimeError('POST %s → %s %s' % (path, code, r))
         return code, r
 
-    def paged(self, path):
+    def paged(self, path, retries=3, retry_wait=4):
+        """翻页取全部。传输层失败（相对 0）会重试 —— 后端初始化期间会短暂排队。"""
         out, page = [], 0
         while True:
             sep = '&' if '?' in path else '?'
-            d = self.get('%s%spageSize=500&page=%d' % (path, sep, page))
+            url = '%s%spageSize=500&page=%d' % (path, sep, page)
+            d = None
+            for attempt in range(retries + 1):
+                code, resp = self.call('GET', url, timeout=120)
+                if code != 0:
+                    d = resp
+                    break
+                if attempt < retries:
+                    time.sleep(retry_wait)
             if not isinstance(d, dict):
                 break
             out.extend(d.get('data') or [])
@@ -731,6 +762,39 @@ def prune(api, log, dry, customer_id, customer_name):
 # 包干到底的三步：客户 → 维度 → 设备
 # ================================================================
 
+def wait_customer_ready(api, customer_id, log, max_wait=240):
+    """等后端把「新建客户」触发的异步演示数据落完。
+
+    <p>★ 为什么必须等（2026-11-02 干净库实测，首次部署必现）：
+
+    TB 在客户创建后会**自动**跑 createDimensionRoots + createDemoPackage ——
+    2 个场站 / 12 个分项 / 21 台设备 / 一批 built-in 遥测。这段时间里 Tomcat
+    线程被占满，紧接着的任何查询都会排队超时，脚本报 `timed out`，
+    但客户其实已经建成功了 —— 于是后面所有步骤全部中断，而调用方
+    还可能以为「跑完了」。
+
+    <p>判据：客户名下资产数**连续两次采样不变**。没有资产的客户视为已就绪。
+    """
+    last, stable, waited = -1, 0, 0
+    while waited < max_wait:
+        code, d = api.call('GET', '/api/customer/%s/assets?pageSize=1&page=0' % customer_id,
+                           timeout=120)
+        total = d.get('totalElements') if isinstance(d, dict) else None
+        if total is not None:
+            if total == last:
+                stable += 1
+                if stable >= 2:
+                    log('  ✓ 后端初始化已完成（%s 个资产）' % total)
+                    return total
+            else:
+                stable = 0
+                last = total
+        time.sleep(4)
+        waited += 4
+    log('  ! 等后端初始化超时（%ss，停在 %s 个资产），继续执行' % (max_wait, last))
+    return last
+
+
 def ensure_customer(api, name, log):
     """客户不存在就建。返回 (customer, 是否新建)。
 
@@ -743,12 +807,16 @@ def ensure_customer(api, name, log):
     if api.dry:
         log('  + 客户「%s」将新建' % name)
         return {'id': {'id': 'dry-customer'}, 'title': name}, True
-    api.post('/api/customer', {'title': name, 'country': 'CN'})
+    # ★ 长超时：客户创建会同步跑整套演示数据初始化（60~120s），
+    #   90s 默认值下客户已建好、脚本却报超时。
+    api.post('/api/customer', {'title': name, 'country': 'CN'}, timeout=600)
+    # 建完立刻查会撞上后端异步初始化（见 wait_customer_ready 的说明）
     for c in api.paged('/api/customers'):
         if c.get('title') == name:
             log('  + 客户「%s」已建' % name)
+            wait_customer_ready(api, c['id']['id'], log)
             return c, True
-    raise RuntimeError('客户「%s」创建后仍查不到' % name)
+    raise RuntimeError('客户「%s」创建后仍查不到（后端可能仍在初始化，稍后重跑即可）' % name)
 
 
 def assign_owner(api, entity_type, entity_id, customer_id, log):

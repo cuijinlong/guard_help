@@ -22,12 +22,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 DATA_SRC="$ROOT/guard-server/src/main/data"
-SQL_SRC="$ROOT/dao/src/main/resources/sql"
+# ★ 开始目录必须在 guard-server 自己里，不能指向 dao（2026-11-02 客户要求）：
+#   「把源码的 sql 文件移植到 guard-server 中，未来源码 java 会删除掉」
+#   dao 模块删了之后，这里指过去就是 NoSuchFileException —— install 直接失败。
+#   两份文件已于 2026-11-02 实体化进 guard-server，与本脚本同仓共存。
+SQL_SRC="$ROOT/guard-server/src/main/data/sql"
 # Cassandra 的建表 CQL（可选后端）。install 会从 ${install.data_dir}/cassandra/ 读，
 # 少了这个目录、又把 DATABASE_TS_TYPE 改成 cassandra 时，install 直接崩：
 #   java.nio.file.NoSuchFileException: /opt/energy/data/cassandra/schema-keyspace.cql
 # 实测 2026-10-22：打包漏了这个目录，切 Cassandra 一直失败。
-CQL_SRC="$ROOT/dao/src/main/resources/cassandra"
+CQL_SRC="$ROOT/guard-server/src/main/data/cassandra"
 JAR="$ROOT/guard-server/target/guard-server-4.4.0.jar"
 
 TARGET=""
@@ -131,8 +135,9 @@ mkdir -p "$STAGE/data/sql" "$STAGE/data/cassandra" "$STAGE/logs" "$STAGE/scripts
 
 cp "$JAR" "$STAGE/guard-server-4.4.0.jar"
 cp -R "$DATA_SRC/json" "$STAGE/data/"
-# 仓库里 data/sql 是符号链接，必须从 dao 的真实目录拷贝
-cp "$SQL_SRC"/*.sql "$STAGE/data/sql/"
+# data/sql 与 data/cassandra 都已实体化进 guard-server/src/main/data，直接拷即可
+# （2026-11-02 之前 sql 是指向 dao 的符号链接，只能从 dao 拷真实文件）
+cp -R "$DATA_SRC/sql/." "$STAGE/data/sql/"
 # Cassandra 建表脚本（schema-keyspace / schema-ts / schema-ts-latest）。
 # 不用 Cassandra 时这几个文件是死重量（<2KB），但漏了就无法启用，宁可带上。
 cp "$CQL_SRC"/*.cql "$STAGE/data/cassandra/" 2>/dev/null || true
