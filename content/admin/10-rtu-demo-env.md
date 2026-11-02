@@ -35,21 +35,22 @@ python3 scripts/31-rtu-simulate.py --interval 30
 ## 二、建出来的拓扑
 
 ```
-单相园区·平台演示中心
+单相园区·平台演示中心（办公园区）
 └─ ED1-Gateway          真实 RTU（HaaS506-ED1 板子）
-   ├─ PowerMeter-DDSU666   单相电表（正泰 DDSU666）
-   ├─ Sensor-HZ8706        温湿度传感器
-   └─ Relay-8CH            8 路继电器        ← 可控设备
+   ├─ PowerMeter-DDSU666   单相电表（正泰 DDSU666，真实）      → 插座分项 · 公共区域
+   ├─ Sensor-HZ8706        温湿度传感器（真实，env）           → 公共区域
+   └─ Relay-8CH            8 路继电器（真实）            ← 可控 → A栋办公区
+   ＋ PowerMeter-1P-SIM    单相模拟表（照明总表）              → 照明分项 · 公共区域
+   ＋ WaterMeter-SIM       水表（模拟）                        → 给排水分项 · 公共区域
+   ＋ GasMeter-SIM         燃气表（模拟）                      → 炊事分项 · 食堂区域
 
-三相园区·平台演示中心
+三相园区·平台演示中心（生产园区）
 └─ ED2-Gateway          模拟（脚本发数据）
-   ├─ PowerMeter-3P-SIM    三相电表 3P4W     ← 电能质量全场景（49 个测点）
-   ├─ WaterMeter-SIM       水表
-   ├─ GasMeter-SIM         燃气表
-   ├─ SteamMeter-SIM       蒸汽表
-   ├─ HeatMeter-SIM        热力表
-   ├─ AHU-SIM              新风机组          ← 可控设备
-   └─ Breaker-SIM          智能空开          ← 可控设备
+   ├─ PowerMeter-3P-SIM    三相电表 3P4W  ← 电能质量全场景    → 生产车间区域
+   ├─ SteamMeter-SIM       蒸汽表                              → 蒸汽分项 · 锅炉房
+   ├─ HeatMeter-SIM        热力表                              → 锅炉分项 · 锅炉房
+   ├─ AHU-SIM              新风机组（env）              ← 可控 → 办公区
+   └─ Breaker-SIM          智能空开（带计量）            ← 可控 → 动力分项 · 生产车间
 ```
 
 **真实设备与模拟设备分属两个网关、两个场站** —— 客户看到的两个园区都有数据，
@@ -57,6 +58,22 @@ python3 scripts/31-rtu-simulate.py --interval 30
 
 > 一块 RTU 板子只能当一个网关（`main.py` 里的 `GATEWAY_NAME` 写死一个）。
 > 第二个网关的模拟数据由 `31-rtu-simulate.py` 在服务器侧发出，不需要第二块板子。
+
+### ⚠ 归属关系是看板能出数的前提
+
+设备上写 `additionalInfo.siteId` **只够归档，不够出数**。三个能耗看板都靠**关系**遍历：
+
+| 关系 | 用途 |
+| --- | --- |
+| 场站 `--SiteContains-->` 设备 | 「设备属于哪个场站」的**唯一**依据 |
+| 区域 / 分项 `--Contains-->` 设备 | 区域能耗 / 分项能耗按节点取数 |
+| 网关 `--Contains-->` 设备 | 设备树、RPC 路由 |
+
+`30-rtu-env-init.py` 的 **第 ⑩ 步**会把这三类关系全部补齐，**并清掉不属于当前映射的旧边**
+（历史演示数据给同一台表挂过两个区域，会双算）。所以：
+
+- 任何时候只要改了设备、场站、区域/分项，**重跑一次 `30-` 脚本**即可，不用碰 Java
+- 跑完必须 `POST /api/energy/asset-totals/rebuild`，否则资产上的 `energy_total` 还是旧值
 
 ---
 

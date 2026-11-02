@@ -115,6 +115,8 @@ class Sim:
 
         if self.kind == 'elec3':
             return self._elec3(f, hours)
+        if self.kind == 'elec1':
+            return self._elec1(f, hours)
         if self.kind == 'water':
             return self._utility(f, hours, 0.35, 'm3')
         if self.kind == 'gas':
@@ -126,7 +128,7 @@ class Sim:
         if self.kind == 'ahu':
             return self._ahu(f)
         if self.kind == 'breaker':
-            return self._breaker(f)
+            return self._breaker(f, hours)
         return {}
 
     # ---- 三相电表：含电能质量全场景 ----
@@ -203,6 +205,30 @@ class Sim:
             out['current_harmonic_%d' % hk] = round(random.uniform(0.5, scale * 3), 2)
         return out
 
+    # ---- 单相电表 ----
+    def _elec1(self, f, hours):
+        power = round(12 * f * random.uniform(0.92, 1.08), 2)      # kW
+        energy = round(power * hours, 4)
+        if energy <= 0:
+            energy = round(random.uniform(0.0002, 0.001), 4)
+        if self.reading is None:
+            self.reading = round(random.uniform(3000, 5000), 3)
+        self.reading = round(self.reading + energy, 3)
+        v = round(random.uniform(219.0, 231.0), 2)
+        pf = round(random.uniform(0.90, 0.98), 3)
+        return {
+            'energy': energy,
+            'energy_reading': self.reading,
+            'power_total': power,
+            'power_factor_total': pf,
+            'frequency': round(random.uniform(49.96, 50.04), 2),
+            'voltage_a': v,
+            'current_a': round(power * 1000 / v / pf, 2),
+            'voltage_deviation_a': round((v - 220) / 220 * 100, 2),
+            'voltage_thd_a': round(random.uniform(1.2, 3.6), 2),
+            'current_thd_a': round(random.uniform(3.0, 11.0), 2),
+        }
+
     # ---- 水 / 气 / 汽 ----
     def _utility(self, f, hours, base_flow, unit, pressure=False, temp_pressure=False):
         flow = round(base_flow * f * random.uniform(0.9, 1.1), 3)
@@ -240,20 +266,40 @@ class Sim:
         }
 
     # ---- 新风机组（可控）----
+    #
+    # ★ 不要把「运行模式」写进 power（2026-11-02 实测）：
+    #   power 是全平台通用的有功功率键，所有「分项/场站功率」都按它求和；
+    #   把 0/1/2 的模式码写进去，会把风机模式算成几 kW 的假负荷。
+    #   模式走独立键 run_mode，power 给真正的风机有功。
     def _ahu(self, f):
         return {
             'temperature': round(22 + random.uniform(-2, 3), 1),
             'humidity': round(48 + random.uniform(-8, 8), 1),
-            'power': 1,          # 运行模式：1=自动
+            'run_mode': 1,                      # 1=自动
+            'power': round(1.5 * f * random.uniform(0.9, 1.1), 2),
             'frequency': round(35 + f * 10 + random.uniform(-2, 2), 1),
         }
 
-    # ---- 智能空开（可控）----
-    def _breaker(self, f):
+    # ---- 智能空开（可控，带计量）----
+    #
+    # ★ 开关次数绝不能写进 energy（2026-11-02 实测）：
+    #   energy 是增量电量，动力分项曾把开关次数当电量加成 31272 kW·h。
+    #   次数走 switch_count，分合闸走 switch_state。
+    def _breaker(self, f, hours):
+        power = round(3.2 * f * random.uniform(0.9, 1.1), 2)      # kW
+        energy = round(power * hours, 4)
+        if energy <= 0:
+            energy = round(random.uniform(0.0002, 0.001), 4)
+        if self.reading is None:
+            self.reading = round(random.uniform(500, 900), 3)
+        self.reading = round(self.reading + energy, 3)
         return {
-            'power': 1,          # 1=合闸
-            'energy': round(random.uniform(0, 0.01), 4),
-            'current_a': round(12 * f * random.uniform(0.9, 1.1), 2),
+            'switch_state': 1,
+            'switch_count': 12,
+            'power': power,
+            'energy': energy,
+            'energy_reading': self.reading,
+            'current_a': round(power * 1000 / (380 * 1.732) , 2),
         }
 
 
@@ -261,6 +307,8 @@ class Sim:
 def classify(name, profile):
     if name.startswith('PowerMeter-3P'):
         return 'elec3'
+    if name.startswith('PowerMeter-1P'):
+        return 'elec1'
     if 'Water' in name:
         return 'water'
     if 'Gas' in name:
@@ -276,8 +324,12 @@ def classify(name, profile):
     return None
 
 
-def push(base, token, sim, hours, dry):
+def push(base, token, sim, hours, dry, reading_only=False):
     payload = sim.payload(hours)
+    if reading_only:
+        # 去掉增量类键，只留累积量 —— 模拟现场仪表的能力边界
+        for k in ('energy',):
+            payload.pop(k, None)
     if dry:
         return payload
     code, body = api(base, '/api/plugins/telemetry/DEVICE/%s/timeseries/SERVER_SCOPE' % sim.id,
@@ -303,7 +355,7 @@ def latest_reading(base, token, dev_id, key='energy_reading'):
         return None
 
 
-def backfill(base, token, sims, days, dry):
+def backfill(base, token, sims, days, dry, reading_only=False):
     """回填历史遥测：每小时一个点，覆盖最近 N 天。
 
     <p>为什么需要：新初始化的环境只有刚才那几轮实时数据，
@@ -339,6 +391,13 @@ def backfill(base, token, sims, days, dry):
             for h in range(24):
                 ts = int((now - d * 86400 + h * 3600) * 1000)
                 payload = sim.payload(1.0)
+                if reading_only:
+                    # ★ 回填也必须遵守 --reading-only。
+                    #   之前只在 push() 里 pop，回填直接调 sim.payload()，
+                    #   结果「只报表底」的回填仍然写了 energy 键 ——
+                    #   验证「平台能否从表底差出用量」时，差分路径根本没被走到
+                    #   （实测 2026-11-02，白查了两轮）。
+                    payload.pop('energy', None)
                 points.append((ts, payload))
         if dry:
             total += len(points)
@@ -373,6 +432,10 @@ def main():
     ap.add_argument('--backfill-days', type=int, default=0,
                     help='回填最近 N 天的历史数据（每小时一个点）。'
                          '演示前跑一次，看板立刻有曲线，不用等数据攒够')
+    ap.add_argument('--reading-only', action='store_true',
+                    help='只上报累积表底（energy_reading），不报本周期增量（energy）。'
+                         '现场真实仪表就是这样 —— 平台必须能从表底差出用量。'
+                         '用于验证资产汇总的差分路径')
     ap.add_argument('--customer', default=None,
                     help='只给这个客户名下的模拟设备发数据（默认全部）。'
                          '多客户同租户时建议指定，避免一个客户的数据串到另一个')
@@ -409,7 +472,8 @@ def main():
     # 回填历史（演示前跑一次，让看板立刻有曲线）
     if args.backfill_days > 0:
         print('\n回填最近 %d 天历史（每小时一个点）…' % args.backfill_days)
-        n = backfill(args.base, token, sims, args.backfill_days, args.dry_run)
+        n = backfill(args.base, token, sims, args.backfill_days, args.dry_run,
+                     args.reading_only)
         print('  回填 %d 个数据点%s' % (n, '（dry-run）' if args.dry_run else ''))
         if args.once:
             return 0
@@ -426,7 +490,7 @@ def main():
         t0 = time.time()
         for s in sims:
             try:
-                payload = push(args.base, token, s, hours, args.dry_run)
+                payload = push(args.base, token, s, hours, args.dry_run, args.reading_only)
                 ok += 1
                 if args.dry_run or args.once or args.interval == 0:
                     keys = [k for k in payload if k in

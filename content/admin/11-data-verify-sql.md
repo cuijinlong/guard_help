@@ -418,6 +418,99 @@ ORDER BY 网关, 下游设备;
 
 ---
 
+### 6.1 场站 / 区域 / 分项归属（三个能耗看板的前提）
+
+**为什么单查这一条**：设备上的 `additionalInfo.siteId` 写得再对，看板也读不到 ——
+综合能耗 / 分项能耗 / 区域能耗全部靠**关系**遍历。关系缺了，页面只会说
+「当前筛选下没有可用计量点」，**不报错**。
+
+```sql
+-- 每台设备在哪个场站下（SiteContains），以及区域/分项分别挂到哪里
+SELECT d.name AS 设备,
+       (SELECT a.name FROM relation r JOIN asset a ON a.id = r.from_id
+         WHERE r.to_id = d.id AND r.to_type = 'DEVICE'
+           AND r.relation_type = 'SiteContains' LIMIT 1) AS 场站,
+       (SELECT string_agg(a.name, ' / ') FROM relation r JOIN asset a ON a.id = r.from_id
+         WHERE r.to_id = d.id AND r.to_type = 'DEVICE'
+           AND r.relation_type = 'Contains' AND a.type = '区域') AS 区域,
+       (SELECT string_agg(a.name, ' / ') FROM relation r JOIN asset a ON a.id = r.from_id
+         WHERE r.to_id = d.id AND r.to_type = 'DEVICE'
+           AND r.relation_type = 'Contains' AND a.type = '分项') AS 分项
+FROM device d
+WHERE d.customer_id = '<客户id>'
+ORDER BY 场站, 设备;
+```
+
+**正常**：每台计量设备都有 `场站`，且 `区域`/`分项` 各**最多一个**。
+
+| 现象 | 含义 | 处理 |
+| --- | --- | --- |
+| 场站 为空 | 看板里这台表根本不存在 | 重跑 `30-rtu-env-init.py` 第 ⑩ 步 |
+| 区域或分项 有 **两个** | 历史演示数据留了脏边，区域能耗双算 | 重跑 `30-` 脚本，它会自动清旧边 |
+
+---
+
+### 6.2 分项/区域是按品种分键写的，`energy_total` 只给电
+
+```sql
+SELECT a.type AS 类型, a.name AS 资产, kd.key AS 键, count(*) AS 点数,
+       round(sum(t.dbl_v)::numeric, 2) AS 合计
+FROM ts_kv t
+JOIN key_dictionary kd ON kd.key_id = t.key
+JOIN asset a ON a.id = t.entity_id
+WHERE t.ts > (extract(epoch from now()) * 1000)::bigint - 7 * 86400000
+  AND kd.key IN ('energy_total','energy_day','power_total',
+                 'water_total','gas_total','steam_total','heat_total')
+  AND a.customer_id = '<客户id>'
+GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+```
+
+**判据**：
+
+| 资产 | 应该有的键 |
+| --- | --- |
+| 装电表的场站/分项/区域 | `energy_total` + `energy_day` + `power_total` |
+| 只装水/气/汽/热表 | 对应品种键（`water_total` 等），**没有 `energy_total`** |
+| 维度容器（用能分项/用能区域根） | 子树的合计 |
+
+> 「分项能耗」选**电能**时，燃气/水/汽/热分项是空的 —— 这是**正确**的，不是没数据。
+> 切到对应品种才会出数。
+
+---
+
+### 6.3 哨兵读数：真实表底会突然变成 7777.7 / 8888.8
+
+```sql
+-- 找明显超出量程的表底（按现场实际量程改阈值）
+SELECT d.name AS 设备, to_timestamp(t.ts/1000) AS 时间, t.dbl_v AS 表底
+FROM ts_kv t
+JOIN key_dictionary kd ON kd.key_id = t.key
+JOIN device d ON d.id = t.entity_id
+WHERE kd.key = 'energy_reading' AND t.dbl_v > 100
+ORDER BY t.ts DESC LIMIT 20;
+```
+
+**实测**：DDSU666 在调试期上报过 `7777.7` 和 `8888.8`（正常值 8.37~8.47）。
+差分后插座分项变成 1111.2 kW·h，而实际负载只有 0.1 kW。
+
+清理后**必须重算汇总**，否则资产上的旧值还在：
+
+```sql
+-- ① 删掉哨兵读数（确认是垃圾再删）
+DELETE FROM ts_kv
+WHERE entity_id = '<设备id>'
+  AND key = (SELECT key_id FROM key_dictionary WHERE key = 'energy_reading')
+  AND dbl_v > 100;
+```
+
+```bash
+# ② 重算
+curl -X POST http://127.0.0.1:8090/api/energy/asset-totals/rebuild \
+  -H "X-Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}'
+```
+
+---
+
 ## 7. 档案：品种标注对不对
 
 ```sql

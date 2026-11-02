@@ -100,6 +100,8 @@ KIND_NAMES = {'elec': '电能', 'water': '水表', 'gas': '燃气',
 # 档案 → (品种, meterTypeCode, 排序, 是否计量, 说明)
 PROFILES = {
     '热力表': ('heat', 'heat_meter', 45, True, '热量表（热力）：供回水温度、热功率、累积热量'),
+    '智能空开': ('elec', 'smart_breaker', 35, True,
+              '带计量的智能断路器：分合闸、开关次数、有功功率与电量'),
     '温湿度变送器': ('env', 'th_sensor', 50, False, '温湿度采集（非计量器具，但参与环境监测与告警）'),
     '室内环境变送器': ('env', 'indoor_env', 55, False, '室内环境：温度、湿度、CO₂（非计量器具）'),
     '新风机组': ('env', 'ahu', 60, False, '组合式新风机组：送风温度、运行模式、风机频率'),
@@ -187,6 +189,25 @@ SIM_DEVICES = [
         'points': _pq_points(),
     },
     {
+        'name': 'PowerMeter-1P-SIM', 'meterLevel': 2,
+        'site': 'single', 'gw': 'single',
+        'profile': '单相电能表', 'model': 'DDSU666', 'brand': '正泰',
+        'type1': 'elec', 'type2': 'normal', 'l1': 'elec_meter',
+        'wiring': '1P2W',
+        'note': '模拟单相电表（1P2W）：真实 DDSU666 只报表底，'
+                '这台保证单相园区有可展示的电量曲线',
+        'points': [mp('U', 'voltage_a', 'A相电压', 'V'),
+                   mp('I', 'current_a', 'A相电流', 'A'),
+                   mp('P', 'power_total', '总有功功率', 'kW'),
+                   mp('PF', 'power_factor_total', '总功率因数', ''),
+                   mp('Freq', 'frequency', '频率F', 'Hz'),
+                   mp('Ep', 'energy_reading', '累积读数', 'kW·h'),
+                   mp('E', 'energy', '本周期用电量', 'kW·h'),
+                   mp('Ud', 'voltage_deviation_a', 'A相电压偏差', '%'),
+                   mp('THDu', 'voltage_thd_a', 'A相电压畸变率', '%'),
+                   mp('THDi', 'current_thd_a', 'A相电流畸变率', '%')],
+    },
+    {
         'name': 'WaterMeter-SIM', 'meterLevel': 2, 'site': 'single', 'gw': 'single',
         'profile': '水表', 'model': 'LXSY-20', 'brand': '宁波水表',
         'type1': 'water', 'type2': 'normal', 'l1': 'water_meter',
@@ -237,17 +258,25 @@ SIM_DEVICES = [
         'note': '模拟新风机组（可控）：送风温湿度、运行模式、风机频率',
         'points': [mp('Ts', 'temperature', '送风温度', '℃'),
                    mp('Hs', 'humidity', '送风湿度', '%RH'),
-                   mp('Mode', 'power', '运行模式', ''),
+                   mp('Mode', 'run_mode', '运行模式', ''),
+                   mp('P', 'power', '风机功率', 'kW'),
                    mp('Freq', 'frequency', '风机频率', 'Hz')],
     },
     {
-        'name': 'Breaker-SIM', 'meterLevel': 0, 'site': 'three', 'gw': 'three',
-        'profile': 'default', 'model': 'TGB3-63', 'brand': '天正',
+        'name': 'Breaker-SIM', 'meterLevel': 2, 'site': 'three', 'gw': 'three',
+        # ★ 档案不能写 'default'（2026-11-02 实测）：default 档案没有 energyTypeCode，
+        #   汇总直接 continue 跳过 → 动力分项永远是空的，且不报错。
+        'profile': '智能空开', 'model': 'TGB3-63', 'brand': '天正',
         'type1': 'elec', 'type2': 'smart_breaker', 'l1': 'smart_breaker',
         'wiring': '',
-        'note': '模拟智能空开（可控）：分合闸状态、开关次数',
-        'points': [mp('State', 'power', '分合闸状态', ''),
-                   mp('Cnt', 'energy', '开关次数', ''),
+        'note': '模拟智能空开（可控且带计量）：分合闸、开关次数、有功功率与电量',
+        # ★ 开关次数不能用 energy 键（2026-11-02 实测）：energy 是增量电量，
+        #   动力分项曾把开关次数当电量累加成 31272 kW·h。次数走 switch_count。
+        'points': [mp('State', 'switch_state', '分合闸状态', ''),
+                   mp('Cnt', 'switch_count', '开关次数', ''),
+                   mp('P', 'power', '有功功率', 'kW'),
+                   mp('E', 'energy', '本周期用电量', 'kW·h'),
+                   mp('Ep', 'energy_reading', '累积读数', 'kW·h'),
                    mp('Ia', 'current_a', 'A相电流', 'A')],
     },
 ]
@@ -296,6 +325,30 @@ RPC_SPECS = {
             {'method': 'getState', 'params': {}, 'desc': '读当前状态'},
         ],
     },
+}
+
+
+# ---------------------------------------------------------------- 设备归属
+# ★ 看板判「设备属于哪个场站」读的是**关系**，不是 additionalInfo.siteId。
+#   2026-11-02 实测：场站下只连了 3 台网关，综合能耗看板一个计量点都取不到，
+#   界面只显示「当前筛选下没有可用计量点」，无任何报错。
+#   场站 → 设备走干净的 SiteContains；区域/分项 → 设备走标准 Contains。
+MEMBERSHIP = {
+    # 设备基名（去掉 ·客户名 后缀）: (区域名前缀, 分项名前缀)
+    # 总表（meterLevel=1）只挂场站、不挂分项 —— 否则分项能耗会重复计电
+    'PowerMeter-1P-SIM': ('公共区域', '照明'),
+    'PowerMeter-3P-SIM': ('生产车间', None),
+    'PowerMeter-DDSU666': ('公共区域', '插座'),
+    'WaterMeter-SIM': ('公共区域', '给排水'),
+    'GasMeter-SIM': ('食堂', '炊事'),
+    'SteamMeter-SIM': ('锅炉房', '蒸汽'),
+    'HeatMeter-SIM': ('锅炉房', '锅炉'),
+    'Breaker-SIM': ('生产车间', '动力'),
+    'Relay-8CH': ('A栋办公区', None),
+    'AHU-SIM': ('办公区', None),
+    'Sensor-HZ8706': ('公共区域', None),
+    'ED1-Gateway': ('公共区域', None),
+    'ED2-Gateway': ('生产车间', None),
 }
 
 
@@ -367,6 +420,147 @@ def find_site(api, name):
     return None
 
 
+def _device_base_name(name):
+    """PowerMeter-1P-SIM·平台演示中心 → PowerMeter-1P-SIM"""
+    return (name or '').split('·')[0]
+
+
+def _existing_relations(api, cache, entity_type, entity_id):
+    key = (entity_type, entity_id)
+    if key not in cache:
+        cache[key] = api.get(
+            '/api/relations?fromId=%s&fromType=%s&relationTypeGroup=COMMON'
+            % (entity_id, entity_type)) or []
+    return cache[key]
+
+
+def ensure_relation(api, cache, from_type, from_id, to_type, to_id, rel_type):
+    """幂等建关系：已存在返回 False，新建返回 True。"""
+    rels = _existing_relations(api, cache, from_type, from_id)
+    for r in rels:
+        t = r.get('to') or {}
+        if (r.get('type') == rel_type and t.get('entityType') == to_type
+                and t.get('id') == to_id):
+            return False
+    api.post('/api/relation', {
+        'from': {'entityType': from_type, 'id': from_id},
+        'to': {'entityType': to_type, 'id': to_id},
+        'type': rel_type, 'typeGroup': 'COMMON',
+    })
+    rels.append({'type': rel_type,
+                 'to': {'entityType': to_type, 'id': to_id}})
+    return True
+
+
+def _drop_relation(api, from_type, from_id, to_type, to_id, rel_type):
+    """删单条关系（TB 用 DELETE /api/relation + 查询参数，没有 body）。"""
+    path = ('/api/relation?fromId=%s&fromType=%s&relationType=%s'
+            '&toId=%s&toType=%s&relationTypeGroup=COMMON'
+            % (from_id, from_type, rel_type, to_id, to_type))
+    code, _ = api.call('DELETE', path)
+    return code in (200, 204)
+
+
+def relink_devices(api, log, customer_id, customer_name, dry):
+    """把设备挂到它 additionalInfo.siteId 指向的场站，并按 MEMBERSHIP 补
+    区域/分项归属，同时清掉不属于当前映射的旧边。**可重复执行**。
+
+    这一步是综合能耗 / 分项能耗 / 区域能耗三个看板能出数的前提：
+    部件用 collectDevices() 沿 Contains|SiteContains 递归找设备，
+    关系没有 = 场站下 0 台表，界面只说「当前筛选下没有可用计量点」。
+    """
+    assets = [a for a in api.paged('/api/tenant/assets')
+              if (a.get('customerId') or {}).get('id') == customer_id]
+    by_id = {a['id']['id']: a for a in assets}
+    buckets = {}
+    for a in assets:
+        head = (a.get('name') or '').split('·')[0]
+        buckets.setdefault((a.get('type'), head), []).append(a)
+
+    devices = [d for d in api.paged('/api/tenant/devices')
+               if (d.get('customerId') or {}).get('id') == customer_id]
+    cache = {}
+    kids_cache = {}
+    stat = {'site': 0, 'region': 0, 'item': 0, 'pruned': 0, 'skip': 0}
+
+    # 区域/分项 → 设备 的现有边，一次收齐（设备 id → [(资产, 关系类型)]）。
+    # 逐台设备反查要把每个资产的关系都拉一遍，这里按资产拉、按设备归集，请求数一样但能复用缓存。
+    incoming = {}
+    for (kind, _head), group in buckets.items():
+        if kind not in ('区域', '分项'):
+            continue
+        for asset in group:
+            for r in _existing_relations(api, cache, 'ASSET', asset['id']['id']):
+                to = r.get('to') or {}
+                if to.get('entityType') != 'DEVICE' or not to.get('id'):
+                    continue
+                incoming.setdefault(to['id'], []).append((asset, r.get('type')))
+
+    for d in devices:
+        ai = d.get('additionalInfo') or {}
+        if isinstance(ai, str):
+            try:
+                ai = json.loads(ai)
+            except Exception:
+                ai = {}
+        sid = ai.get('siteId')
+        site = by_id.get(sid)
+        if not site or site.get('type') != '场站':
+            stat['skip'] += 1
+            continue
+        did = d['id']['id']
+
+        if ensure_relation(api, cache, 'ASSET', sid, 'DEVICE', did, 'SiteContains'):
+            stat['site'] += 1
+
+        # 同名区域/分项在别的园区也有，只认本场站下面的那个
+        if sid not in kids_cache:
+            kids_cache[sid] = {r['to']['id']
+                               for r in _existing_relations(api, cache, 'ASSET', sid)
+                               if (r.get('to') or {}).get('entityType') == 'ASSET'}
+        kids = kids_cache[sid]
+
+        base = _device_base_name(d['name'])
+        spec = MEMBERSHIP.get(base) or (None, None)
+        wanted = set()
+        for kind, head in (('区域', spec[0]), ('分项', spec[1])):
+            if not head:
+                continue
+            cands = buckets.get((kind, head + kind), [])
+            inside = [x for x in cands if x['id']['id'] in kids]
+            pick = (inside or cands)
+            if not pick:
+                log('  · %s 找不到%s「%s」，跳过' % (d['name'], kind, head))
+                continue
+            wanted.add(pick[0]['id']['id'])
+            if ensure_relation(api, cache, 'ASSET', pick[0]['id']['id'],
+                               'DEVICE', did, 'Contains'):
+                log('  + %s → %s' % (d['name'], pick[0]['name']))
+                stat['region' if kind == '区域' else 'item'] += 1
+
+        # 清掉不是当前映射的旧边。
+        #
+        # ★ 为什么要删（2026-11-02 实测）：历史演示数据给同一台表挂过两个区域
+        #   （燃气表同时在「公共区域」和「食堂」），区域能耗会把它算两遍。
+        #   只补不删就会永远带着这些脏边。
+        #   只动「区域/分项 → 设备」，不碰楼栋 / 能耗类型 / 网关下的 Contains。
+        if base in MEMBERSHIP:
+            for asset, rel_type in incoming.get(did, []):
+                if rel_type != 'Contains' or asset['id']['id'] in wanted:
+                    continue
+                if dry:
+                    log('  - %s 将解除「%s」' % (d['name'], asset['name']))
+                    stat['pruned'] += 1
+                elif _drop_relation(api, 'ASSET', asset['id']['id'],
+                                    'DEVICE', did, 'Contains'):
+                    log('  - %s 解除多余的「%s」' % (d['name'], asset['name']))
+                    stat['pruned'] += 1
+
+    log('  场站归属 +%d / 区域 +%d / 分项 +%d / 清理旧边 %d（%d 台无场站，已跳过）'
+        % (stat['site'], stat['region'], stat['item'], stat['pruned'], stat['skip']))
+    return stat
+
+
 def ensure_profile(api, name, spec, kind_ids, log):
     prof = find_profile(api, name)
     if prof is None:
@@ -430,7 +624,18 @@ def ensure_gateway(api, name, site, customer_id, log):
 def ensure_device(api, spec, site, customer_id, gw_id, log):
     name = spec['name']
     dev = next((d for d in api.paged('/api/tenant/devices') if d.get('name') == name), None)
-    ai = {'siteId': site['id']['id'], 'simulated': True, 'deviceVirtual': 'real'}
+    # ★ 不要写 deviceVirtual（除非真的是虚拟表）。
+    #
+    #   看板部件的 isVirtual 是**黑名单式**判断：只要这个键存在且非空
+    #   （除了 false/'false'/0/'0'）就算虚拟设备，直接从计量池里剔除。
+    #   曾经写 'real' 想表达「这是实表」，结果 8 台模拟设备全被判虚拟，
+    #   场站看板一直是「当前范围内没有可用计量点」（实测 2026-11-02）。
+    #
+    #   energyTypeCode 必须写：部件优先用它判品种，
+    #   否则只能靠档案名查 ENERGY_OF_TYPE 白名单 —— 新建的档案名不在表里，
+    #   设备就会被当作「识别不出品种」剔除。
+    ai = {'siteId': site['id']['id'], 'simulated': True,
+          'energyTypeCode': spec['type1']}
 
     if dev is None:
         api.post('/api/device', {
@@ -642,6 +847,14 @@ def ensure_dimensions(api, customer_id, customer_name, log):
     """
     if api.dry:
         log('  · 维度根与场站：将调用 demo-data（幂等）')
+        return
+    # ★ 维度已存在就**不要再调 demo-data**（2026-11-02 实测）：
+    #   它不只建资产，还会把客户设备重新挂回「默认区域」（单相→公共区域、
+    #   三相→生产车间），把本脚本 ⑩ 步建的正确区域边冲掉 ——
+    #   于是每次重跑都变成「+5 正确边 / -5 旧边」，日志永远不收敛。
+    want_root = '用能分项·%s' % customer_name
+    if any(a.get('name') == want_root for a in api.paged('/api/tenant/assets')):
+        log('  · 维度根已存在（%s），跳过 demo-data，避免设备区域被重置' % want_root)
         return
     code, r = api.call('POST', '/api/energy/demo-data', {'customerId': customer_id,
                                                         'customerName': customer_name})
@@ -856,6 +1069,15 @@ def main():
                  and d.get('name') not in keep]
         if extra:
             log('\n⚠ 还有 %d 台非白名单设备（演示设备）。加 --prune 清掉。' % len(extra))
+
+    # ⑩ 设备归属关系（场站 / 区域 / 分项）
+    # ★ 看板判归属读关系，不读 additionalInfo.siteId —— 缺这步综合能耗恒为空。
+    #   每次跑都执行（幂等），存量环境重跑本脚本即可修好。
+    log('\n=== ⑩ 设备归属关系（场站 / 区域 / 分项）===')
+    try:
+        relink_devices(api, log, customer_id, customer_name, args.dry_run)
+    except Exception as e:
+        log('  ✗ 归属补建失败: %s' % e)
 
     # 完成
     log('\n=== 完成 ===')
