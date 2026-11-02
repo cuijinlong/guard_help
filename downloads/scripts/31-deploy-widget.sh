@@ -94,7 +94,7 @@ fi
 if [[ ! -d "$APP_WT_DIR" ]]; then
   warn "部署目录里没有 $APP_WT_DIR"
   warn "  推库仍会生效（前端读库），但**下次重启会被源文件覆盖**。"
-  warn "  确认 --app-home 指向正确的部署目录（当前 $APP_HOME）。"
+  warn "  确认 --app-home 指向正确的部署目录（当前 ${APP_HOME}）。"
 fi
 
 # ---------------------------------------------------------------- 1. 确定目标
@@ -260,7 +260,7 @@ if d.get('tags'):
 print(f"UPDATE widget_type SET {', '.join(sets)} WHERE fqn = '{fqn}';")
 PYEOF
   then
-    die "$name：生成 SQL 失败"
+    die "${name}：生成 SQL 失败"
   fi
 
   out=$(docker exec -i "$DB_CONTAINER" psql -U postgres -d "$DB_NAME" -v ON_ERROR_STOP=1 < /tmp/deploy-widget.sql 2>&1)
@@ -269,19 +269,19 @@ PYEOF
 
   if [[ $rc -ne 0 ]]; then
     echo "$out" | tail -5
-    die "$name：推库失败（fqn=$fqn）"
+    die "${name}：推库失败（fqn=${fqn}）"
   fi
 
   # 「UPDATE 0」= 库里没有这个 fqn，前端会报「部件类型已被移除」
   if echo "$out" | grep -q 'UPDATE 0'; then
-    die "$name：库里没有 fqn=$fqn 这条记录
+    die "${name}：库里没有 fqn=$fqn 这条记录
    → 该部件还没被装载过。先确认后端启动日志里有 loadSystemWidgets，
      或跑一次：bash shiyongshouce/downloads/deploy/docker-98-rebuild.sh --keep-data ..."
   fi
 
   # 同步挂载目录（缺失时只警告：推库已生效，但重启会丢）
   if [[ -d "$APP_WT_DIR" ]]; then
-    cp "$file" "$APP_WT_DIR/$name" || die "$name：同步到部署目录失败（权限？）"
+    cp "$file" "$APP_WT_DIR/$name" || die "${name}：同步到部署目录失败（权限？）"
   fi
 
   PUSHED=$((PUSHED + 1))
@@ -333,10 +333,10 @@ PYEOF
 
   case "$verdict" in
     MATCH)   ok "$name 库内一致" ;;
-    EMPTY)   warn "$name：库里查不到该 fqn"; FAIL=$((FAIL + 1)) ;;
-    BADJSON) warn "$name：库内 descriptor 不是合法 JSON"; FAIL=$((FAIL + 1)) ;;
-    READERR) warn "$name：读库结果失败"; FAIL=$((FAIL + 1)) ;;
-    *)       warn "$name：库内与文件不完全一致（可能是推送被截断）"; FAIL=$((FAIL + 1)) ;;
+    EMPTY)   warn "${name}：库里查不到该 fqn"; FAIL=$((FAIL + 1)) ;;
+    BADJSON) warn "${name}：库内 descriptor 不是合法 JSON"; FAIL=$((FAIL + 1)) ;;
+    READERR) warn "${name}：读库结果失败"; FAIL=$((FAIL + 1)) ;;
+    *)       warn "${name}：库内与文件不完全一致（可能是推送被截断）"; FAIL=$((FAIL + 1)) ;;
   esac
 done
 
@@ -348,7 +348,7 @@ if [[ -d "$APP_WT_DIR" ]]; then
     if [[ -f "$APP_WT_DIR/$name" ]]; then
       if [[ "$(md5 -q "$file" 2>/dev/null || md5sum "$file" | cut -d' ' -f1)" != \
             "$(md5 -q "$APP_WT_DIR/$name" 2>/dev/null || md5sum "$APP_WT_DIR/$name" | cut -d' ' -f1)" ]]; then
-        warn "$name：部署目录副本与源文件不一致"; SYNC_BAD=$((SYNC_BAD + 1))
+        warn "${name}：部署目录副本与源文件不一致"; SYNC_BAD=$((SYNC_BAD + 1))
       fi
     fi
   done
