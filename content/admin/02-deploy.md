@@ -530,12 +530,72 @@ unzip -l $JAR | grep -cE "public/chunk-[A-Z0-9]+[.]js$"                     # �
 
 或者直接跑 `bash scripts/33-check-widget-style.sh`，L1 会报红。
 
-**修**：
+**修**（**不需要重建库，也不需要重新 install** —— 数据都在 PostgreSQL 里，jar 只是应用）：
 
 ```bash
+# ── ① 在有源码的那台机器上，打干净 jar（会重建前端，约 12 分钟）
 cd <仓库>
-bash guard-server/pack.sh --clean     # mvn clean：彻底清掉 target
+bash guard-server/pack.sh --clean
+
+# ── ② 换 jar。只换这一个文件，data/ 与 .env 一律不动
+docker stop energy-server
+cd ~/energy-app
+mv guard-server-4.4.0.jar guard-server-4.4.0.jar.bak-$(date +%H%M)
+cp <仓库>/guard-server/target/guard-server-4.4.0.jar ~/energy-app/
+docker start energy-server
+
+# ── ③ 等就绪
+for i in $(seq 1 60); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8090/)
+  [ "$code" = "200" ] && { echo "就绪（第 ${i} 次）"; break; }
+  sleep 3
+done
 ```
+
+然后浏览器 **硬刷新**：`Cmd+Shift+R`（macOS）/ `Ctrl+F5`（Windows）。
+
+**验证（两个都要绿）**：
+
+```bash
+cd ~/energy-app
+bash scripts/33-check-widget-style.sh
+```
+
+```
+L1  前端产物：production（带 hash），public/ 下 9066 个文件   ← 约 9066
+    前端产物日期一致（单一构建，无叠加）                      ← 必须这句
+    chunk 数正常（88 个）
+L2/L3/L4 全 ✓
+```
+
+然后点这几个页面，都应正常（这是 2026-11-04 实测坏掉的那几个）：
+综合能耗 · 能源流向 · 盘查报告 · 节能记录 · 组织
+
+**! 三个绝对不要做的**（会让事情变得更糟）：
+
+| 别做 | 为什么 |
+| --- | --- |
+| `docker-99-uninstall.sh --purge` | 连数据卷和整个部署目录一起删，客户数据全没 |
+| `docker compose down -v` | `-v` 删卷 = 删库 |
+| 重跑 `docker-01-install.sh` | 会报「库已有 N 张表」；它不会修前端问题 |
+
+**还不行的话**，按顺序查：
+
+| 现象 | 含义 | 处理 |
+| --- | --- | --- |
+| 33 的 L1 仍报「混了 N 个日期」 | `--clean` 没真清掉 `target` | `rm -rf guard-server/target/classes/public` 后重跑 `pack.sh --clean` |
+| `pack.sh` 报错说找不到前端 | 新机器上没有 `ui-ngx/node_modules` | `cd ui-ngx && npm ci` 后再打（或直接拿发布包里的 jar） |
+| L1 全绿但页面仍旧 | 浏览器缓存 | 开无痕窗口访问，对比一下 |
+| 某几个页面仍空白 | 不是本条问题 | 跑 `33` 看 L2/L3，按输出处置 |
+
+> 如果不想在新机器上构建（没 Node / 内存不够），
+> 直接拿发布包里的 jar：
+> ```bash
+> tar -xzf energy-deploy-*.tar.gz -C /tmp energy-deploy/guard-server-4.4.0.jar
+> docker stop energy-server
+> cp /tmp/energy-deploy/guard-server-4.4.0.jar ~/energy-app/
+> docker start energy-server
+> ```
 
 > `pack.sh` 已修（2026-11-04）：打包前自动 `rm -rf target/classes/public`，
 > 并在产物校验里新增「多个日期 / chunk > 200」硬检测，命中就报红。
