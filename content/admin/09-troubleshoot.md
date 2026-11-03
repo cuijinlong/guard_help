@@ -250,6 +250,10 @@ print('模板长度', j-i, '结束于第', s[:j].count(chr(10))+1, '行')
 
 | 症状 | 判据 | 修 |
 | --- | --- | --- |
+| 脚本一开始就报「守护进程未运行」 | 见下「Docker 起不来」 | — |
+| 脚本卡住几分钟不动、不报错 | `docker info` 无响应 | 见下「Docker 卡死」 |
+| 就绪后什么都没打印就退了，没建出管理员 | 旧版 02 的 `CODE=$(curl …)` 没 `\|\|` 保护 | 换新脚本，或直接看下一条 |
+| 创建管理员报 HTTP 000 / 502 | 后端刚起，gateway 还没就上 | 等 30 秒重跑同一条命令 |
 | 全新库安装到「建库」就失败 | 见下 | — |
 | 重装脚本崩了，`APP_HOME: unbound variable` | 脚本从错误目录调用 | 在部署目录执行 |
 | **`bash: scripts/xxx.sh: No such file or directory`** | 部署目录的 scripts/ 是旧的 | `32-check-deploy-sync.sh --fix` |
@@ -257,6 +261,173 @@ print('模板长度', j-i, '结束于第', s[:j].count(chr(10))+1, '行')
 | 跑完验收再跑初始化，报「Σ峰谷 ≠ energy」 | 演示数据被重复写入 | 清遥测后重跑 |
 | 切 Cassandra 后大面积「0 台 / 没有数据」 | 遥测后端切换后数据在新库 | 重新灌数据，或切回 SQL |
 | Cassandra 无限重启，平台 502 | 内存不足 / 数据目录权限 | 见 [① 安装 · Cassandra](/admin/install#cassandra) |
+| 峰谷/电能质量慢，或报 `relation "ts_kv" does not exist` | 遥测后端是 cassandra | 见下「遥测后端选错」 |
+
+### Docker 起不来：`docker 守护进程未运行`
+
+> **命令因机器而异，别跨平台照抄。** 脚本会自己判平台（见
+> `docker-01-install.sh` 第 1 节），下面是你手工介入时的对照。
+
+| 机器 | daemon 没启动 | 权限不足 |
+| --- | --- | --- |
+| Ubuntu / Debian | `sudo systemctl start docker` | `sudo usermod -aG docker $USER && newgrp docker` |
+| CentOS 7 / RHEL | 同上（7 没有 dnf，但 systemctl 一样有） | 同上 |
+| macOS | `open -a Docker`，等鲸鱼图标停转 | 不该出现；先看 `docker context ls` 是否是 `desktop-linux` |
+
+> Linux 上先确认真的是「没启动」而不是「没权限」：
+>
+> ```bash
+> docker info >/dev/null 2>&1 && echo OK || echo 失败
+> sudo systemctl status docker --no-pager | head -5
+> ```
+>
+> `Active: active (running)` 但 `docker info` 报 `permission denied` → 是权限，不是启动。
+
+### Docker 卡死：脚本挂住不返回（本次实测坑）
+
+**症状**：`docker info` / `docker ps` / `docker version` 跑下去**不报错也不退出**，
+几十秒到几分钟一直挂着；而 `docker compose` 相关脚本看起来像「卡在检查环境」。
+
+**为什么容易误判**：daemon 进程在、socket 文件也在，你以为是没启动，于是
+去 `open -a Docker` 或 `systemctl start` —— 都没用，因为它本来就在。
+
+**判据**（两行分清楚）：
+
+```bash
+ls -l ~/.docker/run/docker.sock        # macOS；Linux 是 /var/run/docker.sock
+curl -s -m 5 --unix-socket ~/.docker/run/docker.sock http://localhost/_ping
+# 有输出 {"OK":...} = 正常；超时无输出 = 卡死
+```
+
+**实测形态（macOS）**：宿主侧 `com.docker.backend` 握着 socket 但不应答，
+VM 里面的 dockerd 其实是健康的（`~/Library/Containers/com.docker.docker/
+Data/log/vm/dockerd.log` 里有 `Daemon has completed initialization`），
+连 `osascript quit` 都退不掉 backend —— 那本身就是它卡住的证据。
+
+```bash
+# macOS
+osascript -e 'quit app "Docker"'
+# 等 30 秒；还在就强杀
+pkill -f com.docker.backend
+open -a Docker
+
+# Linux
+sudo systemctl restart docker
+sudo journalctl -u docker -n 50 --no-pager
+```
+
+验证 `docker info` 能在 1-2 秒内返回即好。仍不行：菜单栏鲸鱼 → Troubleshoot → Restart。
+
+> 卡死时**不要**重跑安装脚本、不要 `docker compose down` —— 它们会一起挂住。
+> 先把 daemon 救活。
+
+### 看板整片空白，但菜单和页面框架正常（2026-11-03 实测）
+
+**症状**：登录后左侧菜单完整、看板标题也在，但**所有部件区域全是空白**，
+只剩右上角的全屏/下载图标。看起来像「数据没初始化」，但换哪个账号都一样。
+
+**先查一条，不要先查数据**：F12 选中任一部件的容器，看它的 DOM。
+
+```
+<div class="eqtc-head">…</div><!----><!----><!----><!----><!----><!---->
+       ↑ 静态内容正常                        ↑ *ngIf/*ngFor 全变成空注释
+```
+
+**判据**：`{{ 插值 }}` 和静态 HTML 正常渲染，但所有 `*ngIf` / `*ngFor`
+控制的内容变成 `<!---->`，**控制台零报错、后端日志也没有**。
+
+**根因**：TB 部件模板是运行时 JIT 编译的（`createDynamicComponent`）。
+Angular 20 下**只传 `imports: [CommonModule]` 时，它的 exports 没有展开
+进动态组件作用域** ——
+
+| 写法 | 结果 |
+| --- | --- |
+| `{{ x }}` / 静态 HTML | ✅ 正常（不需要指令） |
+| `@if` / `@for`（新 control flow） | ✅ 正常（编译器内建） |
+| `*ngIf` / `*ngFor` / `[ngIf]` | ❌ `<!---->`，**静默失败** |
+
+**影响面**：看板引用的 **42 个部件 100% 都用了 `*ngIf`** —— 所以是
+「所有功能都不好使」，不是个别页面。数据、账号、权限全部没问题。
+
+**修复**：已在 `ui-ngx/src/app/core/services/dynamic-component-factory.service.ts`
+里显式列出指令：
+
+```ts
+let componentImports: Type<any>[] = [
+  CommonModule,
+  NgIf, NgForOf, NgSwitch, NgSwitchCase, NgSwitchDefault,
+  NgClass, NgStyle, NgTemplateOutlet, AsyncPipe
+];
+```
+
+这是 `ui-ngx/src/**` 的改动，**改 JSON 救不了**，必须重新构建：
+
+```bash
+cd ui-ngx && ./node_modules/.bin/ng build --configuration production   # 约 5-6 分钟
+cd ../guard-server && mvn -o package -DskipTests
+cp target/guard-server-4.4.0.jar ~/energy-app/
+cd ~/energy-app && docker compose --profile split restart energy-server
+```
+
+> **为什么会误判成「数据没初始化」**：
+> ① `WidgetComponent.detectChanges()` 里有个 `catch (e) { /* 静默 */ }`，
+> 模板异常被完全吞掉 —— 浏览器控制台、后端日志、网关日志三处都没有错误。
+> ② 插值 `{{ }}` 正常，很容易让人以为模板没问题，其实它根本不需要指令。
+> ③ 部件接口（`/api/tenant/assets`、`.../attributes/SERVER_SCOPE`）全部 200，
+> 数据一条不缺，查数据方向全是死胡同。
+>
+> 新增部件若用到其它指令（如 `NgComponentOutlet`），也要去
+> `dynamic-component-factory.service.ts` 补进 imports。
+> 写新模板建议直接用 `@if`/`@for`，不受 imports 影响。
+
+### 遥测后端选错：功能慢、或报 `relation "ts_kv" does not exist`
+
+**症状**（三种，同一个根因）：
+
+- 峰谷分析 / 电能质量要等很久才出数，或干脆报 500
+- 后端日志刷 `PreparedStatementCallback; bad SQL grammar [...] FROM ts_kv`
+- 手册⑩的运维 SQL 复制到 psql，一条都跑不了
+
+**判据（一条命令）**：
+
+```bash
+docker exec energy-server env | grep DATABASE_TS_TYPE
+```
+
+- `sql` → 正常（遥测在 Postgres 的 `ts_kv` 表）
+- `cassandra` → 遥测在 Cassandra，**Postgres 里没有 `ts_kv` 表**
+
+**为什么会这样**：平台有两套遥测后端。业务代码（峰谷小时桶、电能质量圈选）
+与手册里的运维 SQL 都是围绕 `ts_kv` 写的；Cassandra 部署下这些路径要么降级
+（慢一个数量级），要么报错。
+
+> 2026-11-03 之前，安装脚本按**物理内存**自动选：≥10GB 就上 Cassandra。
+> 结果是 16GB 的机器选了 Cassandra，现场表现成「看板空白 / 功能不好使」，
+> 排查很久才定位。**现在默认已是 `sql`**（`docker-00-prepare.sh`）。
+
+**平台已做的适配**：查历史前先探测后端类型（`TelemetryBackend`），
+走不通就自动降级走 `timeseriesService` —— 不会再砸 500，但**降级就是慢**。
+
+**要换回 sql**（推荐，除非数据量真到千万行以上）：
+
+```bash
+# 1. 改 .env
+DATABASE_TS_TYPE=sql
+
+# 2. 清库重建（遥测不会自动迁移，旧数据留在 Cassandra 卷里）
+cd ~/energy-app && bash docker-99-uninstall.sh --purge --yes
+
+# 3. 重走三步
+bash docker-00-prepare.sh && bash docker-01-install.sh
+bash docker-02-start.sh --admin-email ... --admin-pass '...'
+```
+
+> **注意**：换后端只是换读取端，`ts_kv` 与 Cassandra 是两套存储。
+> 不重建库只会看到「设备在、数据全空」。
+
+**真要 Cassandra 时**：显式指定
+`DATABASE_TS_TYPE=cassandra bash docker-00-prepare.sh`，
+并接受上表的性能差异。
 
 ### `bash: scripts/xxx.sh: No such file or directory`
 

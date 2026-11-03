@@ -2,6 +2,9 @@
 
 > 这一页只管 Docker 本身。平台的部署在[② 平台部署](/admin/deploy)。
 >
+> 支持三种部署宿主机：**Ubuntu/Debian**、**CentOS 7 / RHEL / Rocky**、**macOS（Docker Desktop）**。
+> 命令不通用，别跨段照抄 —— 尤其 CentOS 7 没有 `dnf`。
+>
 > 装一次、用很久，但**运维三件事必须知道**：磁盘会满、日志会涨、端口会冲突。
 > 每节都给了现成命令，照着敲即可。
 
@@ -18,7 +21,13 @@ docker compose version
 
 两条都出结果（Docker ≥ 20.10、Compose ≥ v2）就**跳到第二节**。
 
+> 只出 Client 段、没有 Server 段 = daemon 没跑，接着往下装 / 启动。
+
+---
+
 ### Ubuntu / Debian
+
+支持 18.04 / 20.04 / 22.04 / 24.04，以及 Debian 11 / 12。
 
 ```bash
 sudo apt-get update
@@ -37,7 +46,60 @@ sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
   docker-buildx-plugin docker-compose-plugin
 ```
 
-### CentOS / Rocky / RHEL
+> Debian 要把上面两处 `ubuntu` 换成 `debian`，`VERSION_CODENAME` 保留即可。
+
+---
+
+### CentOS 7
+
+> ⚠ **CentOS 7 没有 `dnf`** —— 网上一堆教程写 `dnf install`，在这台机器上会直接
+> `command not found`。7 只能用 `yum`。
+
+```bash
+sudo yum install -y yum-utils device-mapper-persistent-data lvm2
+sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+sudo yum install -y docker-ce docker-ce-cli containerd.io
+```
+
+**Compose v2 插件单独装**（CentOS 7 的 Docker 源里常常没有 `docker-compose-plugin`，
+装到最后一步报 `No package docker-compose-plugin available`）：
+
+```bash
+sudo mkdir -p /usr/local/lib/docker/cli-plugins
+ARCH=$(uname -m)   # x86_64 或 aarch64
+sudo curl -fSL "https://github.com/docker/compose/releases/download/v2.28.1/docker-compose-linux-${ARCH}" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+```
+
+判据：`docker compose version` 出 `v2.x` 才算成（不是 `docker-compose version`）。
+
+**CentOS 7 两个必查项**（不处理会在安装后半段才爆，很难定位）：
+
+```bash
+# ① SELinux 必须放过容器卷挂载，否则 postgres 起不来
+#    报错长这样：Permission denied on /var/lib/postgresql/data
+sudo setenforce 0                          # 临时（重启失效）
+sudo sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config   # 永久
+
+# ② firewalld 与 docker 的 iptables 会打架：宿主机能访问，局域网访问不了
+sudo systemctl stop firewalld && sudo systemctl disable firewalld
+#    要保留防火墙就必须放行业务端口，见下一条
+```
+
+> 客户环境必须开防火墙时，放行端口（至少 HTTP 与 MQTT）：
+>
+> ```bash
+> sudo firewall-cmd --permanent --add-port=8090/tcp --add-port=1883/tcp
+> sudo firewall-cmd --reload
+> ```
+>
+> 注意 `docker run -p` 走的是 NAT，可能绕过 firewalld 规则。以「从另一台机器
+> `curl http://<IP>:8090` 能通」为最终判据，别只看 `firewall-cmd --list-all`。
+
+---
+
+### CentOS 8+ / Rocky / AlmaLinux / RHEL
 
 ```bash
 sudo dnf install -y dnf-plugins-core
@@ -46,21 +108,64 @@ sudo dnf install -y docker-ce docker-ce-cli containerd.io \
   docker-buildx-plugin docker-compose-plugin
 ```
 
-### 启动并开机自启
+SELinux / firewalld 的处理与上面 CentOS 7 一致。
+
+---
+
+### macOS（Docker Desktop）
+
+**不要用 brew 装 docker CLI**，那只有客户端，没有 daemon。必须装 Docker Desktop：
+
+```bash
+# Apple Silicon / Intel 同一个包，官网自动选
+curl -fSL https://desktop.docker.com/mac/main/arm64/Docker.dmg -o /tmp/Docker.dmg
+```
+
+或者直接下载安装包：<https://docs.docker.com/desktop/install/mac-install/>
+
+装完必须**手动启动一次**并同意条款（第一次会弹权限框，要点允许）：
+
+```bash
+open -a Docker
+```
+
+等菜单栏鲸鱼图标停止转动（首次 30-60 秒），然后验证：
+
+```bash
+docker version --format '{{.Server.Version}}'   # 要看到 27.x 这种 Server 版本
+docker compose version                          # 要看到 v2.x
+```
+
+> macOS 没有 `systemctl`、没有 `/var/run/docker.sock` 的 root 属主概念，
+> **也不要照搬手册里任何 `sudo` 开头的 docker 命令** —— Mac 上的 docker 本来就
+> 不该用 sudo 跑，加了 sudo 反而会因为 socket 属主变成 root 而把环境搞坏。
+
+**内存给够**：Docker Desktop → Settings → Resources，建议 ≥ 8 GB。
+平台 split 模式要跑 postgres + cassandra + 后端 + 网关，4 GB 会 OOM。
+
+**开机自启**（跑演示环境时建议开）：Settings → General →
+`Start Docker Desktop when you sign in`。
+
+---
+
+### Linux 通用：启动 + 开机自启 + 免 sudo
 
 ```bash
 sudo systemctl enable --now docker
-```
-
-### 让当前用户免 sudo 用 docker
-
-```bash
 sudo usermod -aG docker $USER
-newgrp docker
+newgrp docker       # 只对新 shell 生效，重开终端更省事
 ```
 
-> **不执行这一步，后面所有脚本都会报**
-> `docker 守护进程未运行（或当前用户无权限）`。这是最常见的卡点。
+> **不做这两步，后面所有脚本都会报**「守护进程未运行 / 无权限」。这是最常见的卡点。
+>
+> 判据（一条命令分清楚）：
+>
+> ```bash
+> docker info >/dev/null 2>&1 && echo "OK" || echo "还没好"
+> sudo systemctl status docker --no-pager | head -5
+> ```
+
+---
 
 ### 验证
 
@@ -70,9 +175,71 @@ docker compose version
 docker run --rm hello-world | head -3
 ```
 
+三条全过才算装好。
+
+---
+
+## 一之二、装完仍报错？按症状对号入座
+
+`docker info` 有三种失败形态，**修法完全不同**，别混着试。部署脚本（
+`docker-01-install.sh` / `docker-02-start.sh`）已经内置了这个判别，会自动
+尝试拉起 daemon 并按平台给出对应命令；下面是你需要手工介入时的对照表。
+
+### ① 立刻报错 `Cannot connect to the Docker daemon`
+
+daemon 没启动。Linux：`sudo systemctl start docker`。
+macOS：`open -a Docker` 等鲸鱼图标停止转动。
+
+### ② 立刻报错 `permission denied ... docker.sock`
+
+daemon 在跑，是权限问题。
+
+```bash
+sudo usermod -aG docker $USER && newgrp docker
+```
+
+macOS 上一般不会出现；真遇到了先看 context：`docker context ls`，不对就
+`docker context use desktop-linux`。
+
+### ③ 命令**卡住不返回**（等几十秒到几分钟，不报错也不退出）
+
+这是最容易被误判成「没装 / 没启动」的形态。**daemon 进程在、socket 文件也在，
+但就是不应答。** 实测于 macOS 的 Docker Desktop：宿主侧 socket 转发卡死，
+VM 里的 dockerd 其实是好的。
+
+```bash
+# 判据：socket 存在但 _ping 超时
+ls -l ~/.docker/run/docker.sock
+curl -s -m 5 --unix-socket ~/.docker/run/docker.sock http://localhost/_ping   # 超时即命中
+```
+
+**macOS 修法**（`quit` 常常无效，进程赖着不走 —— 那本身就是它卡住的证据）：
+
+```bash
+osascript -e 'quit app "Docker"'
+# 等 30 秒；backend 还在就强杀
+pkill -f com.docker.backend
+open -a Docker
+```
+
+**Linux 修法**：
+
+```bash
+sudo systemctl restart docker
+sudo journalctl -u docker -n 50 --no-pager    # 看它为什么卡
+```
+
+> 卡死状态下**不要**直接 `docker compose down` / 重跑安装脚本 —— 它们全都会挂住。
+> 先把 daemon 救活。
+
 ---
 
 ## 二、调优（装完就做）
+
+> 本节命令都是 **Linux 路径**（`/etc/docker/daemon.json` + `systemctl`）。
+> **macOS 上没有这些文件，也不要 `sudo`** —— 在 Docker Desktop 里改：
+> Settings → Docker Engine，把同样的 JSON 填进编辑框，点 Apply & Restart。
+> 「根目录换盘」在 Mac 上叫 Settings → Resources → Disk image location。
 
 ### 1. 配镜像加速 + 日志轮转
 
@@ -234,7 +401,14 @@ docker compose --profile split up -d
 docker compose --profile split up -d --build
 ```
 
-> **默认后端是 Cassandra，命令要不要带 `--profile cassandra`？**
+> **默认后端是 SQL（Postgres 存遥测），命令要不要带 `--profile cassandra`？**
+>
+> 2026-11-03 起默认 `DATABASE_TS_TYPE=sql`（旧逻辑是「物理内存 ≥10GB 就选
+> cassandra」）。业务代码里的峰谷分析、电能质量、手册的运维 SQL 全部基于
+> `ts_kv` 表，Cassandra 部署下这些路径要么报错要么退化。详见下面「Cassandra」一节。
+>
+> 只有明确指定 `DATABASE_TS_TYPE=cassandra` 时才有 Cassandra 容器。
+> 带不带 `--profile cassandra` 的对照：
 >
 > | 命令 | 要不要带 | 原因 |
 > | --- | --- | --- |
@@ -324,3 +498,24 @@ curl -s -H "X-Authorization: Bearer $TOKEN" \
 
 > 平台的数据卷在 `~/energy-app`。**Cassandra 恢复比 SQL 麻烦得多**，
 > 这也是默认不用它的原因之一。
+
+### 用 Cassandra 会损失什么（2026-11-03 实测）
+
+选 Cassandra **不是**“换个更快的存储”那么简单 —— 有一批功能会变慢或不可用。
+切之前先确认这些都能接受：
+
+| 功能 | SQL 后端 | Cassandra 后端 |
+| --- | --- | --- |
+| 峰谷分析（tou-analysis） | 一条 SQL 算小时桶 | 不能直查，退化为逐时段读；**慢一个数量级** |
+| 电能质量数据集圈选 | `INSERT…SELECT` 直接搬 | 读回 JVM 再写；**大量数据时内存吃紧** |
+| 手册的运维 SQL（⑩） | 可执行 | **一条都跑不了**（ts_kv 不存在） |
+| 抄表树“最近有数据优先”排序 | 查 ts_kv | 改查 ts_kv_latest，语义一致 |
+| 设备参数报表 / 基础报表 | 正常 | 正常（走 timeseriesService） |
+
+平台已经做了适配：查历史前会先探测后端类型（`TelemetryBackend`），
+走不通就自动降级，不会再把 500 砸给用户。**但降级就是慢** ——
+数据量大时差异很明显。
+
+> 判据：`docker exec energy-server env | grep DATABASE_TS_TYPE`。
+> 如果看到 `cassandra` 而你并不需要它（只是内存大），建议改成 `sql` 重建库 ——
+> `/workspace/iot-rule-engine` 的 `docker-00-prepare.sh` 现在默认就是 sql。

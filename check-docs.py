@@ -398,6 +398,23 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
     if probe.returncode != 0:
         return 0, 0, ['跳过：energy-postgres 未运行']
 
+    # ★ 遥测后端是 Cassandra 时，库里根本**没有 ts_kv 表**（TB 把遥测写到
+    #   Cassandra，PostgreSQL 只存实体元数据）。此时手册里那些 ts_kv 查询
+    #   全部报 `relation "ts_kv" does not exist`。
+    #   这不是手册写错，是部署形态不同 —— 按本函数的设计原则
+    #   （「文档一致性不该依赖数据库状态」）跳过，而不是算作不一致。
+    #   实测（2026-11-03）：DATABASE_TS_TYPE=cassandra 时 6 条 SQL 全部误报失败，
+    #   导致 ./sync.sh 被卡住、手册推不到 guard_help。
+    try:
+        tsq = subprocess.run(
+            ['docker', 'exec', 'energy-postgres', 'psql', '-U', 'postgres', '-d', 'thingsboard',
+             '-tAc', "SELECT to_regclass('public.ts_kv')"],
+            capture_output=True, text=True, timeout=20)
+        if tsq.returncode == 0 and (tsq.stdout or '').strip() == '':
+            return 0, 0, ['跳过：无 ts_kv 表（遥测后端为 Cassandra，手册 SQL 只适用 SQL 模式）']
+    except Exception:
+        pass
+
     # 校验范围：故障排查页的「运维常用 SQL」+ 两页功能/数据流文档的全部 SQL。
     #
     # ★ 为什么把新页面也纳进来（2026-10-23）：
@@ -692,6 +709,12 @@ def main() -> int:
         else:
             print(f'\n✓ 运维 SQL 全部可执行（{sql_ran}/{sql_total} 条；'
                   f'带 <客户id> 占位符的已替换成真实 id 验证）')
+    elif sql_errors:
+        # 返回 (0, 0, ...) = 整体跳过；此时列表里是**跳过原因**而不是失败。
+        # 必须打出来：否则用户看到「✓ 全部一致」会以为手册 SQL 已经验证过。
+        print('\n· 运维 SQL 未校验：')
+        for e in sql_errors:
+            print(f'    · {e}')
 
     # ---------------- 故障手册章节编号唯一性 ----------------
     numbering_errors = check_troubleshoot_numbering()

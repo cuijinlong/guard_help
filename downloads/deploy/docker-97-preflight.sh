@@ -242,6 +242,44 @@ else
   warn "缺少 data 源目录或部署目录，跳过"
 fi
 
+# ---------------------------------------------------------------- 3d. 部件模板指令兼容
+#
+# ★ 为什么查这个（2026-11-03 真实踩过，排查花了几小时）：
+#   TB 部件模板是运行时 JIT 编译的。Angular 20 下只给
+#   `imports: [CommonModule]` 时，它的 exports **不会展开进动态组件作用域**，
+#   于是模板里所有 *ngIf / *ngFor 静默变成 <!----> 空注释：
+#     静态 HTML 正常、{{ 插值 }} 正常、@if/@for 正常，但看板里部件整片空白，
+#     控制台零报错（WidgetComponent.detectChanges 把异常吞了）。
+#   看板引用的 42 个部件 100% 用了 *ngIf，所以表现是「所有功能都不好使」，
+#   极易误判成「数据没初始化」。
+#
+#   修法是在 dynamic-component-factory.service.ts 里显式列 NgIf/NgForOf 等。
+#   这里守住两道：① 部件模板确实在用结构型指令 ② 工厂里确实导了它们。
+#   两者任一不成立就说明有人把修复改回去了，或换了构建链。
+C "3d. 部件模板指令兼容"
+WIDGET_DIR="$ROOT/guard-server/src/main/data/json/system/widget_types"
+FACTORY="$ROOT/ui-ngx/src/app/core/services/dynamic-component-factory.service.ts"
+if [[ ! -d "$WIDGET_DIR" ]]; then
+  warn "找不到 widget_types 源目录，跳过"
+elif ! command -v grep >/dev/null 2>&1; then
+  warn "缺少 grep，跳过"
+else
+  NG_USERS=$(grep -l '\*ngIf\|\*ngFor' "$WIDGET_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$NG_USERS" == "0" ]]; then
+    ok "部件模板未使用 *ngIf/*ngFor，无需检查"
+  elif [[ ! -f "$FACTORY" ]]; then
+    warn "找不到 dynamic-component-factory.service.ts，跳过"
+  elif grep -q 'NgIf' "$FACTORY" 2>/dev/null; then
+    ok "${NG_USERS} 个部件用结构型指令，工厂已显式导入 NgIf/NgForOf"
+  else
+    bad "${NG_USERS} 个部件用了 *ngIf/*ngFor，但工厂没显式导入 NgIf"
+    echo "      后果：看板所有部件区域空白（*ngIf 静默变 <!---->），控制台无报错"
+    echo "      修法：在 $FACTORY"
+    echo "            componentImports 里加上 NgIf, NgForOf（详见手册「看板整片空白」）"
+    N=$((N+1))
+  fi
+fi
+
 # ---------------------------------------------------------------- 4. 服务健康
 C "4. 服务健康"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' \

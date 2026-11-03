@@ -707,6 +707,78 @@ python3 scripts/31-rtu-simulate.py --interval 30 --no-pq-anomaly
 > 已经跑过的不必再动。日常只用上表三个，加 `02-onboard`、`09-onboard-customer`、
 > `10-cleanup-customer`。不确定某个脚本干什么：看它开头 20 行的注释。
 
+### 在哪儿找「电能质量数据集」
+
+左侧菜单 → **电能质量**（可展开）→ **数据集管理**。
+
+```
+电能质量
+├── 实时监测      看电压/频率/谐波等实时曲线（原有看板）
+└── 数据集管理    建数据集、看可评价性、圈选历史数据  ← 本功能
+```
+
+> **存量环境看不到这个子项？** 客户端菜单是初始化时装的。
+> 升级后需要触发一次菜单重建：
+> ```bash
+> # 在部署目录，用租户管理员调一次
+> bash scripts/02-onboard.sh --admin <租户管理员邮箱> --admin-pass '<密码>' \
+>   --tenant <租户名> --tenant-email tenant@example.com --tenant-pass '<租户密码>'
+> # 或直接调接口（token 从 /api/auth/login 取）
+> curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/energy/repair-init \
+>   -H "X-Authorization: Bearer $TOKEN"
+> ```
+> 平台会检测「电能质量分组里有没有『数据集管理』」，缺了就重建菜单。
+> 已经是最新结构时不会覆盖客户对菜单的其它调整。
+
+**客户账号能看到哪些设备**：只看自己客户的设备
+（`/api/customer/{id}/devices`）。租户管理员看全部。
+
+### 电能质量数据集：CAPTURE 需要固件支持
+
+「电能质量数据集」部件支持两种来源，对设备的要求完全不同：
+
+| 来源 | 需要什么 | 现在能用吗 |
+| --- | --- | --- |
+| **TS_KV 圈选** | 设备**曾经上报过**数据（历史数据在库里） | ✅ 能，无需固件改动 |
+| **CAPTURE 实时采集** | 设备声明并实现 `startPqSession` / `stopPqSession` | ⚠ 需固件实现 |
+
+**CAPTURE 的前置条件**（三者缺一不可）：
+
+1. 设备档案的 `rpcCommands`（SERVER_SCOPE）里有采集命令声明
+2. 设备的 MQTT 连接在线
+3. 固件真的实现了该命令
+
+平台在**选设备那一刻**就会探测并提示：
+
+```
+✓ 可下发 startPqSession / stopPqSession     ← 能建 CAPTURE 数据集
+⚠ 该设备不支持采集命令 —— 该设备没有声明 rpcCommands...   ← 只能走 TS_KV 圈选
+```
+
+**怎么给设备加声明**：在设备档案的 `rpcCommands` 属性里写
+
+```json
+{
+  "note": "平台约定命令，需 RTU 固件实现",
+  "methods": [
+    {"method": "startPqSession", "pqRole": "start",
+     "params": {"datasetId": "uuid", "plannedSeconds": "int", "intervalMs": "int"}},
+    {"method": "stopPqSession", "pqRole": "stop", "params": {"datasetId": "uuid"}}
+  ]
+}
+```
+
+`pqRole` 是解析依据 —— 现场叫什么名字都行（`beginCapture` 也可以），
+只要标了 `pqRole: start/stop` 平台就认。
+
+> ⚠ **声明了不等于固件实现了**。平台下发后只会得到「命令已入队」，
+> 是否真的在采**只看点数有没有增长**。固件没实现时命令会一直排在
+> `rpc` 表里（状态 `QUEUED`），数据集停在 CAPTURING 但一个点都不来。
+> 这是平台无法替你验证的事，必须现场确认。
+
+**没有固件支持时的可用路径**：用 TS_KV 圈选 —— 只要设备历史上报过数据，
+就能圈出一段做成数据集，完全不需要固件改动。
+
 ### 电能质量覆盖
 
 三相模拟表按**专业电能质量表**的能力布局（tier = `harmonic` / `pq`）：

@@ -56,7 +56,7 @@ bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
 
 ```bash
 ls ~/energy-app/guard-server-4.4.0.jar
-ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 24
+ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 25
 ls ~/energy-app/data/sql/*.sql | wc -l                   # 必须是 8
 ```
 
@@ -181,6 +181,10 @@ sudo firewall-cmd --reload
 
 云服务器（阿里云/腾讯云/AWS）还要在控制台**安全组**放行同样的 TCP 端口。
 这是“容器起来了但外面访问不了”最常见的原因。
+
+> **macOS 本机**不需要放行（系统防火墙默认不拦已签名的 Docker），但首次启动
+> Docker Desktop 时系统会弹「是否允许接受传入网络连接」，**必须点允许**。
+> 已经误点拒绝的：系统设置 → 网络 → 防火墙 → 选项，把 Docker 加回来。
 
 ---
 

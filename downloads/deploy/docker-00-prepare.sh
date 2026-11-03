@@ -347,17 +347,27 @@ else
   ENV_MQTT_RTU_PORT=$MQTT_RTU_PORT
 fi
 
-# 遥测后端：按宿主机物理内存自动选（详见下面 .env 注释）。
+# 遥测后端：默认 sql。
+#
+# ★ 为什么默认改成 sql（2026-11-03 实测）：
+#   旧逻辑「物理内存 ≥ 10GB → cassandra」，直觉是「大内存用高写入吞吐的 Cassandra」。
+#   但本平台的业务代码是围绕 SQL 遥测写的：
+#     · 峰谷分析要小时桶 MAX（ts_kv GROUP BY），SQL 一条语句就完
+#     · 电能质量要圈选历史点、算采样间隔、统计非数值行
+#     · 手册里的运维 SQL（08-ops-sql.md）全部是 ts_kv 查询
+#   Cassandra 部署下 PostgreSQL **没有 ts_kv 表**，这些路径要么报
+#   relation does not exist（500），要么退化成分段读（慢到另一个数量级）。
+#   16GB 的机器按旧逻辑选了 Cassandra，现场表现为「看板空白 / 功能不好使」，
+#   排查了半天才发现是遥测后端选错了。
+#
+#   真要 Cassandra（千万行以上、写入压力大）：显式指定
+#     DATABASE_TS_TYPE=cassandra bash docker-00-prepare.sh
+#   此时业务侧的 ts_kv 直查会自动降级走 timeseriesService（能用，但慢）。
+#
 # ★ 必须在 heredoc **之前**求值：heredoc 里写 `VAR=$(...)` 只是往文件里写字面量，
 #   而 `$DATABASE_TS_TYPE` 会被立即展开 —— set -u 下未定义就直接退出（实测）。
 HOST_MEM_GB=$( (sysctl -n hw.memsize 2>/dev/null || awk '/MemTotal/{printf "%.0f\n", $2*1024}' /proc/meminfo 2>/dev/null || echo 0) | awk '{printf "%.0f", $1/1073741824}' )
-if [[ -n "${DATABASE_TS_TYPE:-}" ]]; then
-  DATABASE_TS_TYPE="$DATABASE_TS_TYPE"
-elif [[ "${HOST_MEM_GB:-0}" -ge 10 ]]; then
-  DATABASE_TS_TYPE="cassandra"
-else
-  DATABASE_TS_TYPE="sql"
-fi
+DATABASE_TS_TYPE="${DATABASE_TS_TYPE:-sql}"
 DATABASE_TS_LATEST_TYPE="${DATABASE_TS_LATEST_TYPE:-sql}"
 
 cat > "$STAGE/.env" <<ENVEOF
@@ -394,17 +404,23 @@ TB_API_PASSWORD=tenant
 # 遥测存储后端：sql（遥测与实体同存 Postgres）| cassandra（独立时序库，需 ~2GB 常驻）
 # 改这个值不迁移存量数据；空库部署随便切。详见手册「Cassandra」一节。
 #
-# ★ 默认值按**宿主机物理内存**自动选（2026-10-25 实测教训）：
-#   8GB 机器上 Cassandra 堆 2G + 页缓存 + 其它三个容器会把 Docker VM 挤爆，
-#   Cassandra 被反复杀 → commitlog 写到一半 → 下次启动报
-#   "Could not read commit log descriptor" 并无限重启，平台整体 502。
-#   而这种损坏**不会自己好**，只能清 commitlog 才恢复
-#   （scripts/12-cassandra-recover.sh）。
+# ★ 默认 **sql**（2026-11-03 改，之前是「内存≥10GB 就用 cassandra」）：
 #
-#   数据量在千万行 / 20GB 以内时，Postgres 存遥测完全够用，所以：
-#     物理内存 < 10GB  → 默认 sql（少一个容器、少 2GB 常驻、少一整类故障）
-#     物理内存 ≥ 10GB  → 默认 cassandra（高写入吞吐更好）
-#   要强制指定就显式导出 DATABASE_TS_TYPE=cassandra|sql 再跑本脚本。
+#   为什么推翻内存逻辑：
+#   ① 业务代码是围绕 SQL 遥测写的。峰谷分析要小时桶 MAX（ts_kv GROUP BY）、
+#      电能质量要圈选历史点与采样间隔 —— 这些用 SQL 一条语句就完。
+#      Cassandra 部署下 PostgreSQL 没有 ts_kv 表，这些路径要么 500，
+#      要么退化成逐段读（慢到另一个数量级）。
+#   ② 手册里的运维 SQL（⑩ 运维 SQL）全部是 ts_kv 查询，Cassandra 下一条都跑不了。
+#   ③ 16GB 机器按旧逻辑选了 cassandra，现场表现是「看板空白 / 功能不好使」，
+#      排查了很久才定位。大内存不等于该用 Cassandra —— 要看代码怎么用数据。
+#
+#   旧逻辑保留的另一半理由仍然成立（8GB 机器 Cassandra 会把 VM 挤爆）：
+#   数据量在千万行 / 20GB 以内，Postgres 存遥测完全够用。
+#
+#   真要 Cassandra（千万行以上、写入压力大）：
+#     DATABASE_TS_TYPE=cassandra bash docker-00-prepare.sh
+#   此时业务侧针对 ts_kv 的查询会自动降级走 timeseriesService（能用，但慢）。
 DATABASE_TS_TYPE=$DATABASE_TS_TYPE
 # 最新值后端：建议留 sql（查询快、与实体同库）
 DATABASE_TS_LATEST_TYPE=$DATABASE_TS_LATEST_TYPE

@@ -38,6 +38,55 @@ done
 # shellcheck disable=SC1091
 set -a; . ./.env; set +a
 
+# ===== Docker 可用性快检（精简版）=====
+# 完整版（自动拉起 + 三平台分类报错）在 docker-01-install.sh。
+# 这里只拦一个痑心场景：上一次还能跑，这次 daemon 没了/卡死了 ——
+# 不拦就会在后面一堆 docker compose 调用里报些看不懂的错。
+# ⚠ 改 01 的那段时请回来同步此处。
+#
+# 必须带超时：daemon 卡死时 docker info 不是报错而是**挂住**，
+# 不加超时用户看到的就是脚本卡死（macOS 实测 3 分钟不返回）。
+_docker_ok() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 10 docker info >/dev/null 2>&1
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout 10 docker info >/dev/null 2>&1
+  else
+    docker info >/dev/null 2>&1 &
+    local pid=$! i=0
+    while kill -0 "$pid" 2>/dev/null; do
+      if (( i >= 10 )); then
+        # 先收子孙再收本体：子进程握着输出管道会让调用方继续等
+        pkill -TERM -P "$pid" 2>/dev/null || true
+        kill -TERM "$pid" 2>/dev/null || true
+        sleep 1
+        pkill -KILL -P "$pid" 2>/dev/null || true
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        return 1
+      fi
+      i=$((i + 1))
+      sleep 1
+    done
+    wait "$pid" 2>/dev/null
+  fi
+}
+
+if ! _docker_ok; then
+  case "$(uname -s)" in
+    Darwin)
+      die "Docker Desktop 未运行或未响应
+  启动：open -a Docker，等鲸鱼图标不再转动后重跑
+  已启动但仍报错：osascript -e 'quit app \"Docker\"' && pkill -f com.docker.backend && open -a Docker"
+      ;;
+    *)
+      die "Docker 守护进程未运行或无权限
+  sudo systemctl start docker
+  仍报权限错：sudo usermod -aG docker \$USER && newgrp docker"
+      ;;
+  esac
+fi
+
 # APP_HOME 是 compose 里挂载 jar 与 data 的基准路径，空值会让 compose 直接报错。
 # 正常流程是 01 → 02，这里只是防止跳过 01 直接跑 02。
 if [[ -z "${APP_HOME:-}" || ! -f "${APP_HOME}/guard-server-4.4.0.jar" ]]; then
@@ -136,13 +185,31 @@ elif echo "$STATE" | grep -q "ACCOUNT_REQUIRED"; then
     || die "系统还没有管理员，请加参数：--admin-email ... --admin-pass ..."
 
   log "创建系统管理员 $ADMIN_EMAIL"
+  # ⚠ 必须带 `|| CODE=000`（2026-11-03 实测踩过）：
+  #   set -euo pipefail 下，`CODE=$(curl ...)` 一旦 curl 自己失败（连不上 /
+  #   超时，退出码非 0），赋值语句就整体非零 → **脚本静默退出**，
+  #   用户只看到「服务已就绪」然后什么都没了，既不知道失败也不知道为什么。
+  #   更旧的版本里还会拖到后面报 `CODE: unbound variable`。
+  #   带上 || 之后，任何传轮失败都会走下面的分支给出明确错误。
+  rm -f /tmp/energy-setup.json
   CODE=$(ncurl -m 120 -o /tmp/energy-setup.json -w '%{http_code}' \
     -X POST "$BASE/api/noauth/setup/complete" \
     -H 'Content-Type: application/json' \
-    -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASS\",\"loadDemo\":false}")
+    -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASS\",\"loadDemo\":false}") || CODE="000"
   if [[ "$CODE" != "200" ]]; then
-    cat /tmp/energy-setup.json
-    echo
+    if [[ -s /tmp/energy-setup.json ]]; then
+      cat /tmp/energy-setup.json
+      echo
+    else
+      warn "没有响应体 —— 请求没打到服务"
+    fi
+    case "$CODE" in
+      000) die "创建管理员失败：连不上 ${BASE}
+  服务刚启动时 gateway 可能还没就上后端，等 30 秒重跑同一条命令即可
+  仍是 000：bash docker-97-preflight.sh 看容器状态" ;;
+      502|503|504) die "创建管理员失败：HTTP ${CODE}（gateway 起来了但后端还没就绪）
+  等 1-2 分钟重跑同一条命令。先确认：docker ps | grep energy-server" ;;
+    esac
     die "创建管理员失败（HTTP ${CODE}）"
   fi
   ok "管理员已创建"
@@ -212,7 +279,7 @@ WHERE key = 'general';" >/dev/null 2>&1 \
 TOKEN=$(ncurl -m 30 -X POST "$BASE/api/auth/login" \
   -H 'Content-Type: application/json' \
   -d "{\"username\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASS\"}" \
-  | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  | sed -n 's/.*"token":"\([^"]*\)".*/\1/p') || TOKEN=""
 
 if [[ -z "$TOKEN" ]]; then
   warn "登录失败。若管理员已在别处创建，请用当时设置的密码；"
@@ -220,7 +287,7 @@ if [[ -z "$TOKEN" ]]; then
   die "管理员登录验证未通过"
 fi
 
-ME=$(ncurl -m 20 -H "X-Authorization: Bearer $TOKEN" "$BASE/api/auth/user")
+ME=$(ncurl -m 20 -H "X-Authorization: Bearer $TOKEN" "$BASE/api/auth/user") || ME=""
 echo "$ME" | grep -q '"authority":"SYS_ADMIN"' || die "登录成功但不是 SYS_ADMIN，返回：$ME"
 
 # 设备接入通道。
@@ -229,9 +296,9 @@ echo "$ME" | grep -q '"authority":"SYS_ADMIN"' || die "登录成功但不是 SYS
 # 端点装了但 token 不对也是 404，两者分不出来。直接看装配条件：
 #   DeviceApiController 要求 service.type=monolith 且 transport.http.enabled=true
 SVC_TYPE=$($COMPOSE $PROFILE_ARGS exec -T energy-server \
-  sh -c 'printf "%s" "${SERVICE_TYPE:-}"' 2>/dev/null | tr -d '\r\n')
+  sh -c 'printf "%s" "${SERVICE_TYPE:-}"' 2>/dev/null | tr -d '\r\n') || SVC_TYPE=""
 HTTP_ON=$($COMPOSE $PROFILE_ARGS exec -T energy-server \
-  sh -c 'printf "%s" "${HTTP_ENABLED:-}"' 2>/dev/null | tr -d '\r\n')
+  sh -c 'printf "%s" "${HTTP_ENABLED:-}"' 2>/dev/null | tr -d '\r\n') || HTTP_ON=""
 
 if [[ "$SVC_TYPE" == "monolith" && "$HTTP_ON" == "true" ]]; then
   ok "设备接入通道已开放（HTTP + MQTT）"

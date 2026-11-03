@@ -305,6 +305,37 @@ def keep_devices(customer):
 
 # ============ RPC 能力（写进设备属性，供界面/脚本查）============
 RPC_SPECS = {
+    # ── 电能质量采集会话（平台侧约定，2026-11-03）────────────────────
+    #
+    # ★ 这是**平台与 RTU 之间的约定命令**，不是任何国标规定的东西。
+    #   固件必须先实现它们，否则平台下发后没人执行。
+    #   平台侧的防御：下发前先读这份 rpcCommands，找不到命令就拒绝创建数据集，
+    #   不会盲发一个固件不认识的名字然后静默超时（那种故障两边日志都对，查不出来）。
+    #
+    # pqRole 是解析依据：现场叫什么名字都行（beginCapture 也可以），
+    # 只要标了 pqRole=start / stop，平台就认。
+    'PowerMeter-DDSU666': {
+        'note': '正泰单相电表（经 RTU 转发）。startPqSession/stopPqSession 为平台约定命令，需固件实现',
+        'methods': [
+            {'method': 'startPqSession', 'pqRole': 'start',
+             'params': {'datasetId': 'uuid', 'plannedSeconds': 'int',
+                        'intervalMs': 'int', 'build': 'object', 'standards': 'array'},
+             'desc': '按国标节拍启动 PQ 采集（平台约定；固件需实现）'},
+            {'method': 'stopPqSession', 'pqRole': 'stop',
+             'params': {'datasetId': 'uuid'},
+             'desc': '停止 PQ 采集（平台约定；固件需实现）'},
+        ],
+    },
+    'PowerMeter-3P-SIM': {
+        'note': '三相模拟表。声明采集命令仅用于验证平台下发链路；模拟器本身不执行 RPC',
+        'methods': [
+            {'method': 'startPqSession', 'pqRole': 'start',
+             'params': {'datasetId': 'uuid', 'plannedSeconds': 'int', 'intervalMs': 'int'},
+             'desc': '启动 PQ 采集（模拟表不真执行，仅验证平台能否下发）'},
+            {'method': 'stopPqSession', 'pqRole': 'stop',
+             'params': {'datasetId': 'uuid'}, 'desc': '停止 PQ 采集'},
+        ],
+    },
     'Relay-8CH': {
         'note': '8 路继电器，真实 RTU 执行',
         'methods': [
@@ -712,7 +743,14 @@ def ensure_device(api, spec, site, customer_id, gw_id, log):
         attrs['wiring'] = spec['wiring']
     api.post('/api/plugins/telemetry/DEVICE/%s/SERVER_SCOPE' % did, attrs)
 
-    rpc = RPC_SPECS.get(name)
+    # ★ 用**基名**查 RPC_SPECS（2026-11-03 修）：
+    #   模拟设备的 name 是 'PowerMeter-3P-SIM·平台演示中心'（带客户名后缀），
+    #   而 RPC_SPECS 的键是基名 'PowerMeter-3P-SIM'。
+    #   原来直接 RPC_SPECS.get(name) 永远落空 ——
+    #   实测确认：8 台模拟设备的 rpcCommands 属性全为「无」，
+    #   连 AHU-SIM 的 setMode、Breaker-SIM 的 setState 也从没生效过。
+    #   界面不报错，只是点了没反应，最难查。
+    rpc = RPC_SPECS.get(_device_base_name(name)) or RPC_SPECS.get(name)
     if rpc:
         api.post('/api/plugins/telemetry/DEVICE/%s/SERVER_SCOPE' % did,
                  {'rpcCommands': rpc})
