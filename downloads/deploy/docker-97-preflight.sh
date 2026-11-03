@@ -98,45 +98,45 @@ C "3. 脚本一致性（仓库是唯一真相，部署目录是副本）"
 SRC_DIR="$ROOT/shiyongshouce/downloads/scripts"
 DST_DIR="$APP_HOME/scripts"
 
-# ★ 只比对 02 起的脚本 —— 这是 docker-00-prepare.sh 的拷贝规则，两处必须一致。
+# ★ 清单规则在 _deploy-manifest.sh 里（唯一真相），与 docker-00-prepare.sh（拷贝）、
+#   32-check-deploy-sync.sh（比对+同步）共用同一份。
 #
 #   01-install.sh 是「不起 Docker、直连数据库」的裸机路径，**有意不进**
 #   Docker 部署目录（放进去只会让人误以为要跑它）。
 #   本脚本第一版用 `*` 全比，误报「部署目录缺 01-install.sh」——
 #   教训：写检查判据前先确认「正确状态长什么样」，别拿「仓库有什么」
-#   当「部署目录该有什么」。规则变了要同时改这里和 docker-00-prepare.sh。
-# 两个通配符：0[2-9]-* 覆盖 02..09，[1-9][0-9]-* 覆盖 10..99。
-# 只写前者会漏掉 10-cleanup-customer.sh（踩过：手册让用户跑，但没进部署目录）。
-SCRIPT_GLOBS=( '0[2-9]-*' '[1-9][0-9]-*' )
+#   当「部署目录该有什么」。
+#
+#   历史教训（这条规则为什么不能散着写）：prepare 曾漏拷 dev-fast-build.sh，
+#   于是手册里的 `cd ~/energy-app && bash scripts/dev-fast-build.sh` 从来跑不了。
+MANIFEST=""
+[[ -f "$SRC_DIR/_deploy-manifest.sh" ]] && MANIFEST="$SRC_DIR/_deploy-manifest.sh"
+[[ -z "$MANIFEST" && -f "$DST_DIR/_deploy-manifest.sh" ]] && MANIFEST="$DST_DIR/_deploy-manifest.sh"
+if [[ -n "$MANIFEST" ]]; then
+  # shellcheck source=/dev/null
+  source "$MANIFEST"
+else
+  bad "缺 _deploy-manifest.sh（部署脚本清单的唯一真相）"
+  N=$((N+1))
+fi
 
-is_ops_script() {
-  local n="$1" g
-  for g in "${SCRIPT_GLOBS[@]}"; do
-    [[ "$n" == $g ]] && return 0
-  done
-  return 1
-}
-
-if [[ -d "$SRC_DIR" && -d "$DST_DIR" ]]; then
+if [[ -d "$SRC_DIR" && -d "$DST_DIR" && -n "$MANIFEST" ]]; then
   N=0; TOTAL=0
-  for f in "$SRC_DIR"/0[2-9]-* "$SRC_DIR"/[1-9][0-9]-*; do
-    [[ -e "$f" ]] || continue
+  for b in $(deploy_list_scripts "$SRC_DIR"); do
+    [[ -z "$b" ]] && continue
     TOTAL=$((TOTAL+1))
-    b=$(basename "$f")
     if [[ ! -f "$DST_DIR/$b" ]]; then
       bad "部署目录缺脚本：$b"
       N=$((N+1))
-    elif ! diff -q "$f" "$DST_DIR/$b" >/dev/null 2>&1; then
+    elif ! diff -q "$SRC_DIR/$b" "$DST_DIR/$b" >/dev/null 2>&1; then
       bad "脚本过期：${b}（cp 过去）"
       N=$((N+1))
     fi
   done
 
   # 反向检查：部署目录里有、仓库里没有的 → 是旧版残留，容易被误跑
-  for f in "$DST_DIR"/*; do
-    [[ -e "$f" ]] || continue
-    b=$(basename "$f")
-    is_ops_script "$b" || continue
+  for b in $(deploy_list_scripts "$DST_DIR"); do
+    [[ -z "$b" ]] && continue
     [[ -f "$SRC_DIR/$b" ]] || { bad "部署目录有仓库已删的脚本：${b}（删掉它，避免误跑）"; N=$((N+1)); }
   done
 

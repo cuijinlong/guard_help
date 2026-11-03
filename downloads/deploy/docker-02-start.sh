@@ -270,15 +270,75 @@ if command -v lsof >/dev/null 2>&1; then
   fi
 fi
 
+# ---------------- 2.6 双入口自检 ----------------
+#
+# 为什么要两个口都测：
+#   只有 Web 入口时，现场出问题无法区分「Java 挂了」还是「nginx 挂了」——
+#   两者的表现都是页面打不开。有了直连口，一条命令就能定位：
+#     Web 通、直连不通 → gateway / nginx 问题
+#     两个都不通        → energy-server 本身问题
+#     两个都通          → 问题在浏览器侧 / 网络 / 防火墙
+#
+# 前面已经用 $BASE（=HTTP_PORT）等到 setup/state 返回 JSON，
+# 所以走到这里 Web 入口理论上是通的。再确认一次是为了在
+# 「中途 nginx 挂了」或「宿主机端口被别的进程抢走」时能报出来。
+DIRECT_P="${SERVER_DIRECT_PORT:-}"
+WEB_OK=0
+DIRECT_OK=0
+
+WEB_CODE=$(ncurl -o /dev/null -w '%{http_code}' -m 5 "${BASE}/api/noauth/energy/health" 2>/dev/null || echo 000)
+if [[ "$WEB_CODE" == "200" ]]; then
+  WEB_OK=1
+  ok "Web 入口 ${PORT} 正常（经 gateway）"
+else
+  warn "Web 入口 ${PORT} 返回 ${WEB_CODE} —— 浏览器会打不开"
+fi
+
+if [[ -n "$DIRECT_P" ]]; then
+  D_CODE=$(ncurl -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:${DIRECT_P}/api/noauth/energy/health" 2>/dev/null || echo 000)
+  if [[ "$D_CODE" == "200" ]]; then
+    DIRECT_OK=1
+    ok "直连入口 ${DIRECT_P} 正常（绕过 nginx）"
+  else
+    warn "直连入口 ${DIRECT_P} 返回 ${D_CODE}"
+  fi
+
+  if [[ "$WEB_OK" == "1" && "$DIRECT_OK" == "0" ]]; then
+    warn "诊断：Java 活着但 nginx 不通。看 docker compose logs gateway"
+  elif [[ "$WEB_OK" == "0" && "$DIRECT_OK" == "1" ]]; then
+    warn "诊断：Java 正常，问题在 gateway。浏览器暂时可用 http://本机IP:${DIRECT_P}/ 应急"
+  elif [[ "$WEB_OK" == "0" && "$DIRECT_OK" == "0" ]]; then
+    warn "诊断：两个口都不通，energy-server 本身有问题：docker compose logs --tail=80 energy-server"
+  fi
+fi
+
+# 远程访问（客户从自己电脑访问）还要过一道宿主机防火墙 —— 容器映射只管本机
+if [[ "$WEB_OK" == "1" ]]; then
+  cat <<FIREWALL
+
+  ── 远程访问前提（客户机器/公网访问）───────────────────
+  容器端口映射只保证「本机可访问」。从别的机器访问还需放行防火墙：
+    Ubuntu/Debian  sudo ufw allow ${PORT}/tcp
+    CentOS/RHEL    sudo firewall-cmd --add-port=${PORT}/tcp --permanent && sudo firewall-cmd --reload
+    云服务器       在控制台安全组放行 TCP ${PORT}
+  设备上报还需放行 MQTT：TCP ${MQTT_PORT}${MQTT_RTU_PORT:+ / ${MQTT_RTU_PORT}}
+  ─────────────────────────────────────────────────────
+FIREWALL
+fi
+
 cat <<DONE
 
 ============================================================
  第 3 步完成：服务已启动，管理员已就绪
 ============================================================
 
-  访问地址
-    http://localhost:${PORT}/
-    （服务器部署则用 http://服务器IP:${PORT}/）
+  访问地址（浏览器）
+    http://本机IP:${PORT}/           ← Web 入口（经 gateway）
+    http://本机IP:${DIRECT_P:-8091}/   ← 直连口，仅排查用
+
+  ★ ${PORT}（.env 里的 HTTP_PORT）是 **gateway(nginx)**，不是 Java。
+    nginx 挂了页面打不开，但 Java 可能还活着 —— 用直连口区分。
+    不要把浏览器入口改成直连口：会丢掉 /ngxai 反代与 SPA 回退。
 
   系统管理员
     ${ADMIN_EMAIL}

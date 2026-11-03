@@ -860,6 +860,10 @@ def ensure_customer_user(api, customer_id, customer_name, log, password='demo123
 
     <p>**③ 要用 token 调 `/api/noauth/activate` 设密码** —— 这一步才真正
     把密码写进去并置为 active。跳过它，账号永远登不进去。
+
+    <p>**返回值语义**：`(email, password)`。`password` 为 `None` 表示
+    「这个账号的密码不是我们设的默认值」（已存在且改过密码、或建失败），
+    调用方**不得**把默认密码报给用户。
     """
     email = 'demo+%s@126.com' % customer_id.replace('-', '')[:8]
 
@@ -869,8 +873,26 @@ def ensure_customer_user(api, customer_id, customer_name, log, password='demo123
     if isinstance(d, dict):
         existing = next((u for u in (d.get('data') or []) if u.get('email') == email), None)
     if existing is not None:
-        log('  · 账号 %s 已存在' % email)
-        return email, password
+        log('  · 账号 %s 已存在，不重建' % email)
+        # 实测密码能不能用，而不是假设它就是默认值。
+        #
+        # 旧写法直接 `return email, password`，于是结尾永远打印
+        # 「客户账号: xxx / demo123456」—— 客户改过密码后，这条提示
+        # 就是错的，人会去试一个登不进去的密码（2026-11-03 客户提问暴露）。
+        #
+        # 现在拿默认密码登一次：
+        #   登得进 → 密码确实是默认值，可以照实报
+        #   登不进 → 密码被改过或账号被禁用，不能再报默认值
+        if api.dry:
+            log('    （dry-run 不验证密码）')
+            return email, None
+        code, _ = api.call('POST', '/api/auth/login',
+                           {'username': email, 'password': password}, auth=False)
+        if code == 200:
+            log('    ✓ 默认密码可用')
+            return email, password
+        log('    ! 默认密码登不进去（客户可能改过密码，或账号被禁用）')
+        return email, None
 
     if api.dry:
         log('  + 账号 %s 将新建' % email)
@@ -1165,14 +1187,24 @@ def main():
     log('\n=== 完成 ===')
     log('客户      : %s (%s)' % (customer_name, cust_short))
     if user_email:
-        log('客户账号  : %s / %s' % (user_email, user_pass))
+        if user_pass:
+            log('客户账号  : %s / %s' % (user_email, user_pass))
+        else:
+            # 密码不是我们设的默认值（改过 / 被禁 / 建失败）—— 不能报一个错的
+            log('客户账号  : %s' % user_email)
+            log('            密码沿用原值（本脚本没改）；忘了就去「客户与用户 → 用户」重置')
     log('场站      : %s / %s' % (site_single_name, site_three_name))
     log('模拟设备  : %d / %d' % (ok, len(SIM_DEVICES)))
     if args.dry_run:
         log('（dry-run 共计划写入 %d 次）' % api.writes)
     log('\n下一步：')
-    log('  1) 给这个客户建账号并绑定（客户与用户 → 新建用户 → 客户选 %s）' % customer_name)
-    log('  2) python3 scripts/31-rtu-simulate.py --customer "%s" --interval 30' % customer_name)
+    if not user_email:
+        log('  1) 给这个客户建账号并绑定（客户与用户 → 新建用户 → 客户选 %s）' % customer_name)
+    log('  %s) 启动模拟上报（长期运行）：' % ('2' if not user_email else '1'))
+    log('     nohup bash scripts/29-rtu-demo-up.sh --sim-only --customer "%s" \\' % customer_name)
+    log('       > /tmp/rtu-sim.log 2>&1 &')
+    log('  %s) 看谁在报、谁停了：' % ('3' if not user_email else '2'))
+    log('     bash scripts/29-rtu-demo-up.sh --status --customer "%s"' % customer_name)
     return 0 if ok == len(SIM_DEVICES) else 1
 
 

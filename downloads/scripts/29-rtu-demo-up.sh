@@ -16,23 +16,36 @@
 #   模拟上报由本脚本跑 31-rtu-simulate.py 控制。
 #   两者写的是**不同设备**，互不覆盖，场站总量是两者之和。
 #
-#   ┌──────────────────┬────────┬────────┬──────────────────────────────┐
-#   │ 场景             │ 模拟   │ 真实   │ 命令                         │
-#   ├──────────────────┼────────┼────────┼──────────────────────────────┤
-#   │ 纯演示（无硬件） │  开    │   --   │ --sim-only                   │
-#   │ 纯现场（真表）   │  关    │  开    │ --no-sim                     │
-#   │ 混合（真表+模拟）│  开    │  开    │ 默认（不加这两个参数）       │
-#   │ 只看不跑         │   --   │   --   │ --status                     │
-#   └──────────────────┴────────┴────────┴──────────────────────────────┘
+#   ┌──────────────────────────────┬──────────┬──────────┬─────────┐
+#   │ 场景 / 参数                    │ 建账号？ │ 写模拟？ │ 常驻？  │
+#   ├──────────────────────────────┼──────────┼──────────┼─────────┤
+#   │ （无参数）新库一键到能演示     │   会     │   会     │   否    │
+#   │ --sim-only  客户已建好只跑数据 │  不建    │   会     │   是    │
+#   │ --no-sim    只要真实 RTU        │   会     │   不     │   否    │
+#   │ --status    看谁在报、谁停了   │  不建    │   不     │   否    │
+#   │ --check     只体检（dry-run）  │  不建    │   不     │   否    │
+#   └──────────────────────────────┴──────────┴──────────┴─────────┘
 #
-# 用法：
-#   bash scripts/29-rtu-demo-up.sh                          # 默认：初始化 + 混合数据
-#   bash scripts/29-rtu-demo-up.sh --customer "新客户名"     # 给新客户初始化
-#   bash scripts/29-rtu-demo-up.sh --sim-only               # 只跑模拟上报（长期）
-#   bash scripts/29-rtu-demo-up.sh --no-sim                 # 不跑模拟，只靠真实 RTU
-#   bash scripts/29-rtu-demo-up.sh --backfill-days 0        # 不回填历史
-#   bash scripts/29-rtu-demo-up.sh --status                 # 看谁在报、谁停了
-#   bash scripts/29-rtu-demo-up.sh --check                  # 只体检，不改数据
+# 常用命令（可直接复制）：
+#
+#   # 【最常用】客户已建好，恢复模拟上报（常驻，Ctrl-C 或 pkill 停）
+#   nohup bash scripts/29-rtu-demo-up.sh --sim-only --interval 30 \
+#     > /tmp/rtu-sim.log 2>&1 &
+#   # 停： pkill -f 31-rtu-simulate.py
+#
+#   bash scripts/29-rtu-demo-up.sh --status             # 谁在报、谁停了
+#   bash scripts/29-rtu-demo-up.sh --check              # 改数据前先看一眼
+#   bash scripts/29-rtu-demo-up.sh --no-sim             # 纯现场，不写假数据
+#   bash scripts/29-rtu-demo-up.sh --customer "客户名"   # 多客户环境必带
+#   bash scripts/29-rtu-demo-up.sh --backfill-days 0    # 不回填历史
+#
+# ★ 关键区别：
+#   --sim-only **不建客户、不建账号、不建场站设备**，直接发数据。
+#     客户不存在时会报「找不到客户 xxx」并退出，不会替你建。
+#   其余带初始化的参数会调用 30-rtu-env-init.py，那里会对客户与账号查重：
+#     账号按 demo+<客户id前8位>@126.com 查重，已存在就不重建、不改密码；
+#     若客户改过密码，结尾**不会**误报默认密码，而是提示「密码沿用原值」。
+#     你自己在后台另建的邮箱不受影响（会多一个演示账号，两者共存）。
 #
 # 幂等：反复执行无害。
 # ==============================================================================
@@ -66,7 +79,7 @@ while [[ $# -gt 0 ]]; do
     --no-sim)    NO_SIM=1; shift ;;
     --status)    STATUS_ONLY=1; shift ;;
     --check)     CHECK_ONLY=1; shift ;;
-    -h|--help)   sed -n '2,42p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,50p' "$0"; exit 0 ;;
     *) echo "未知参数: $1"; exit 1 ;;
   esac
 done

@@ -123,7 +123,64 @@ curl -s --noproxy '*' http://127.0.0.1:8090/api/noauth/setup/state
 # 期望：{"status":"OK"}（不是 ACCOUNT_REQUIRED）
 ```
 
-**服务地址**：`http://本机IP:8090`（直连后端）或 `http://本机IP`（经 gateway）。
+**服务地址**：
+
+| 端口 | 是什么 | 用途 |
+| --- | --- | --- |
+| `HTTP_PORT`（默认 **8090**） | **gateway / nginx** | 浏览器入口，日常就用这个 |
+| `SERVER_DIRECT_PORT`（默认 **8091**） | **energy-server 直连** | 只用于排查，会绕过 nginx |
+| `MQTT_PORT`（默认 **1883**） | 设备侧 MQTT | RTU / 网关上报 |
+| `MQTT_RTU_PORT`（默认 **11883**） | MQTT 别名端口 | 现场固件把 11883 写死，平台额外监听 |
+
+```
+浏览器 ──▶ :8090 gateway(nginx) ──┬──▶ energy-server :8090 (Java)
+                                  ├──▶ ngxai-backend :18801
+                                  └──▶ /ngxai/ 静态文件
+          :8091 energy-server ─────────┘（直连，仅供排查）
+设备   ──▶ :1883 / :11883 MQTT
+```
+
+**为什么 8090 不是 Java**：容器里 Java 监听 8090，但它**不映射到宿主机**
+（compose 里只有 `expose`）。宿主机的 8090 是 nginx，由它反代到 Java。
+这样 `/ngxai` 反代、gzip、SPA 回退才能生效。
+
+**页面打不开时先分清是谁的问题**：
+
+```bash
+# 两个口都探一次
+curl -s --noproxy '*' -o /dev/null -w 'gateway  :%{http_code}\n' http://127.0.0.1:8090/api/noauth/energy/health
+curl -s --noproxy '*' -o /dev/null -w 'java直连 :%{http_code}\n' http://127.0.0.1:8091/api/noauth/energy/health
+```
+
+| 结果 | 结论 | 怎么办 |
+| --- | --- | --- |
+| 8090 通、8091 通 | 服务正常，问题在浏览器/网络 | 查防火墙、代理、浏览器缓存 |
+| 8090 不通、8091 通 | **gateway 挂了** | `docker compose logs gateway` |
+| 两个都不通 | **Java 挂了** | `docker compose logs --tail=80 energy-server` |
+| 两个都不通且容器没起 | 端口被占 | 看 `docker compose ps` 与 `.env` 的端口 |
+
+> 端口被别的程序占用时，`docker-00-prepare.sh` 会自动顺延并写进 `.env`。
+> **实际端口以 `.env` 为准**，不要假设一定是 8090。
+
+### 从别的机器访问需要放行防火墙
+
+容器端口映射只管**宿主机本机**。客户用自己的电脑访问、或云服务器，还要放行：
+
+```bash
+# Ubuntu / Debian
+sudo ufw allow 8090/tcp
+sudo ufw allow 1883/tcp        # 设备上报
+sudo ufw allow 11883/tcp       # 现场固件写死的端口
+
+# CentOS / RHEL
+sudo firewall-cmd --add-port=8090/tcp --permanent
+sudo firewall-cmd --add-port=1883/tcp --permanent
+sudo firewall-cmd --add-port=11883/tcp --permanent
+sudo firewall-cmd --reload
+```
+
+云服务器（阿里云/腾讯云/AWS）还要在控制台**安全组**放行同样的 TCP 端口。
+这是“容器起来了但外面访问不了”最常见的原因。
 
 ---
 
@@ -218,7 +275,7 @@ bash scripts/29-rtu-demo-up.sh
 | --- | --- |
 | 库表 | 122 张 |
 | 系统部件（install 后 DB 行数） | 743 个 |
-| 交付的部件文件 | 583 个 |
+| 交付的部件文件 | 584 个 |
 | 能源参数字典 | 1 个资产，标准 key **137** 个（电能 122） |
 | 演示客户 | 「平台演示中心」，10 台设备（8 台可模拟） |
 | 归属关系 | 场站 10 条 `SiteContains`，区域/分项按拓扑挂好 |
@@ -335,6 +392,25 @@ cp target/guard-server-4.4.0.jar ~/energy-app/ && docker restart energy-server
 > 两个脚本都**必须从仓库跑**。从 `~/energy-app/scripts` 跑时，
 > `32` 会直接拒绝（拿自己比自己永远报一致），`31` 会因找不到仓库路径而报错。
 > 它们自己知道自己被拷进了部署目录 —— 这就是预防。
+
+### 升级时 .env 的端口项（2026-11-03）
+
+`SERVER_DIRECT_PORT`（直连排查口）是后加的。**老部署的 .env 里没有这一项**，
+compose 会自动用默认值 `8091`。多数情况无需处理，但两种场景要看一眼：
+
+```bash
+# ① 宿主机 8091 已被别的服务占用 → compose up 会报
+#    Bind for 0.0.0.0:8091 failed: port is already allocated
+lsof -nP -iTCP:8091 -sTCP:LISTEN
+
+# ② 确实被占了：在 .env 里显式改一个空闲端口
+#    注意不能与 HTTP_PORT 相同（两个容器抢一个宿主端口）
+echo 'SERVER_DIRECT_PORT=8093' >> ~/energy-app/.env
+docker compose up -d gateway energy-server
+```
+
+> 新部署（跑过新版 `docker-00-prepare.sh` 的）不用管 —— 它会自动找一个
+> 既空闲、又不与 `HTTP_PORT` 相同的值写进 `.env`。
 
 ### 为什么需要这一节（真实故障）
 

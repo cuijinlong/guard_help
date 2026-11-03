@@ -109,15 +109,19 @@ else
 fi
 
 step "2. 运维脚本与源码逐文件比对（缺脚本 = 手册命令直接报 No such file）"
-# ★ 收集规则必须与 docker-00-prepare.sh 的拷贝规则一致：
-#   "0[2-9]-*" "[1-9][0-9]-*"  →  合起来就是「两位数字前缀，排除 00-01」
-#   01-install.sh 是裸机路径，Docker 部署故意不带。
-#   改 prepare 的规则时必须同步改这里，否则自检会误报「缺脚本」。
+# ★ 收集规则在 _deploy-manifest.sh 里 —— 与 docker-00-prepare.sh（拷贝）、
+#   docker-97-preflight.sh（自检）共用同一份，不再各自内联维护。
+#   三处各写一份的代价实测过：preflight 用 `*` 全比误报缺 01-install.sh；
+#   prepare 漏 dev-fast-build.sh，手册里的命令从来跑不了。
 SCRIPTS_APP="$APP/scripts"
-list_scripts() {
-  find "$1" -maxdepth 1 -type f -name '[0-9][0-9]-*' \
-    ! -name '00-*' ! -name '01-*' -exec basename {} \; 2>/dev/null | sort -u
-}
+if [[ -f "$SCRIPTS_SRC/_deploy-manifest.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "$SCRIPTS_SRC/_deploy-manifest.sh"
+else
+  bad "源码里缺 _deploy-manifest.sh（部署脚本清单的唯一真相）"
+  exit 1
+fi
+list_scripts() { deploy_list_scripts "$1"; }
 
 if [[ ! -d "$SCRIPTS_APP" ]]; then
   bad "部署目录没有 scripts/ —— 手册里所有 bash scripts/xxx.sh 都会失败"
@@ -155,7 +159,34 @@ else
   fi
 fi
 
-step "3. 部件 JSON 与源码逐文件比对"
+step "3. 部署根目录的 docker-*.sh（97-preflight / 98-rebuild 容易漏）"
+# 这些也是部署物料，但不在 data/ 也不在 scripts/ —— 之前没人查，
+# 于是 97-preflight 从来没进过部署目录（手册提到就报 No such file）。
+DOCKER_SRC="$HERE/../deploy"
+# ★ 目录不存在时不能静默通过：deploy_list_docker 对不存在的目录返回空，
+#   循环一次不跑，于是永远报「齐全」—— 实测过，路径写错成 ../../deploy
+#   时得到的就是这个假绿。
+[[ -d "$DOCKER_SRC" ]] || { bad "找不到部署脚本源目录：$DOCKER_SRC"; exit 1; }
+DOCKER_MISSING=""
+DOCKER_DIFFED=""
+for b in $(deploy_list_docker "$DOCKER_SRC"); do
+  [[ -z "$b" ]] && continue
+  if [[ ! -f "$APP/$b" ]]; then
+    DOCKER_MISSING+="$b"$'\n'
+  elif ! cmp -s "$DOCKER_SRC/$b" "$APP/$b"; then
+    DOCKER_DIFFED+="$b"$'\n'
+  fi
+done
+DOCKER_MISSING=$(printf '%s' "$DOCKER_MISSING" | grep . || true)
+DOCKER_DIFFED=$(printf '%s' "$DOCKER_DIFFED" | grep . || true)
+if [[ -z "$DOCKER_MISSING" && -z "$DOCKER_DIFFED" ]]; then
+  ok "docker-*.sh 齐全且一致（$(deploy_list_docker "$APP" | grep -c .) 个）"
+else
+  [[ -n "$DOCKER_MISSING" ]] && { bad "部署目录缺 $(printf '%s\n' "$DOCKER_MISSING" | grep -c .) 个部署脚本："; printf '%s\n' "$DOCKER_MISSING" | sed 's/^/      /'; RC=1; }
+  [[ -n "$DOCKER_DIFFED"  ]] && { bad "部署脚本过期 $(printf '%s\n' "$DOCKER_DIFFED" | grep -c .) 个："; printf '%s\n' "$DOCKER_DIFFED" | sed 's/^/      /'; RC=1; }
+fi
+
+step "4. 部件 JSON 与源码逐文件比对"
 DIFF_LIST=$(diff -rq "$SRC/json" "$APP/data/json" 2>/dev/null)
 NDIFF=$(printf '%s' "$DIFF_LIST" | grep -c . || true)
 if [[ "$NDIFF" == "0" ]]; then
@@ -166,7 +197,7 @@ else
   RC=1
 fi
 
-step "4. 结论"
+step "5. 结论"
 if [[ "$RC" == "0" ]]; then
   ok "部署物料与源码一致，可以 install / 打包"
   exit 0
@@ -204,9 +235,20 @@ if [[ "$FIX" == "1" ]]; then
     if [[ ! -f "$SCRIPTS_APP/$f" ]] || ! cmp -s "$SCRIPTS_SRC/$f" "$SCRIPTS_APP/$f"; then
       cp "$SCRIPTS_SRC/$f" "$SCRIPTS_APP/$f" && COPY_N=$((COPY_N+1))
     fi
-  done <<< "$(list_scripts "$SCRIPTS_SRC")"
+  done <<< "$(deploy_list_scripts "$SCRIPTS_SRC")"
   chmod +x "$SCRIPTS_APP"/*.sh 2>/dev/null || true
-  ok "scripts/ 已同步（更新 ${COPY_N} 个，现共 $(list_scripts "$SCRIPTS_APP" | grep -c .) 个）"
+  ok "scripts/ 已同步（更新 ${COPY_N} 个，现共 $(deploy_list_scripts "$SCRIPTS_APP" | grep -c .) 个）"
+
+  # 部署根目录的 docker-*.sh：同样是物料，同样会漂移
+  DCOPY_N=0
+  while IFS= read -r b; do
+    [[ -z "$b" ]] && continue
+    if [[ ! -f "$APP/$b" ]] || ! cmp -s "$DOCKER_SRC/$b" "$APP/$b"; then
+      cp "$DOCKER_SRC/$b" "$APP/$b" && DCOPY_N=$((DCOPY_N+1))
+    fi
+  done <<< "$(deploy_list_docker "$DOCKER_SRC")"
+  chmod +x "$APP"/docker-*.sh 2>/dev/null || true
+  ok "docker-*.sh 已同步（更新 ${DCOPY_N} 个）"
   echo
   warn "同步完成。若后端已打包，需要重新 mvn package + 重启容器才会生效"
   exit 0

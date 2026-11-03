@@ -514,7 +514,7 @@ GROUP BY 1 ORDER BY 2 DESC LIMIT 10;"
 | **真实 RTU** | 硬件自己 | 板子上电、连上 WiFi 就开始报 | 断电 / 断网 |
 | **模拟上报** | 脚本 | `--sim-only` 常驻 | `Ctrl-C` |
 
-所以有四种用法：
+所以有四种基本用法：
 
 | 场景 | 模拟 | 真实 | 命令 |
 | --- | --- | --- | --- |
@@ -523,19 +523,122 @@ GROUP BY 1 ORDER BY 2 DESC LIMIT 10;"
 | **混合**（真表 + 模拟） | ✅ | ✅ | 默认（两个参数都不加） |
 | **只看状态** | — | — | `--status` |
 
+---
+
+### 完整参数说明（按「我要做什么」查）
+
+> 下表每个命令都可以**直接复制**到服务器上跑。
+> **关键区别看两列：「建客户账号？」和「写模拟数据？」** —— 这是最容易搞错的。
+
+| 我要做什么 | 命令 | 建客户账号？ | 写模拟数据？ | 常驻？ |
+| --- | --- | --- | --- | --- |
+| 全新库一键到「能演示」 | `bash scripts/29-rtu-demo-up.sh` | ✅ 会 | ✅ 回填 30 天 + 发一轮 | 否，跑完退出 |
+| **客户账号已建好，只想恢复模拟** | `bash scripts/29-rtu-demo-up.sh --sim-only` | ❌ **不建** | ✅ 持续上报 | ✅ **是，Ctrl-C 停** |
+| 只要真实 RTU，不要任何假数据 | `bash scripts/29-rtu-demo-up.sh --no-sim` | ✅ 会 | ❌ 不写 | 否 |
+| 看谁在报、谁停了 | `bash scripts/29-rtu-demo-up.sh --status` | ❌ 不建 | ❌ 不写 | 否，读完就退 |
+| 只体检，不改任何数据 | `bash scripts/29-rtu-demo-up.sh --check` | ❌ 不建 | ❌ 不写 | 否 |
+| 给另一个客户初始化 | `bash scripts/29-rtu-demo-up.sh --customer "新客户名"` | ✅ 会 | ✅ | 否 |
+| 回填更长的历史 | `bash scripts/29-rtu-demo-up.sh --backfill-days 90` | ✅ 会 | ✅ 回填 90 天 | 否 |
+| 不要历史，只发当前值 | `bash scripts/29-rtu-demo-up.sh --backfill-days 0` | ✅ 会 | ✅ 只发一轮 | 否 |
+| 改模拟上报频率（默认 30s） | `bash scripts/29-rtu-demo-up.sh --sim-only --interval 10` | ❌ 不建 | ✅ 每 10s 一轮 | ✅ 是 |
+
+#### 逐个场景备注
+
+**① 默认（无参数）—— 只在「新库首次部署」时用**
+
 ```bash
-# 混合：初始化 + 回填 30 天 + 发一轮（真实 RTU 照常上报，不用管它）
-bash scripts/29-rtu-demo-up.sh
+cd ~/energy-app && bash scripts/29-rtu-demo-up.sh
+```
 
-# 纯演示：初始化后只跑模拟（演示期间常驻，Ctrl-C 停）
-bash scripts/29-rtu-demo-up.sh --sim-only --interval 30
+做四件事：建客户 → 建场站/设备 → 回填 30 天历史 + 发一轮 → 重算资产汇总。
+**跑完就退出**，模拟不会继续上报 —— 演示前还要再开 `--sim-only`。
 
-# 纯现场：不发任何模拟数据，只依赖真实表
+> ⚠ 已有数据的环境重跑它，会**再走一遍建客户/建设备**（幂等，不会重复建，
+> 但会耗时 1-3 分钟）。只想恢复模拟数据的话，用下面的 `--sim-only`。
+
+**② `--sim-only` —— 日常最常用（客户已建好、只想看数据动起来）**
+
+```bash
+cd ~/energy-app
+nohup bash scripts/29-rtu-demo-up.sh --sim-only --interval 30 \
+  > /tmp/rtu-sim.log 2>&1 &
+```
+
+- **不会建客户、不会建账号、不会建场站设备** —— 直接跳到发数据步骤
+- 客户不存在会直接报错退出（`找不到客户「xxx」`），不会替你建
+- **这是常驻命令**（每 30s 一轮），关掉终端就停 —— 所以用 `nohup ... &`
+- 停：`pkill -f 31-rtu-simulate.py`
+
+验证是否真的在跑：
+
+```bash
+bash scripts/29-rtu-demo-up.sh --status
+# 期望：模拟上报：8 台在上报 / 模拟脚本进程：1 个在跑
+```
+
+**③ `--no-sim` —— 现场只信真实 RTU**
+
+```bash
 bash scripts/29-rtu-demo-up.sh --no-sim
+```
 
-# 谁在报、谁停了（最常用，随时可跑）
+建客户/场站/设备，但**一条模拟数据都不写、不回填历史**。
+看板能不能出数**完全取决于真实表有没有在报** —— 没报就是空的，这是真实状态。
+
+**④ `--status` —— 排查第一条命令**
+
+```bash
 bash scripts/29-rtu-demo-up.sh --status
 ```
+
+只读不写。看三类信息：谁在上报、最后上报多久前、模拟脚本进程在不在。
+判活**只看数据不看进程**（原因见下面「`--status` 输出怎么看」）。
+
+**⑤ `--check` —— 动数据之前先看一眼**
+
+```bash
+bash scripts/29-rtu-demo-up.sh --check
+```
+
+调 `30-rtu-env-init.py --dry-run`：列出「将会建/改什么」，**一次写入都不做**。
+刚接手一个环境、不确定现状时先跑它。
+
+**⑥ `--customer` —— 多客户环境必带**
+
+```bash
+bash scripts/29-rtu-demo-up.sh --sim-only --customer "星河工业园"
+```
+
+所有命令都该带上它。**不带时默认操作「平台演示中心」**，可能改到不是你想的那个客户。
+
+**⑦ 组合示例**
+
+```bash
+# 新客户初始化 + 回填 90 天 + 保持模拟常驻（分两步：先初始化，再常驻）
+bash scripts/29-rtu-demo-up.sh --customer "新客户" --backfill-days 90
+nohup bash scripts/29-rtu-demo-up.sh --sim-only --customer "新客户" > /tmp/sim.log 2>&1 &
+
+# 现场排查：先看状态，再决定要不要开模拟
+bash scripts/29-rtu-demo-up.sh --status --customer "星河工业园"
+bash scripts/29-rtu-demo-up.sh --sim-only --customer "星河工业园" --interval 60
+```
+
+#### 客户账号：脚本会不会重复建？
+
+**不会重复建，但有一个例外要知道。**
+
+脚本按固定规则生成演示账号邮箱：`demo+<客户id前8位>@126.com`。
+先查这个邮箱在不在，在就不建、也不改密码。
+
+| 情况 | 会发生什么 |
+| --- | --- |
+| 没建过 | 建 `demo+xxxxxxxx@126.com` / `demo123456`，并激活 |
+| 已建过、没改密码 | 复用，结尾照实报密码 |
+| 已建过、**客户改过密码** | 复用，结尾**不会**报 `demo123456`，而是提示「密码沿用原值」 |
+| 你在后台自建了 `customer@xx.com` | 脚本**再建一个** `demo+xxxxxxxx@126.com`。两个账号共存，互不影响 |
+
+最后一行是唯一的「多建一个」情况。不想多一个账号，就用 `--sim-only`
+（完全不碰账号）。
 
 ### `--status` 输出怎么看
 
@@ -575,11 +678,24 @@ bash scripts/29-rtu-demo-up.sh --status
 
 ### 三个脚本的分工
 
-| 脚本 | 作用 | 会不会写模拟数据 |
+| 脚本 | 作用 | 建客户/账号？ | 写模拟数据？ |
+| --- | --- | --- | --- |
+| `29-rtu-demo-up.sh` | **一键编排**：客户 / 场站 / 设备 / 回填 / 汇总 / 状态 | 看参数（下表） | 默认会，`--no-sim` 不会 |
+| `30-rtu-env-init.py` | 只建/补齐数据（幂等，不碰遥测） | 会（查重，不重复建） | 不会 |
+| `31-rtu-simulate.py` | 只发数据（持续上报 / 回填历史） | **不会** | 会 |
+
+**`29` 的哪些参数会动客户/账号**：
+
+| 参数 | 建客户 | 建账号 |
 | --- | --- | --- |
-| `29-rtu-demo-up.sh` | **一键编排**：客户 / 场站 / 设备 / 回填 / 汇总 / 状态 | 默认会，`--no-sim` 不会 |
-| `30-rtu-env-init.py` | 只建/补齐数据（幂等，不碰遥测） | 不会 |
-| `31-rtu-simulate.py` | 只发数据（持续上报 / 回填历史） | 会 |
+| （无参数） | ✅ | ✅ |
+| `--sim-only` | ❌ 直接跳到发数据 | ❌ |
+| `--no-sim` | ✅ | ✅ |
+| `--status` | ❌ | ❌ |
+| `--check` | ❌（dry-run） | ❌ |
+
+> 「客户已建好、只想恢复模拟数据」→ 用 `--sim-only`，它根本不调 `30-rtu-env-init.py`。
+> 完整参数说明见上面「完整参数说明（按「我要做什么」查）」。
 
 ```bash
 # 关闭电能质量异常注入（真实现场演示时不造假异常）

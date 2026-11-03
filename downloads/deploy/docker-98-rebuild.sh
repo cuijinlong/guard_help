@@ -246,13 +246,13 @@ DEMO_NAME="${DEMO_NAME:-平台演示中心}"
 if [[ "$SKIP_DEMO" == "true" ]]; then
   warn "已跳过演示账号（--no-demo）"
 elif [[ -f "$APP_HOME/scripts/13-demo-account.sh" ]]; then
-  log "步骤 5b/9　创建演示账号（$DEMO_EMAIL）"
+  log "步骤 5b/9　创建演示账号（${DEMO_EMAIL}）"
   if ( cd "$APP_HOME" && BASE=http://127.0.0.1:8090 \
         bash scripts/13-demo-account.sh \
           --tenant-email "$TENANT" --tenant-pass "$TENANT_PASS" \
           --email "$DEMO_EMAIL" --password "$DEMO_PASS" --name "$DEMO_NAME" ) \
       >/tmp/rebuild-demo.log 2>&1; then
-    ok "演示账号已就绪：$DEMO_EMAIL / $DEMO_PASS（客户「$DEMO_NAME」）"
+    ok "演示账号已就绪：${DEMO_EMAIL} / ${DEMO_PASS}（客户「${DEMO_NAME}」）"
     sed -n 's/^  ✓ /     /p' /tmp/rebuild-demo.log | head -10 || true
   else
     warn "演示账号创建失败（不影响真实客户使用），日志：/tmp/rebuild-demo.log"

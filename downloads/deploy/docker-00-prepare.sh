@@ -145,9 +145,19 @@ cp "$HERE/docker-compose.yml"        "$STAGE/"
 # 不再拷 env.example 到部署目录：第 3 节会直接生成 .env，
 # 目录里只留一个配置文件，避免“到底该改哪个”的困惑。
 # env.example 仍保留在下载区，供查阅全部配置项含义。
-cp "$HERE/docker-01-install.sh"      "$STAGE/"
-cp "$HERE/docker-02-start.sh"        "$STAGE/"
-cp "$HERE/docker-99-uninstall.sh"    "$STAGE/"
+# 部署根目录的 docker-*.sh —— 用通配符，不逐个写。
+# ★ 教训（同下一条）：这里原本是逐个 cp 的清单
+#   （01 / 02 / 99），于是 97-preflight（部署后自检，很常用）和
+#   98-rebuild（增量重建）**从来没进过部署目录**。
+#   手册里让人跑 97 的话必报 No such file。
+# 排除 00：它是在仓库根的**组装脚本**（要求仓库里有 target/ 与源码），
+#   进了部署目录只会被误跑 —— 跟 01-install.sh 不进 scripts/ 同一个道理。
+for d in "$HERE"/docker-[0-9][0-9]-*.sh; do
+  [[ -e "$d" ]] || continue
+  b=$(basename "$d")
+  [[ "$b" == docker-00-* ]] && continue
+  cp "$d" "$STAGE/"
+done
 # 运维脚本全量拷贝 —— 不写死文件名。
 # 教训：早先这里是逐个 cp 的清单，新增 08-verify-release.sh 时忘了加，
 # 结果「重装一次脚本就没了」，而手册已经让用户去跑它。
@@ -164,13 +174,21 @@ cp "$HERE/docker-99-uninstall.sh"    "$STAGE/"
 cp "$HERE/../scripts/"0[2-9]-* "$HERE/../scripts/"[1-9][0-9]-* "$STAGE/scripts/" 2>/dev/null \
   || die "scripts/ 下没有 02-* 起的脚本"
 
-# 不带数字前缀的辅助脚本也要拷 —— 上面的通配符只匹配 02-~99- 开头的文件。
-# ts-mirror.sh 是验收脚本（04/06/08）的依赖：它把 Cassandra 遥测镜像到 PG。
-# 漏拷的后果不是报错，而是验收静默跳过镜像、然后一堆断言误报为 0
-# （实测 2026-10-23：重装后 08 报「资产上没有 energy_total」等 3 项）。
-for helper in ts-mirror.sh; do
-  [[ -f "$HERE/../scripts/$helper" ]] && cp "$HERE/../scripts/$helper" "$STAGE/scripts/"
-done
+# 不带数字前缀的辅助脚本也要拷 —— 上面的通配符只匹配 02-99 开头的文件。
+# 清单在 _deploy-manifest.sh 里（唯一真相），不再在本脚本里内联维护。
+# 漏拷的后果实测两次：ts-mirror.sh（验收静默跳过镜像、一堆断言误报为 0）、
+# dev-fast-build.sh（手册让跑，可它从来就不在部署目录里）。
+if [[ -f "$HERE/../scripts/_deploy-manifest.sh" ]]; then
+  cp "$HERE/../scripts/_deploy-manifest.sh" "$STAGE/scripts/"
+  # shellcheck source=/dev/null
+  source "$HERE/../scripts/_deploy-manifest.sh"
+  for helper in "${DEPLOY_SCRIPT_AUX[@]}"; do
+    [[ "$helper" == "_deploy-manifest.sh" ]] && continue
+    [[ -f "$HERE/../scripts/$helper" ]] && cp "$HERE/../scripts/$helper" "$STAGE/scripts/"
+  done
+else
+  die "缺 _deploy-manifest.sh —— 部署脚本清单的唯一真相，不能省略"
+fi
 
 # 自检：脚本数与仓库一致，防止某次改动只加了文件没被拷进来
 REPO_SCRIPTS=$(ls "$HERE/../scripts/"0[2-9]-* "$HERE/../scripts/"[1-9][0-9]-* 2>/dev/null | wc -l | tr -d ' ')
@@ -277,6 +295,7 @@ if [[ "$PACK" == "true" ]]; then
   # 目标机器路径与端口都未知，用默认值；APP_HOME 留空待解压后自愈
   ENV_APP_HOME=""
   ENV_HTTP_PORT=8090
+  ENV_SERVER_DIRECT_PORT=8091
   ENV_DB_PORT=5432
   ENV_MQTT_PORT=1883
   ENV_MQTT_RTU_PORT=11883
@@ -291,6 +310,22 @@ else
   }
   HTTP_PORT=8090
   while ! port_free "$HTTP_PORT" && [[ "$HTTP_PORT" -lt 8200 ]]; do HTTP_PORT=$((HTTP_PORT+1)); done
+
+  # ★ 直连排查端口（gateway 之外的第二个入口）。
+  #
+  # 为什么必须单独分配而不能用默认值 8091：
+  #   HTTP_PORT 从 8090 起顺延，8090 被占时它就会占到 8091，
+  #   而 compose 里 SERVER_DIRECT_PORT 的默认值也正是 8091 ——
+  #   两个容器抢同一个宿主端口，compose 直接报
+  #   "Bind for 0.0.0.0:8091 failed: port is already allocated"。
+  #   实测过：8090 被占的机器上部署必失败，而报错信息完全看不出是端口撞了。
+  # 顺延区间与 HTTP_PORT 相同，但跳过已被 HTTP_PORT 占住的那个值。
+  SERVER_DIRECT_PORT=8091
+  while ( ! port_free "$SERVER_DIRECT_PORT" || [[ "$SERVER_DIRECT_PORT" == "$HTTP_PORT" ]] ) \
+        && [[ "$SERVER_DIRECT_PORT" -lt 8200 ]]; do
+    SERVER_DIRECT_PORT=$((SERVER_DIRECT_PORT+1))
+  done
+
   DB_PORT=5432
   while ! port_free "$DB_PORT" && [[ "$DB_PORT" -lt 5600 ]]; do DB_PORT=$((DB_PORT+1)); done
   # MQTT 是 RTU / 网关的接入口，被 mosquitto 之类占用时顺延，别让部署失败
@@ -306,6 +341,7 @@ else
   [[ "$MQTT_RTU_PORT" == "$MQTT_PORT" ]] && MQTT_RTU_PORT=""
   ENV_APP_HOME="$STAGE"
   ENV_HTTP_PORT=$HTTP_PORT
+  ENV_SERVER_DIRECT_PORT=$SERVER_DIRECT_PORT
   ENV_DB_PORT=$DB_PORT
   ENV_MQTT_PORT=$MQTT_PORT
   ENV_MQTT_RTU_PORT=$MQTT_RTU_PORT
@@ -332,7 +368,13 @@ cat > "$STAGE/.env" <<ENVEOF
 # 同一个包解压到任何路径都能直接跑，不必手工改路径。
 DEPLOY_MODE=${DEPLOY_MODE:-split}
 APP_HOME=$ENV_APP_HOME
+# Web 入口：浏览器访问 http://服务器IP:\$HTTP_PORT （经 nginx gateway）
 HTTP_PORT=$ENV_HTTP_PORT
+# Java 直连口（跳过 nginx），仅供排查：
+#   HTTP_PORT 通、直连不通  → gateway 问题
+#   两个都不通              → energy-server 问题
+# ⚠ 不要把前端入口切到这里：它会绕开 /ngxai 反代、gzip、SPA 回退
+SERVER_DIRECT_PORT=$ENV_SERVER_DIRECT_PORT
 DB_NAME=thingsboard
 DB_USER=postgres
 DB_PASSWORD=$DB_PASS
@@ -369,11 +411,10 @@ DATABASE_TS_LATEST_TYPE=$DATABASE_TS_LATEST_TYPE
 ENVEOF
 
 ok "遥测后端：${DATABASE_TS_TYPE}（宿主机内存 ${HOST_MEM_GB:-?}GB；可用 DATABASE_TS_TYPE 环境变量覆盖）"
-
 if [[ "$PACK" == "true" ]]; then
   ok "已生成 .env（随包分发；APP_HOME 解压后自动填入，密码随机）"
 else
-  ok "已生成 .env（APP_HOME 已填好，端口检测后取 ${ENV_HTTP_PORT}/${ENV_DB_PORT}/${ENV_MQTT_PORT}，密码随机生成）"
+  ok "已生成 .env（APP_HOME 已填好，端口检测后取 Web ${ENV_HTTP_PORT} / 直连 ${ENV_SERVER_DIRECT_PORT} / DB ${ENV_DB_PORT} / MQTT ${ENV_MQTT_PORT}，密码随机生成）"
 fi
 
 # ---------------- 4. 输出 ----------------

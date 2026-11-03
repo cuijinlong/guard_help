@@ -200,16 +200,44 @@ services:
       LWM2M_ENABLED: "false"
       COAP_SERVER_ENABLED: "false"
       TB_QUEUE_TYPE: in-memory
+      # 关闭网关专题页的 git 同步（2026-10-29 实测踩坑）。
+      #
+      # TB 默认 true：每次启动从
+      #   https://github.com/thingsboard/gateway-management-extensions-dist.git
+      # 拉官方 gateways_dashboard.json，直接 createOrUpdateSystemResource 覆盖 resource 表。
+      # 后果是我们改的中文文案每重启一次就被冲回英文，而且神不知鬼不觉 ——
+      # 日志里只有一行「Updating system resource gateways_dashboard.json」。
+      #
+      # 关掉后资源不再被覆盖；已同步过的部件/脚本/图片留在库里，不受影响。
+      # 以后要跟进官方新版网关页时，临时改回 true 启动一次，再重新打一遍中文补丁。
+      TB_GATEWAY_DASHBOARD_SYNC_ENABLED: "false"
       JAVA_TOOL_OPTIONS: "-Xms512m -Xmx${SERVER_HEAP:-2g}"
     volumes:
       - ${APP_HOME}/guard-server-4.4.0.jar:/opt/energy/app.jar:ro
       - ${APP_HOME}/data:/opt/energy/data:ro
       - ${APP_HOME}/logs:/opt/energy/logs
-    # 8090 不映射到宿主：Web 访问一律经 gateway。
+    # Web 访问**默认仍走 gateway**（:8090 → nginx :80 → 这里 :8090）。
     # 1883 必须映射：RTU / 物联网网关需要直连 MQTT，走不了 nginx。
+    #
+    # ★ 额外开一个**直连**端口（默认 8091 → 容器 8090），2026-11-02 加。
+    #
+    #   为什么需要它：只有经 nginx 的 8090 时，现场出问题无法区分是
+    #   「Java 挂了」还是「nginx 挂了」—— 两者的表现都是页面打不开/接口超时。
+    #   有了直连口，一条命令就能定位：
+    #
+    #     8091 通、8090 不通  → gateway / nginx 的问题
+    #     两个都不通          → energy-server 本身的问题
+    #     两个都通            → 问题在浏览器侧 / 网络 / 前端
+    #
+    #   排查 RTU 接入时同样有用：RTU 直连的是 MQTT 端口，但若怀疑是
+    #   HTTP 链路问题，用 8091 绕过 nginx 试一次即可排除网关因素。
+    #
+    #   ⚠ 8091 只是**排查用**，不要把前端入口切到它：
+    #     它绕过 nginx，会丢掉 /ngxai 反向代理、gzip、SPA 回退等配置。
     expose:
       - "8090"
     ports:
+      - "${SERVER_DIRECT_PORT:-8091}:8090"
       - "${MQTT_PORT:-1883}:${MQTT_PORT:-1883}"
       # RTU 现场固件把端口写死成 11883（HaaS506-ED1 的约定）。
       # 额外映射一个别名端口，换机器 / 重装 / 换客户都不用重烧固件。
