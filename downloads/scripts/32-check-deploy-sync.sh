@@ -15,10 +15,20 @@
 #   （→ ../../../../dao/src/main/resources/sql），dao 模块删除后链接就断，
 #   install 直接 NoSuchFileException。
 #
+#   第三类最容易漏：<APP_HOME>/scripts/ 里的运维脚本。
+#   docker-00-prepare.sh 只在**组装时**拷一次，之后仓库新增/改写的脚本
+#   不会自己跑进已部署的目录（实测 2026-11-02：手册让跑
+#   `bash scripts/29-rtu-demo-up.sh`，客户照抄得到 No such file or directory,
+#   因为部署目录里还是 10-29 那批旧脚本）。
+#   症状极难自查：仓库里文件在、手册写得对、容器也在跑，只有命令跑不了。
+#
 # 用法：
 #   bash 32-check-deploy-sync.sh                      # 默认比 /Users/cuijinlong/energy-app
 #   bash 32-check-deploy-sync.sh --app /path/to/app   # 指定部署目录
 #   bash 32-check-deploy-sync.sh --fix                # 有问题就直接同步过去
+#
+# ★ 必须在仓库里跑（或 --scripts-src 指定仓库脚本目录）。
+#   本脚本自己也会被拷进 <APP>/scripts/，从部署目录跑会自己比自己。
 #
 # 退出码：0 一致；1 有差异（或 --fix 失败）
 # ==============================================================================
@@ -26,22 +36,42 @@ set -uo pipefail
 
 APP="/Users/cuijinlong/energy-app"
 SRC=""
+SCRIPTS_SRC_ARG=""
 FIX=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --app)   APP="$2"; shift 2 ;;
-    --src)   SRC="$2"; shift 2 ;;
-    --fix)   FIX=1; shift ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    --app)         APP="$2"; shift 2 ;;
+    --src)         SRC="$2"; shift 2 ;;
+    --scripts-src) SCRIPTS_SRC_ARG="$2"; shift 2 ;;
+    --fix)         FIX=1; shift ;;
+    -h|--help)     sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "未知参数: $1"; exit 1 ;;
   esac
 done
 
 # 源码目录：脚本在 <repo>/shiyongshouce/downloads/scripts/
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$HERE/../../.." && pwd)"
+REPO="$(cd "$HERE/../../.." 2>/dev/null && pwd)"
 [[ -z "$SRC" ]] && SRC="$REPO/guard-server/src/main/data"
+
+# ★ 防止「自己比自己」：这个脚本本身也会被拷进 <APP>/scripts/，
+#   从部署目录跑时两边是同一个目录，永远报「完全一致」——
+#   而真正缺失的脚本一个都查不出来。实测过这个坑：
+#   10-29 的部署目录里跑本脚本，28 个脚本「全齐」，
+#   可 29-rtu-demo-up.sh 根本不在里面。
+# 判据用「父目录有 docker-01-install.sh」而不是比字符串：
+#   部署目录可以改名、可以用 --app 指到别处，比字符串会漏。
+if [[ -n "$SCRIPTS_SRC_ARG" ]]; then
+  SCRIPTS_SRC="$SCRIPTS_SRC_ARG"
+elif [[ -f "$HERE/../docker-01-install.sh" ]]; then
+  printf '  \033[31m✗\033[0m 本脚本跑在部署目录里（%s）—— 没有源码可比，会假报「一致」\n' "$HERE"
+  printf '     请从仓库跑： bash shiyongshouce/downloads/scripts/32-check-deploy-sync.sh --fix\n'
+  printf '     或显式指定 --scripts-src <仓库>/shiyongshouce/downloads/scripts\n'
+  exit 1
+else
+  SCRIPTS_SRC="$HERE"
+fi
 
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; }
@@ -51,7 +81,9 @@ step() { printf '\n\033[1;36m━━ %s\033[0m\n' "$1"; }
 step "0. 目录检查"
 [[ -d "$SRC" ]] || { bad "源码目录不存在：$SRC"; exit 1; }
 [[ -d "$APP/data" ]] || { bad "部署目录不存在：$APP/data"; exit 1; }
+[[ -d "$SCRIPTS_SRC" ]] || { bad "脚本源码目录不存在：$SCRIPTS_SRC"; exit 1; }
 ok "源码：$SRC"
+ok "脚本：$SCRIPTS_SRC"
 ok "部署：$APP/data"
 
 RC=0
@@ -76,7 +108,54 @@ else
   ok "源码侧 data/sql 是实体目录"
 fi
 
-step "2. 部件 JSON 与源码逐文件比对"
+step "2. 运维脚本与源码逐文件比对（缺脚本 = 手册命令直接报 No such file）"
+# ★ 收集规则必须与 docker-00-prepare.sh 的拷贝规则一致：
+#   "0[2-9]-*" "[1-9][0-9]-*"  →  合起来就是「两位数字前缀，排除 00-01」
+#   01-install.sh 是裸机路径，Docker 部署故意不带。
+#   改 prepare 的规则时必须同步改这里，否则自检会误报「缺脚本」。
+SCRIPTS_APP="$APP/scripts"
+list_scripts() {
+  find "$1" -maxdepth 1 -type f -name '[0-9][0-9]-*' \
+    ! -name '00-*' ! -name '01-*' -exec basename {} \; 2>/dev/null | sort -u
+}
+
+if [[ ! -d "$SCRIPTS_APP" ]]; then
+  bad "部署目录没有 scripts/ —— 手册里所有 bash scripts/xxx.sh 都会失败"
+  RC=1
+else
+  SRC_SET=$(list_scripts "$SCRIPTS_SRC")
+  APP_SET=$(list_scripts "$SCRIPTS_APP")
+  MISSING=$(comm -23 <(printf '%s\n' "$SRC_SET") <(printf '%s\n' "$APP_SET") | grep . || true)
+  EXTRA=$(comm -13 <(printf '%s\n' "$SRC_SET") <(printf '%s\n' "$APP_SET") | grep . || true)
+
+  # 内容比对只看两边都有的
+  DIFFED=""
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    [[ -f "$SCRIPTS_APP/$f" ]] || continue
+    if ! cmp -s "$SCRIPTS_SRC/$f" "$SCRIPTS_APP/$f"; then DIFFED+="$f"$'\n'; fi
+  done <<< "$SRC_SET"
+  DIFFED=$(printf '%s' "$DIFFED" | grep . || true)
+
+  NSRC=$(printf '%s\n' "$SRC_SET" | grep -c . || true)
+  NAPP=$(printf '%s\n' "$APP_SET" | grep -c . || true)
+
+  if [[ -z "$MISSING" && -z "$DIFFED" ]]; then
+    ok "scripts/ 齐全且与源码一致（${NAPP} 个）"
+  else
+    [[ -n "$MISSING" ]] && { bad "部署目录缺 $(printf '%s\n' "$MISSING" | grep -c .) 个脚本："; printf '%s\n' "$MISSING" | sed 's/^/      /'; RC=1; }
+    [[ -n "$DIFFED"  ]] && { bad "内容与源码不同 $(printf '%s\n' "$DIFFED" | grep -c .) 个："; printf '%s\n' "$DIFFED" | sed 's/^/      /'; RC=1; }
+  fi
+
+  # 部署侧多出来的：不自动删（可能是客户自己放的），但必须报 ——
+  # 仓库已废弃的脚本留在现场，会让人在两个同名用途的脚本之间选错。
+  if [[ -n "$EXTRA" ]]; then
+    warn "部署目录多出 $(printf '%s\n' "$EXTRA" | grep -c .) 个仓库已无的脚本（不自动删除，请人工确认）："
+    printf '%s\n' "$EXTRA" | sed 's/^/      /'
+  fi
+fi
+
+step "3. 部件 JSON 与源码逐文件比对"
 DIFF_LIST=$(diff -rq "$SRC/json" "$APP/data/json" 2>/dev/null)
 NDIFF=$(printf '%s' "$DIFF_LIST" | grep -c . || true)
 if [[ "$NDIFF" == "0" ]]; then
@@ -87,7 +166,7 @@ else
   RC=1
 fi
 
-step "3. 结论"
+step "4. 结论"
 if [[ "$RC" == "0" ]]; then
   ok "部署物料与源码一致，可以 install / 打包"
   exit 0
@@ -111,6 +190,23 @@ if [[ "$FIX" == "1" ]]; then
     cp -R "$SRC/sql" "$APP/data/sql"
     ok "data/sql 已同步为实体目录（$(ls "$APP/data/sql"/*.sql | wc -l | tr -d ' ') 个文件）"
   fi
+
+  # 运维脚本：只补缺失与更新内容，**不删**部署侧多出的（客户可能自己放了东西）
+  if [[ ! -d "$SCRIPTS_APP" ]]; then
+    mkdir -p "$SCRIPTS_APP"
+  else
+    cp -R "$SCRIPTS_APP" "$SCRIPTS_APP.bak.$(date +%m%d-%H%M)" 2>/dev/null \
+      && ok "已备份 scripts/ → scripts.bak.$(date +%m%d-%H%M)"
+  fi
+  COPY_N=0
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    if [[ ! -f "$SCRIPTS_APP/$f" ]] || ! cmp -s "$SCRIPTS_SRC/$f" "$SCRIPTS_APP/$f"; then
+      cp "$SCRIPTS_SRC/$f" "$SCRIPTS_APP/$f" && COPY_N=$((COPY_N+1))
+    fi
+  done <<< "$(list_scripts "$SCRIPTS_SRC")"
+  chmod +x "$SCRIPTS_APP"/*.sh 2>/dev/null || true
+  ok "scripts/ 已同步（更新 ${COPY_N} 个，现共 $(list_scripts "$SCRIPTS_APP" | grep -c .) 个）"
   echo
   warn "同步完成。若后端已打包，需要重新 mvn package + 重启容器才会生效"
   exit 0
@@ -119,4 +215,5 @@ fi
 echo
 bad "有差异。加 --fix 自动同步，或按上面清单手工处理。"
 echo "    注意：不要用 rsync --delete 整个 data/（会删掉 cassandra/ 与实体 sql）"
+echo "    scripts/ 多出的文件不会被自动删除，需人工确认后处理"
 exit 1

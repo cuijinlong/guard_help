@@ -299,9 +299,16 @@ def check_script_refs() -> list[str]:
 
     <p>只查 `scripts/<文件名>.<sh|py>` 这种带目录前缀的引用 ——
     裸文件名（如 `main.py`）歧义太大，容易误报。
+
+    <p>占位符不算引用（2026-11-02）：文档里写
+    `bash: scripts/xxx.sh: No such file or directory` 是在复述报错原文，
+    不是在让你去找一个叫 xxx.sh 的脚本。同理 `<脚本名>`、`...`、`N` 这类。
+    不排除会逼着作者把真实报错改成人造文本，反而降低手册可信度。
     """
     import os
     import re
+
+    PLACEHOLDERS = {'xxx', 'yyy', 'zzz', 'foo', 'bar', 'placeholder', 'script', 'name'}
 
     here = os.path.dirname(os.path.abspath(__file__))
     content = os.path.join(here, 'content')
@@ -325,6 +332,9 @@ def check_script_refs() -> list[str]:
                 for lineno, line in enumerate(f, 1):
                     for m in pat.finditer(line):
                         name = m.group(1)
+                        stem = os.path.splitext(name)[0].lower()
+                        if stem in PLACEHOLDERS:
+                            continue
                         if (rel, name) in seen:
                             continue
                         seen.add((rel, name))

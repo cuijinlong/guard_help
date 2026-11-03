@@ -9,6 +9,10 @@
 
 ## 总览
 
+> **除第 ① 步外，所有命令都在 `~/energy-app` 下执行。**
+> 第 ② 步已经 `cd ~/energy-app`，之后就别再切走了 —— 手册里的
+> `bash scripts/xxx.sh` 都是相对这个目录的。
+
 ```bash
 # ① 组装部署目录（在仓库根目录）
 bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
@@ -287,6 +291,75 @@ bash docker-02-start.sh --allinone --admin-email ... --admin-pass ...
 见 [⑩ 开发与构建](/admin/dev-build)。一句话：
 **能改看板 JSON / 部件就别改 Java**，改 Java 要重新打包 + 重启（约 10 分钟）。
 
+但不管改哪一类，**部署目录里的东西都不会自己更新**。改完先跑这个：
+
+```bash
+cd ~/energy-app
+bash scripts/32-check-deploy-sync.sh        # 只报，不改
+```
+
+它比三类物料：`data/json/`（部件）、`data/sql/`（建库脚本）、`scripts/`（运维脚本）。
+有差异加 `--fix` 自动同步（会先备份）。
+
+> 从部署目录里跑它会被拒绝 —— 那样是拿自己比自己，永远报「一致」。
+> 要在仓库里跑：`bash shiyongshouce/downloads/scripts/32-check-deploy-sync.sh --fix`
+
+## 升级已有部署（不重建库）
+
+现场已经在跑，只想把新脚本 / 新部件送上去。**两类东西走两条路**：
+
+```bash
+# ① 脚本 / sql / 部件 JSON 的**文件**送进部署目录
+#    在仓库里跑（不能在部署目录里跑）
+bash shiyongshouce/downloads/scripts/32-check-deploy-sync.sh --fix
+
+# ② 部件 JSON 还要**写进数据库**（存量库的 widget_type 记录）
+#    同样在仓库根目录跑，指定部件名或 --all
+bash shiyongshouce/downloads/scripts/31-deploy-widget.sh --all
+
+# ③ 改了后端代码才需要：重打 jar + 重启（约 10 分钟）
+cd guard-server && mvn package -o -DskipTests -Dmaven.test.skip=true -q
+cp target/guard-server-4.4.0.jar ~/energy-app/ && docker restart energy-server
+```
+
+**只改脚本的话，②③ 都不用做** —— 脚本是 shell/python，拷过去就能跑。
+
+两张路的分工列一下，别搞混：
+
+| 脚本 | 干什么 | 写数据库 | 改完部件该跑哪个 |
+| --- | --- | --- | --- |
+| `32-check-deploy-sync.sh --fix` | 三类文件比对 + 同步 | ✗ | 新建库前必跑 |
+| `31-deploy-widget.sh <名>` | 推库 + 同步挂载目录 | ✓ | 存量库改部件 |
+| `docker-00-prepare.sh` | 全量组装（会 `rm -rf` 目标目录） | ✗ | 全新机器才用 |
+
+> 两个脚本都**必须从仓库跑**。从 `~/energy-app/scripts` 跑时，
+> `32` 会直接拒绝（拿自己比自己永远报一致），`31` 会因找不到仓库路径而报错。
+> 它们自己知道自己被拷进了部署目录 —— 这就是预防。
+
+### 为什么需要这一节（真实故障）
+
+`docker-00-prepare.sh` 只在**组装时**拷一次脚本。之后仓库里新增的脚本
+（比如 `29-rtu-demo-up.sh`）不会自己跑进已经部署的目录。
+
+现场表现：手册写得对、仓库里文件也在、容器跑得好好的，只有命令报
+
+```
+bash: scripts/29-rtu-demo-up.sh: No such file or directory
+```
+
+判据：
+
+```bash
+ls ~/energy-app/scripts/ | grep 29-           # 空的 = 没同步
+ls shiyongshouce/downloads/scripts/ | grep 29-   # 这里应该有
+```
+
+实际踩到的场景：`~/energy-app/scripts/` 还停在 10-29 那一批（26 个），
+而仓库已经有 30 个。差的 4 个恰好是本次新写的演示/初始化脚本 ——
+**手册里最新、最想用的命令，恰好是最容易缺的那几个**。
+
+以后手册里出现的每个脚本，**都必须先跑过一次 `--fix`**。
+
 ---
 
 ## 卸载平台
@@ -353,4 +426,5 @@ ls ~/energy-app/data/sql/*.sql | wc -l    # 必须 8
 ```
 
 **绝不要用 `rsync --delete` 同步整个 `data/`**：部署侧有源码没有的 `cassandra/`。
-用 `scripts/32-check-deploy-sync.sh --fix`，它只同步 `json/` 与 `sql/`。
+用 `scripts/32-check-deploy-sync.sh --fix`，它同步 `json/`、`sql/` 与 `scripts/`
+三类，且不会删部署侧多余的文件。

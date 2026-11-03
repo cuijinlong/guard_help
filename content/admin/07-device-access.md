@@ -586,6 +586,11 @@ bash scripts/29-rtu-demo-up.sh --status
 python3 scripts/31-rtu-simulate.py --interval 30 --no-pq-anomaly
 ```
 
+> **部署目录里其他脚本是什么**：`scripts/` 里有十几个 `24-` `25-` `28-` `29-dedupe-`
+> 开头的脚本，是历史上一次性修数据用的（改设备分类、去重重复时间控件等），
+> 已经跑过的不必再动。日常只用上表三个，加 `02-onboard`、`09-onboard-customer`、
+> `10-cleanup-customer`。不确定某个脚本干什么：看它开头 20 行的注释。
+
 ### 电能质量覆盖
 
 三相模拟表按**专业电能质量表**的能力布局（tier = `harmonic` / `pq`）：

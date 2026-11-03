@@ -47,8 +47,20 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$HERE/../../.." && pwd)"
+ROOT="$(cd "$HERE/../../.." 2>/dev/null && pwd)"
 APP_HOME="${APP_HOME:-$HOME/energy-app}"
+
+# ★ 防「在部署目录里跑」：本脚本会被拷进 <APP_HOME>/scripts/，
+#   那里跑时 HERE = $APP_HOME/scripts，ROOT 会算到毫无关系的上级目录，
+#   报错信息是「找不到 json」—— 完全看不出真正原因。
+#   而且它依赖仓库里的部件源码，部署目录只有产物，本来就跑不了。
+# 判据用「父目录有 docker-01-install.sh」而不是比字符串：
+#   部署目录可以改名、可以用 --app-home 指到别处，比字符串会漏。
+if [[ -f "$HERE/../docker-01-install.sh" ]]; then
+  printf '\033[31m  ✗ 本脚本要在仓库里跑，不能在部署目录跑\033[0m\n' >&2
+  printf '     正确： bash shiyongshouce/downloads/scripts/31-deploy-widget.sh --all\n' >&2
+  exit 1
+fi
 DB_CONTAINER="energy-postgres"
 DB_NAME="thingsboard"
 ALL="false"

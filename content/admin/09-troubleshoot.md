@@ -87,8 +87,7 @@ POST /api/customer
 | --- | --- | --- |
 | 浏览器缓存 | 硬刷新后变了 | `Cmd+Shift+R` |
 | 部件版本 | 库里有两条同名 fqn，看板取 version 大的 | 更新**系统级**那条（`tenant_id` 为 NULL） |
-| 部署物料 | 干净库装的是旧部件 | 跑 `scripts/32-check-deploy-sync.sh` |
-| jar | 容器挂的是 jar，不是工作目录 | 重新 `mvn package` + 重启容器 |
+| 部署物料 | 干净库装的是旧部件 | 跑 `scripts/32-check-deploy-sync.sh` || jar | 容器挂的是 jar，不是工作目录 | 重新 `mvn package` + 重启容器 |
 
 **判据**：`GET /api/widgetType?widgetTypeId=<id>` 看返回的
 `controllerScript` 里有没有你刚加的代码。有 → 前端缓存；没有 → 没发布成功。
@@ -253,10 +252,33 @@ print('模板长度', j-i, '结束于第', s[:j].count(chr(10))+1, '行')
 | --- | --- | --- |
 | 全新库安装到「建库」就失败 | 见下 | — |
 | 重装脚本崩了，`APP_HOME: unbound variable` | 脚本从错误目录调用 | 在部署目录执行 |
+| **`bash: scripts/xxx.sh: No such file or directory`** | 部署目录的 scripts/ 是旧的 | `32-check-deploy-sync.sh --fix` |
 | 装完自检 `missing=2`（费率 + 电表 Key 节点） | 租户级主数据未铺 | 重跑 `02-onboard.sh` |
 | 跑完验收再跑初始化，报「Σ峰谷 ≠ energy」 | 演示数据被重复写入 | 清遥测后重跑 |
 | 切 Cassandra 后大面积「0 台 / 没有数据」 | 遥测后端切换后数据在新库 | 重新灌数据，或切回 SQL |
 | Cassandra 无限重启，平台 502 | 内存不足 / 数据目录权限 | 见 [① 安装 · Cassandra](/admin/install#cassandra) |
+
+### `bash: scripts/xxx.sh: No such file or directory`
+
+**这是部署目录里的脚本过期了，不是手册写错。**
+
+`docker-00-prepare.sh` 只在组装时拷一次脚本；之后仓库新增的
+（比如 `29-rtu-demo-up.sh`）不会自己跑进已部署的目录。
+
+```bash
+# 判据：两个目录对比，差集就是缺的
+ls ~/energy-app/scripts/ | wc -l
+ls shiyongshouce/downloads/scripts/ | wc -l
+
+# 修（在仓库里跑，不能 cd 到部署目录）
+bash shiyongshouce/downloads/scripts/32-check-deploy-sync.sh --fix
+```
+
+> 在 `~/energy-app/scripts` 里跑 `32` 会被拒绝 —— 那样是拿自己比自己，
+> 永远报「一致」。同理 `31-deploy-widget.sh` 也只能从仓库跑。
+>
+> 注意区分另一种报错：`bash: scripts/xxx.sh: Permission denied` → 补 `chmod +x`。
+> 完全没这个文件 —— 先看是不是自己 cd 到了别的目录（`pwd`）。
 
 ### 安装到「建库」就失败
 
@@ -290,6 +312,8 @@ cp -R guard-server/src/main/data/sql ~/energy-app/data/sql
 | --- | --- |
 | 报 `resource sql/schema-views.sql not found` | jar 里的 sql 与 data 目录版本不一致 |
 | 页面还是旧文案 | 只 `ng build` 没重打 jar（容器挂 jar，不是工作目录） |
+| 新脚本报 `No such file or directory` | 部署目录 scripts/ 未同步（见上条） |
+| 新部件在库里查不到 | 只同步了文件，没推库 —— 跑 `31-deploy-widget.sh` |
 
 **判据**：`ls -l ~/energy-app/guard-server-4.4.0.jar` 时间戳变了吗？
 没变 = 没打进去。
