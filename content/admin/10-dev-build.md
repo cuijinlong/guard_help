@@ -246,6 +246,15 @@ cd ../guard_help && git add -A && git commit -m 'update manual' && git push
 
 ```bash
 cd ui-ngx
+
+# ── 0. 先过部件依赖自检（2026-11-04 加，必跑）
+#    584 个部件模板里的管道 / 结构指令 / Material 控件，是否都在动态组件
+#    imports 的作用域里。缺管道的后果是「整页空白且几乎不报错」，
+#    缺 Material 的后果是「全站控件没样式」。
+node esbuild/check-widget-deps.mjs
+# 用到新的 Material 控件时，先重新生成清单：
+# node esbuild/gen-material-jit-directives.mjs
+
 node --max_old_space_size=8192 ./node_modules/@angular/cli/bin/ng build --configuration production
 cd target/generated-resources && jar cf /tmp/ui-ngx-4.4.0.jar public
 cp /tmp/ui-ngx-4.4.0.jar ~/Documents/dev_tools/maven_repository/rule-engine/org/thingsboard/ui-ngx/4.4.0/

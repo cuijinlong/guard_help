@@ -82,6 +82,96 @@ POST /api/customer
 | 客户看板与租户模板不一致 | 开户时复制的是旧版模板 | 重新复制看板（`09` 幂等，会跳过已有的） |
 | 表格没边框 / 表头像普通文字 | 部件 CSS 被 TB 全局样式覆盖 | 样式写 `templateCss` 用普通选择器，别用 `::ng-deep` |
 
+### 部件没样式 / 整页空白：管道与 Material 指令没进作用域（2026-11-04 实测）
+
+**症状（两种，根因相同）**
+
+- 按钮是浏览器默认灰块，下拉框变成原生 `select`，`mat-icon` 位置上显示
+  `bu` / `pow` 这样的**图标名字文本**；树里的勾选框 40px 把行撑高。
+- 或者更狠：**整块看板全白**，只剩全屏图标。
+
+**判据（F12）**
+
+```js
+// ① 样式问题：应返回 >0；返回 0 就是 Material 指令没生效
+document.querySelectorAll('.mat-mdc-form-field').length
+// ② 管道问题：控制台有这一句就是管道缺失
+// TypeError: Cannot read properties of undefined (reading 'onDestroy')
+```
+
+**根因**：TB 部件模板是运行时 JIT 编译的。AOT 生产构建时
+`linkerJitMode = options.jit = false`，Angular 不为 partial 库生成
+`ɵɵsetNgModuleScope` —— **所有 NgModule 的 exports 在 bundle 里根本不存在**。
+所以往动态组件的 `imports` 里放 `CommonModule` / `MatFormFieldModule`
+等于什么都没放：
+
+| 缺什么 | 后果 |
+| --- | --- |
+| `NgIf` / `NgForOf` 等结构指令 | `*ngIf` 全变 `<!---->`，部件空白 |
+| `DecimalPipe` 等管道 | 视图创建时抛 `onDestroy` 错误，**整页空白** |
+| Material 指令/组件 | 控件全没样式（不报错） |
+
+**修（仓库里已改好，你只需要重新构建）**
+
+```bash
+cd ui-ngx
+node esbuild/check-widget-deps.mjs          # 必须先过：584 个模板，缺一个就退出码 1
+./node_modules/.bin/ng build --configuration production   # 约 4-5 分钟
+cd ../guard-server && mvn -o package -DskipTests          # 把前端打进 jar
+cp target/guard-server-4.4.0.jar ~/energy-app/
+cd ~/energy-app && docker compose --profile split restart energy-server
+```
+
+> **只 build 前端不重打 jar = 白改**。容器读的是 jar 里的静态资源。
+> `docker-98-rebuild.sh` 已经加了这条检查（jar 比 `index.html` 旧就中止）。
+
+**新增部件后**：模板里用了新的 Material 控件，重跑
+`node esbuild/gen-material-jit-directives.mjs` 生成清单；
+清单从 Material 各模块的 `ɵɵngDeclareNgModule(exports)` 自动抽取，不要手写。
+
+### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
+
+**症状**：看板框架、筛选条、KPI 卡片都在，但数字全 0，
+副标题写着「范围：数据源未解析到设备」。
+
+**先确认不是数据问题**（这两条都正常就继续往下）：
+
+```bash
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc \
+ "select relation_type, from_type, to_type, count(*) from relation
+   where relation_type_group='COMMON' group by 1,2,3 order by 4 desc;"
+# 期望看到 Contains|ASSET|ASSET 与 Contains|ASSET|DEVICE 都有记录
+```
+
+**根因**：部件里 `collectDevices` 递归取子资产的设备，但
+`loadRelationsBatch` **只请求传入的那几个 id** 的关系 ——
+递归到第二层时 `rels[子资产]` 是 `undefined`，于是
+「组织 → 场站 → 设备」在第二层就断，解析出 0 台。
+
+**判据**：直接调接口看关系是否真的存在：
+
+```bash
+TOKEN=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"<账号>","password":"<密码>"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+curl -s --noproxy '*' \
+  "http://127.0.0.1:8090/api/relations?fromId=<组织id>&fromType=ASSET&relationTypeGroup=COMMON" \
+  -H "X-Authorization: Bearer $TOKEN" | head -c 300
+# 有数据但看板是 0 → 就是递归断了，不是数据问题
+```
+
+**修**：部件里改用 `loadRelationsDeep`（逐层 BFS，带 `visited` 防环）。
+
+**已修的部件**（同一套模板复制出来的，改一个要全改）：
+
+```
+energy_overview  power_quality  sankey_flow  saving_records  audit_report
+```
+
+**验收**：页面副标题应显示 `范围：数据源（31 台） · 当前 17 台计量点`，
+KPI 有非零数字。改完用 `31-deploy-widget.sh <名>` 推库，**不用重启后端**。
+
 ### 改完部件 JSON 前端没变化
 
 | 层次 | 判据 | 修 |
