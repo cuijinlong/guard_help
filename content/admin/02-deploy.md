@@ -493,6 +493,54 @@ pull 之后不跑 `pack.sh`，浏览器里就是上一次构建的界面。
 
 **修**：跑 `bash guard-server/pack.sh`。
 
+### 坑 1.5：反复 `pack.sh` 会把多套前端叠进同一个 jar（新机器才暴露）
+
+**这是 2026-11-04 新机器「页面空白 + 无效的部件 HTML 模板 + 按钮无样式」的真正的根因。**
+
+`pom.xml` 用 `<resource>` 把 `ui-ngx/target/generated-resources/public`
+拷进 `target/classes/public`，而 **Maven 只增/覆盖，从不删除上轮遗留**。
+于是每跑一次 `pack.sh`，旧的那套前端就多积一层：
+
+| | public/ 文件数 | 日期种类 | chunk 数 | 体积 |
+| --- | --- | --- | --- | --- |
+| 脏 jar（跑过多次） | 10268 | **8 个日期** | 156 | 576MB |
+| 干净 jar（`mvn clean`） | 9066 | **1 个日期** | 88 | 424MB |
+
+实测日期分布：8842 个 11-02 / 1298 个 11-03 / 61 个 10-29 / 24 个 11-01 …
+
+**为什么致命**：`index.html` 只引最新那套（带 hash 文件名），
+但 `assets/` 下的**同名**静态文件（字体、i18n、locale、图片）会被旧构建覆盖
+→ CSS/JS 版本对不上 →
+
+- 部件报「**无效的部件 HTML 模板**」（NG0 编译错误）
+- 部分**样式丢失**（按钮没背景色、下拉框高度怪异）
+- 部分**页面全白**，另一些正常（哪些坏取决于哪套文件被覆盖）
+
+**开发机看不出来**（浏览器缓存着旧资源）；**新机器上必现**。
+
+**三条命令判断**（干净 jar 应为 9066 / 1 / 88）：
+
+```bash
+JAR=~/energy-app/guard-server-4.4.0.jar
+unzip -l $JAR | grep -cF "BOOT-INF/classes/public/"                        # ≈ 9066
+unzip -l $JAR | grep -F "BOOT-INF/classes/public/" | awk '{print $2}' \
+  | sort -u | wc -l                                                       # 必须是 1
+unzip -l $JAR | grep -cE "public/chunk-[A-Z0-9]+[.]js$"                     # ≈ 88
+```
+
+或者直接跑 `bash scripts/33-check-widget-style.sh`，L1 会报红。
+
+**修**：
+
+```bash
+cd <仓库>
+bash guard-server/pack.sh --clean     # mvn clean：彻底清掉 target
+```
+
+> `pack.sh` 已修（2026-11-04）：打包前自动 `rm -rf target/classes/public`，
+> 并在产物校验里新增「多个日期 / chunk > 200」硬检测，命中就报红。
+> 以后就算不加 `--clean` 也不会积脏。但**已经脏了的 jar 必须重打**。
+
 ### 坑 2：改了源码，忘了同步部署目录 → 物料旧
 
 部署侧读 `~/energy-app/data`，源码改的是 `guard-server/src/main/data`。**不会自动同步。**
