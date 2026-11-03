@@ -9,6 +9,7 @@
 | 你的场景 | 看这页 |
 | --- | --- |
 | 第一次装平台，从零到能登录 | [② 包干到底部署](/admin/deploy) |
+| **改完代码，要发到另一台机器** | [⑪ 从源码到新机器](/admin/release) |
 | 发给客户一个账号，让他直接用 | [③ 开户与销户](/admin/onboard) |
 | 客户不合作了，连数据一起清掉 | [③ 开户与销户](/admin/onboard) |
 | 想知道库里到底有什么表、什么字段 | [④ 数据模型](/admin/data-model) |
@@ -22,7 +23,29 @@
 
 ---
 
-## 三条最短路径
+## 四条最短路径
+
+### 零、改完代码，发到另一台机器
+
+**先选路**：发到新机器，还是就地升级已装好的那台？两条路不一样。
+
+```bash
+cd <仓库>
+
+# ① 【必做】物料同步校验 —— 唯一一个「一切正常」的信号
+bash shiyongshouce/downloads/scripts/32-check-deploy-sync.sh --app ~/energy-app
+
+# ② 打 jar（含前端；只改 Java 加 --skip-ui）
+bash guard-server/pack.sh
+
+# ③ 组装发布包（不碰你的 ~/energy-app）
+bash shiyongshouce/downloads/deploy/docker-00-prepare.sh --pack
+
+# ④ 验包 → scp 到目标机 → 解压 → docker-01 → docker-02
+#    → scripts/02-onboard.sh → scripts/09-onboard-customer.sh
+```
+
+每一步的判据、失败处理、三个会翻车的坑，见 [⑪ 从源码到新机器](/admin/release)。
 
 ### 一、新机器，从零到客户能登录
 

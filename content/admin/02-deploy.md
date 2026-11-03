@@ -4,6 +4,14 @@
 
 > 这一页只讲部署。开户/销户见 [③](/admin/onboard)，
 > 设备接入见 [⑦](/admin/device-access)，装不上见 [⑨](/admin/troubleshoot)。
+>
+> **如果你是从源码发布过来的**（刚改完代码，要装到这台新机器）：
+> 先看 [⑪ 从源码到新机器](/admin/release) —— 它会带着你打完 jar、
+> 组装好发布包、验完包，再来跑本页的 `docker-01-install.sh`。
+> **直接从本页开始，容易漏掉「打 jar」和「物料同步」两步**，
+> 表现就是「装完菜单在、页面空」或「新机器脚本静默退出」。
+>
+> **如果这台是已经装好的机器、只想换版本**：看 [⑪](/admin/release) 的路径 B。
 
 ---
 
@@ -56,7 +64,7 @@ bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
 
 ```bash
 ls ~/energy-app/guard-server-4.4.0.jar
-ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 25
+ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 30
 ls ~/energy-app/data/sql/*.sql | wc -l                   # 必须是 8
 ```
 

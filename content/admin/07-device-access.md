@@ -779,6 +779,80 @@ python3 scripts/31-rtu-simulate.py --interval 30 --no-pq-anomaly
 **没有固件支持时的可用路径**：用 TS_KV 圈选 —— 只要设备历史上报过数据，
 就能圈出一段做成数据集，完全不需要固件改动。
 
+### 导出数据集（给分析/训练用）
+
+数据集完成后在**数据集管理**里封存，会生成两个文件：
+
+| 文件 | 内容 |
+| --- | --- |
+| `dataset.csv.gz` | 数据本体，长格式 `ts,metric,num_v,quality` |
+| `dataset.meta.json` | 自描述：单位、中文名、电气条件、依据标准、可评价性、质量码含义 |
+
+下载：
+
+```bash
+TOKEN=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"<账号>","password":"<密码>"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# 数据本体
+curl -H "X-Authorization: Bearer $TOKEN" -o dataset.csv.gz \
+  "http://127.0.0.1:8090/api/energy/pq/datasets/<数据集id>/snapshot/download"
+# 元信息（必须一起拿，否则不知道单位与依据）
+curl -H "X-Authorization: Bearer $TOKEN" -o dataset.meta.json \
+  "http://127.0.0.1:8090/api/energy/pq/datasets/<数据集id>/snapshot/download?part=meta"
+```
+
+**读数据**（Python）：
+
+```python
+import gzip, csv, json, hashlib
+meta = json.load(open('dataset.meta.json'))
+
+# 先校验完整性（训练前必做）
+assert hashlib.sha256(open('dataset.csv.gz','rb').read()).hexdigest() == meta['sha256']
+
+rows = []
+with gzip.open('dataset.csv.gz','rt') as f:
+    for r in csv.DictReader(f):
+        rows.append((int(r['ts']), r['metric'], float(r['num_v']), int(r['quality'])))
+```
+
+**三个必须知道的语义**：
+
+1. **`ts` 是 UTC 毫秒**，不是本地时间。
+2. **`quality` 0=正常 1=估算 2=可疑 3=越界**。
+   **缺失不写行** —— 所以 0 不代表「没读到」，没读到就是没有那一行。
+3. **`num_v` 的单位看 `meta.metrics[].unit`**，不要假设。
+
+**用之前先看 `meta.coverage`**：它列出这地数据能评价哪几项、
+不能评价的缺什么。拿一份只有聚合值的数据集去算谐波/闪变，结果没有意义。
+
+> 平台自带验证脚本，跑通即说明交付物可用：
+> ```bash
+> python3 scripts/pq-e2e-verify.py --base http://127.0.0.1:8090 \
+>   --user <账号> --pass <密码> --device <设备id> --to <最后数据时间戳>
+> ```
+
+### 合格率判定的阈值从哪来
+
+「实时监测」页右上角的**评估口径**卡片会标注阈值来源：
+
+| 标签 | 含义 |
+| --- | --- |
+| 绿「取自标准字典」 | 用平台标准库里的限值（推荐） |
+| 灰「设置项固定」 | 客户在部件设置里手工填了值，以客户为准 |
+
+阈值优先级：**客户设置 > 标准字典 > 内置默认**。
+
+> ⚠ **电压偏差 220V 单相是 +7% / −10%，不是 ±7%**（GB/T 12325-2008）。
+> 2026-11-03 之前这里用同一个 7% 双向算，把 198~204.6 V 的合法区间
+> 误判为欠压，合格率被低估。现在已按国标上下限分开。
+> 如果现场确实要对称考核，在部件设置里把「电压偏差下限」改成 7。
+
+卡片上若有红字「N 条限值尚未核对标准正文」，说明这些数值还没核过标准正文，
+**不得作为对外报告结论**。
+
 ### 电能质量覆盖
 
 三相模拟表按**专业电能质量表**的能力布局（tier = `harmonic` / `pq`）：

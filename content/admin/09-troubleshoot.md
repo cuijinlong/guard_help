@@ -51,7 +51,8 @@ POST /api/noauth/activate?activateToken=...   → 真正设密码并置 active
 | 客户登录后左侧是 TB 原生菜单 | `customer.custom_menu_id` 为空 | `09-onboard-customer.sh` 会绑；手工绑见下 |
 | 租户菜单只剩几项，原生菜单像被删了 | `custom_menu.config` 被覆盖 | 从备份恢复 `custom_menu` 表 |
 | 点某菜单被「弹回」能耗概览 | 菜单指向的看板 id 不存在 | 查菜单 `config` 里的 dashboardId |
-| 菜单里还是旧名字（如「设备运维」） | 菜单配置未更新 | 改 `custom_menu.config` JSON，秒级生效 |
+| 菜单里还是旧名字（如「设备运维」） | 菜单配置未更新 | 改 `custom_menu.config` JSON，**改完必须重启后端**（有缓存，不重启不生效） |
+| 菜单名字对，但点进去是**旧界面** | 该功能同时有部件版和 Angular 站内路由，菜单指着旧的 | 把 `linkType` 从 `URL` 改成 `DASHBOARD` + 填 `dashboardId` + `hideDashboardToolbar: false`，详见下文「页面看起来还是旧版」 |
 | 客户能读写别的客户的场站结构 | 接口只校验租户，没校验 customer | 后端问题，不是配置 |
 
 ### 客户菜单怎么绑
@@ -91,6 +92,61 @@ POST /api/customer
 
 **判据**：`GET /api/widgetType?widgetTypeId=<id>` 看返回的
 `controllerScript` 里有没有你刚加的代码。有 → 前端缓存；没有 → 没发布成功。
+
+### 页面看起来还是旧版（2026-11-03 实测）
+
+**症状**：功能没报错、页面能打开、数据也对，但界面是几天前的样子。
+客户的原话往往是「我的代码都变成老代码了」「是不是被另一台电脑覆盖了」。
+
+**先别查 git。** 先确认这一屏是**谁渲染的** —— 同一功能可能同时存在两套实现：
+
+| 实现 | 特征 | 新旧 |
+| --- | --- | --- |
+| 部件看板 | `linkType: "DASHBOARD"` + `dashboardId` | 新 |
+| Angular 站内路由 | `linkType: "URL"` + `url: "/xxx"` | 可能是旧版 |
+
+查当前菜单指向（把 `<菜单id>` 换成本客户的 `custom_menu_id`）：
+
+```bash
+docker exec energy-postgres psql -U postgres -d thingsboard -t -A -c \
+ "SELECT config FROM custom_menu WHERE id='<菜单id>';" \
+ | python3 -c 'import sys,json; c=json.load(sys.stdin);\
+def w(x,d=0):\
+  [ (print("  "*d + i.get("name","") + "  →  " + (i.get("dashboardId") or i.get("url") or "-")), w(i.get("pages") or [], d+1)) for i in x ];\
+w(c.get("items",[]))'
+```
+
+输出里 `→ /device-management` 这类站内路径就是旧实现；`→ <uuid>` 是部件看板。
+
+**本次实测**：37 个菜单里 22 个走部件看板、8 个走站内路由。设备管理三项
+（`/device-management`、`/device-group`、`/device-topology`）指着 10-26 的 Angular 版，
+而对应的部件 10-31 就做好了、看板 11-02 也建好并挂给了客户 —— **只差菜单这一行**。
+
+**修法**：改菜单 JSON，三处都要改：
+
+```diff
+- { "name": "设备运维", "linkType": "URL", "url": "/device-management",
+-   "dashboardId": null, "hideDashboardToolbar": null }
++ { "name": "设备运维", "linkType": "DASHBOARD",
++   "dashboardId": "<看板id>", "url": null, "hideDashboardToolbar": false }
+```
+
+三个坑，缺一个就出毛病：
+
+1. **`hideDashboardToolbar` 必须显式写 `false`**。`iframe-view` 里这个参数的
+   缺省值是 `true`（`childHideDashboardToolbar` 不传就隐藏整个工具栏），
+   而**面包屑就在工具栏里** —— 不写就是「页面正常、但顶部标题没了」。
+2. **改完必须重启后端**：`docker restart energy-server`。配置有缓存，不重启不生效。
+3. **确认看板真的归属该客户**。`customer_id` 直接归属才一定可访；
+   只用 `assigned_customers` 分配的，实测可能报
+   「这个看板没有分配给你的账号」/ `Permission Denied`。
+
+**不要顺手把所有站内路由都改成看板。** 三个门槛缺一不可：① 有部件版
+② 看板已建 ③ 客户真能打开。用能建议/用能质量是 ngx-ai 子应用、平台自检没有部件版，
+它们本就该走 URL。
+
+**验证必须点菜单**，不要直连 `/dashboards/<id>` —— 直连走的是另一条链路，
+测着通、客户点进去仍是错的。
 
 ### 看板布局问题
 

@@ -29,7 +29,10 @@ DEPLOY_SCRIPT_GLOBS=('0[2-9]-*' '[1-9][0-9]-*')
 #   ts-mirror.sh        验收脚本（04/06/08）的依赖：把 Cassandra 遥测镜像到 PG
 #   dev-fast-build.sh   开发期增量编译，靠 APP_HOME 更新部署目录的 jar
 #   _deploy-manifest.sh 本文件（部署目录里的 preflight / 32 要 source 它）
-DEPLOY_SCRIPT_AUX=('ts-mirror.sh' 'dev-fast-build.sh' '_deploy-manifest.sh')
+#   pq-e2e-verify.py    电能质量数据集端到端验收：圈选→复制→快照→下载→校验 8 项。
+#                       改过 PqSnapshotService / capability / 复制逻辑后必须重跑 ——
+#                       「API 返回 200」不代表交付物能用（见 AGENTS.md E47）
+DEPLOY_SCRIPT_AUX=('ts-mirror.sh' 'dev-fast-build.sh' '_deploy-manifest.sh' 'pq-e2e-verify.py')
 
 # 部署根目录的 docker-*.sh。排除 00（组装脚本，要求在仓库根跑）。
 DEPLOY_DOCKER_GLOB='docker-[0-9][0-9]-*.sh'

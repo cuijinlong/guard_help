@@ -102,6 +102,11 @@
           "id": "dev-build",
           "title": "⑩ 开发与构建",
           "file": "admin/10-dev-build.md"
+        },
+        {
+          "id": "release",
+          "title": "⑪ 从源码到新机器（一条龙发布）",
+          "file": "admin/11-release.md"
         }
       ],
       "description": "给平台方的：怎么部署、开租户、导入数据、排障"
