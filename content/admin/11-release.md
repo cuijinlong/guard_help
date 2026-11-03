@@ -508,6 +508,75 @@ git stash show -p stash@{0} | head -40          # 看它装了什么
 
 详见 [⑨ 排障 · 页面看起来还是旧版](/admin/troubleshoot)。
 
+#### 推送被拒（`! [rejected] main -> main (fetch first)`）
+
+2026-11-03 实测原文：
+
+```
+[main 95d8088] update manual
+To https://github.com/<你>/guard_help.git
+ ! [rejected]        main -> main (fetch first)
+error: failed to push some refs to '...'
+```
+
+**不是权限问题，也不是网络问题。** 含义就一句：
+**远端有你本地没有的提交，直接推会覆盖别人。** Git 拦住了。
+
+最常见的来源就是本文开头那个场景 —— **另一台电脑推过**。
+
+**三步处理**：
+
+```bash
+cd /Users/<你>/Documents/workspace/guard_help
+
+# ① 先看远端到底多了什么（只读，不改工作区）
+git fetch origin
+git log --oneline HEAD..origin/main      # 远端有、你没有
+git log --oneline origin/main..HEAD      # 你有、远端没有
+
+# ② 拉平（保留你的提交，重放到远端之上）
+git pull --rebase origin main
+
+# ③ 推
+git push origin main
+```
+
+**如果第 ② 步报冲突**（`UU` 标记）—— 两侧改了同一文件。
+**不要直接 `git checkout --ours/--theirs`**，先判断能否丢内容：
+
+```bash
+git status                       # 看哪几个是 UU
+git merge-base <远端提交> <你的提交>    # 取共同祖先
+
+# 关键判据：你的版本是不是远端的严格超集？
+git diff <远端提交> <你的提交> -- <冲突文件> | grep '^-'
+#   ↑ 输出为空 = 远端独有行数 0 = 你的版本已包含远端全部内容，取你的版本安全
+
+# 确认安全后，取你的版本（rebase 中 --theirs 指的是你正在重放的提交）
+git show <你的提交>:<冲突文件> > <冲突文件>
+grep -c '^<<<<<<<' <冲突文件>     # 必须是 0
+git add <冲突文件>
+
+git rebase --continue
+```
+
+**本次实测的冲突内容**（很典型）：
+
+| 文件 | 两侧改了什么 | 正确取舍 |
+| --- | --- | --- |
+| `02-deploy.md` | 远端写「看板模板必须是 25」，本地写 30 | 取 **30**（新增 5 个模板后的实测值） |
+| `07-device-access.md` | 远端新增 2 个小节，本地新增同样 2 个 + 另 2 个 | 取**本地**（远端独有行数 = 0） |
+
+**⚠ rebase 过程中不要用 `git add -A`** —— 会把 IDE 配置等垃圾一起提交。
+逐文件 `git add`，或者先 `cat .gitignore` 确认已忽略 `.openidea/`、`.idea/`、`.DS_Store`。
+
+**预防**（比事后救火便宜得多）：
+**开推之前先拉一次**，养成固定动作：
+
+```bash
+git pull --rebase origin main && git push origin main
+```
+
 ---
 
 ## 一页速查
