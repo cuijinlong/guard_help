@@ -18,6 +18,12 @@
 #
 set -euo pipefail
 
+# 脚本所在目录：部署目录下就是 <APP_HOME>/scripts，
+# 凭据文件写在 <APP_HOME>/DEPLOY-CREDENTIALS.txt —— 与 09-onboard-customer.sh
+# 的读取路径 `$HERE/../DEPLOY-CREDENTIALS.txt` 完全一致。
+HERE="$(cd "$(dirname "$0")" && pwd)"
+CRED_FILE="$HERE/../DEPLOY-CREDENTIALS.txt"
+
 BASE="http://127.0.0.1:8090"
 ADMIN=""
 ADMIN_PASS=""
@@ -239,6 +245,48 @@ if [[ "$VERIFY_ONLY" != "true" && -n "$CUSTOMER_EMAIL" && -n "$CUSTOMER_PASS" ]]
   else
     warn "客户管理员已存在，但密码不是本次传入的值 —— 请用原密码登录"
   fi
+fi
+
+
+# ---------------------------------------------------------------- 写凭据
+#
+# ★ 为什么在这里写（2026-11-04 客户实测卡住）：
+#
+# 09-onboard-customer.sh 建客户时需要租户管理员凭据，它默认去读
+# ../DEPLOY-CREDENTIALS.txt。而原来**只有 docker-98-rebuild.sh 会写这个文件** ——
+# 主线上的 docker-01/02 都不写。于是全新机器上跑到建客户那一步直接：
+#
+#     读不到租户管理员凭据。要么在部署目录放 DEPLOY-CREDENTIALS.txt，
+#     要么显式传：--tenant-email xxx@yyy.com --tenant-pass '密码'
+#
+# 客户必须在手册里手抄一遍邮箱密码才能往下走，抄错一个字符就建不出来。
+#
+# 而本脚本（02）建完租户的那一刻，恰好掌握全部凭据 —— 此处落盘最自然，
+# 用户不需要记任何东西。
+#
+# 格式必须与 98-rebuild.sh 保持一致：09 用 sed 按
+#   `租户管理员 <邮箱> / <密码>`   ← 注意空格 + 斜杠两侧各一个空格
+#   `租户名称 <名称>`
+# 解析，改格式会让 09 读不到。
+if [[ -n "$TENANT_EMAIL" && -n "$TENANT_PASS" ]]; then
+  {
+    echo "# 生成于 $(date '+%Y-%m-%d %H:%M:%S')（02-onboard.sh）"
+    echo "# 09-onboard-customer.sh 默认从这里读租户凭据，不用在命令行手传"
+    echo
+    echo "平台入口       $BASE"
+    [[ -n "$ADMIN" ]] && echo "系统管理员     $ADMIN / $ADMIN_PASS"
+    echo "租户管理员     $TENANT_EMAIL / $TENANT_PASS"
+    [[ -n "$TENANT_TITLE" ]] && echo "租户名称       $TENANT_TITLE"
+    [[ -n "$CUSTOMER_EMAIL" ]] && echo "客户用户       $CUSTOMER_EMAIL / $CUSTOMER_PASS"
+    [[ -n "$CUSTOMER_TITLE" ]] && echo "客户名称       $CUSTOMER_TITLE"
+    echo
+    echo "建下一个客户（在部署目录下）："
+    echo "  bash scripts/09-onboard-customer.sh --email 新客户@x.com --password '密码' --name '新客户名'"
+  } > "$CRED_FILE"
+  chmod 600 "$CRED_FILE" 2>/dev/null || true
+  echo
+  echo "   凭据已写入 ${CRED_FILE}（权限 600）"
+  echo "   建客户时不用再手传 --tenant-email / --tenant-pass"
 fi
 
 # ---------------- 验证自动初始化 ----------------

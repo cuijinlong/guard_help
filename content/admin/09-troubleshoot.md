@@ -436,6 +436,70 @@ cd ~/energy-app && docker compose --profile split restart energy-server
 > `dynamic-component-factory.service.ts` 补进 imports。
 > 写新模板建议直接用 `@if`/`@for`，不受 imports 影响。
 
+### 部件能看到，但按钮 / 下拉框样式不对（2026-11-04 客户报）
+
+**症状**：部件内容都在（文字、图标、布局都是对的），但**按钮没有背景色、没有圆角**，
+下拉框与输入框高度怪异。客户描述往往是「TB 的公共样式丢了」。
+
+**先跑脚本，不要先看代码**。在部署目录：
+
+```bash
+cd ~/energy-app
+bash scripts/33-check-widget-style.sh
+```
+
+它分四层查，直接告诉你哪一层坏了：
+
+| 层 | 查什么 | 坏了会怎样 |
+| --- | --- | --- |
+| L1 | jar 里的前端产物（production / development / 缺失） | 没前端 → 整页空白；development → 能用但不是发布版 |
+| L2 | 全局 CSS 可访问性 + **Content-Type** | 404 或 MIME 错成 `application/json` → 整页无样式 |
+| L3 | 库里部件的 `templateCss` 与 HTML 内 `<style>` 块 | 两者都为 0 → 这个部件装出来必然无样式 |
+| L4 | 部署物料 JSON 完整性 | 新装机最常见：物料不全 |
+
+**四层都正常** → 脚本会打印一段浏览器 Console 代码，去**出问题的那个页面**跑：
+
+```js
+// 正常的样子（在本机实测的基线）
+{
+  bodyClass:      "tb-default",                                    ← 必须有
+  hasTbDefault:   true,
+  formFieldVar:   "56px",                                          ← TB 表单标准高度
+  widgetClass:    "widget-type-system-energy_management-query_panel",
+  ngcontentRules: 212,                                             ← 至少一百以上
+  styleTags:      62
+}
+```
+
+**判读**：
+
+| 现象 | 含义 | 怎么办 |
+| --- | --- | --- |
+| `bodyClass` 里没有 `tb-default` | 白标配置把主题类去掉了 | 检查租户白标设置，恢复默认 |
+| `formFieldVar` 为空 | 全局主题变量没加载 | L2 的 CSS 没进来，回看 L2 |
+| `ngcontentRules` 是个位数 | **部件私有样式没进 DOM** | 前端产物不对，重打 jar（见下） |
+| 都正常，但客户就是看着不对 | 浏览器缓存 | 硬刷新 `Cmd+Shift+R` / `Ctrl+F5` |
+
+**两个容易搞错的点**：
+
+1. **部件里 `<style>` 元素数 = 0 是正常的**。Angular 会把模板里的 `<style>` 提取成
+   组件样式，运行时看不到 `<style>` 标签，但规则在（带 `_ngcontent-xxx` 属性）。
+   要看规则数，不是看标签数。
+2. **`templateCss` 很短不等于丢样式**。像 `query_panel` 的 `templateCss` 只有 391 字符
+   （排布用），真正的控件样式在 HTML 的 3 个 `<style>` 块里（共 30614 字符）。
+
+**为什么优先怀疑前端产物**：部件模板是**运行时 JIT 编译**的，
+它把 `<style>` 块降级成 `_ngcontent` 规则。如果前端是旧的 development 产物
+或根本没有前端，这条链就断了 —— 而**后端物料、数据库、接口全部正常**，
+所以查后端永远是死胡同。
+
+重打 jar（不加 `--skip-ui`）：
+
+```bash
+cd <仓库目录>
+bash guard-server/pack.sh
+```
+
 ### 遥测后端选错：功能慢、或报 `relation "ts_kv" does not exist`
 
 **症状**（三种，同一个根因）：

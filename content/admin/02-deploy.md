@@ -222,7 +222,17 @@ bash scripts/02-onboard.sh \
   --tenant-email tenant@example.com --tenant-pass '租户密码'
 ```
 
-租户邮箱和密码自己想，**记下来**，第 7 步要用。
+租户邮箱和密码自己想（**必填**，少了脚本会拒绝）。
+
+**这一步会自动记下凭据**，写到 `~/energy-app/DEPLOY-CREDENTIALS.txt`（权限 600）：
+
+```
+租户管理员     tenant@example.com / 租户密码
+租户名称       某某集团
+```
+
+第 7 步建客户时，`09-onboard-customer.sh` 会**自动从这里读**，不用再手传。
+所以你现在不用抄任何东西。
 
 **看到这个才算成功**（最后一行）：
 
@@ -238,19 +248,37 @@ bash scripts/02-onboard.sh \
 ✓ 四个维度根齐全
 ```
 
+中间还会看到：
+
+```
+凭据已写入 /Users/xxx/energy-app/scripts/../DEPLOY-CREDENTIALS.txt（权限 600）
+建客户时不用再手传 --tenant-email / --tenant-pass
+```
+
+> **为什么需要这个文件（2026-11-04 实测）**
+>
+> `09-onboard-customer.sh` 建客户时必须用租户管理员身份（系统管理员直接建客户会被 TB 403）。
+> 它默认去读 `../DEPLOY-CREDENTIALS.txt`，而原来**只有 `docker-98-rebuild.sh` 会写这个文件** ——
+> 主线的 01/02 都不写。于是全新机器上跑到第 7 步直接失败：
+> ```
+> 读不到租户管理员凭据。要么在部署目录放 DEPLOY-CREDENTIALS.txt，
+> 要么显式传：--tenant-email xxx@yyy.com --tenant-pass '密码'
+> ```
+> 客户必须手抄一遍密码才能往下走，抄错一个字符就建不出来。
+> 已修：`02-onboard.sh` 建完租户后自动落盘。
+
 ---
 
 ## 第 7 步　建第一个客户
-
-`tenant@example.com` / `'租户密码'` 用**第 6 步刚设的**。
 
 ```bash
 cd ~/energy-app
 bash scripts/09-onboard-customer.sh \
   --email customer@example.com --password 'Cust@123456' \
-  --name '某某厂区' \
-  --tenant-email tenant@example.com --tenant-pass '租户密码'
+  --name '某某厂区'
 ```
+
+**不用传租户凭据** —— 第 6 步已经写进 `DEPLOY-CREDENTIALS.txt`，本脚本自动读。
 
 它会：建客户 → 建客户管理员 → 铺演示数据 → 装菜单 → 复制看板 → 逐项验证。
 
@@ -279,7 +307,7 @@ bash scripts/09-onboard-customer.sh \
 
 | 现象 | 怎么办 |
 | --- | --- |
-| `读不到租户管理员凭据` | 你没传 `--tenant-email` / `--tenant-pass`。补上重跑 |
+| `读不到租户管理员凭据` | 第 6 步没跑或没传 `--tenant-email`/`--tenant-pass`。回第 6 步，或手动补：`--tenant-email tenant@example.com --tenant-pass '租户密码'` |
 | `timed out` | 客户其实建好了。等 1 分钟重跑同一条命令（幂等） |
 
 ---
@@ -557,9 +585,9 @@ cd ~/energy-app
 bash docker-01-install.sh                                       # 4. 建库
 bash docker-02-start.sh --admin-email you@x.com --admin-pass '密码'   # 5. 启动
 bash scripts/02-onboard.sh --admin you@x.com --admin-pass '密码' \
-     --tenant '某某集团' --tenant-email t@x.com --tenant-pass '密码'  # 6. 建租户
+     --tenant '某某集团' --tenant-email t@x.com --tenant-pass '密码'  # 6. 建租户（必填，会写凭据文件）
 bash scripts/09-onboard-customer.sh --email c@x.com --password '密码' \
-     --name '某某厂区' --tenant-email t@x.com --tenant-pass '密码'     # 7. 建客户
+     --name '某某厂区'                                              # 7. 建客户（凭据自动读）
 # 8. 浏览器 http://<IP>:8090 用客户账号登录
 
 # ── 装到另一台机器 ────────────────────────────
