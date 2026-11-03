@@ -80,7 +80,39 @@ step() { printf '\n\033[1;36m━━ %s\033[0m\n' "$1"; }
 
 step "0. 目录检查"
 [[ -d "$SRC" ]] || { bad "源码目录不存在：$SRC"; exit 1; }
-[[ -d "$APP/data" ]] || { bad "部署目录不存在：$APP/data"; exit 1; }
+
+#
+# ★ 部署目录不存在 ≠ 出错，那是「全新部署」的正常状态（2026-11-03 实测）
+#
+# 客户跑完 `docker-99-uninstall.sh --purge` 后，整个 $APP 被 rm -rf 删掉，
+# 然后照手册「包干一条龙」第一步跑本脚本，得到的是：
+#     ✗ 部署目录不存在：/Users/xxx/energy-app/data
+# 既没有告诉他这是正常的，也没告诉他下一步该干什么 —— 于是卡在第一步。
+#
+# uninstall --purge 之后本来就不存在可同步的对象：物料会在
+# `docker-00-prepare.sh`（或 `--pack`）组装时从源码**重新拷一份**。
+# 所以这里应该：明确告知「跳过本步」+ 给出下一条命令，而不是报错退出。
+#
+if [[ ! -d "$APP/data" ]]; then
+  warn "部署目录不存在：$APP"
+  cat <<'MSG'
+
+      这不是错误 —— 说明这台机器还没有部署（或刚跑过 uninstall --purge）。
+      没有可同步的对象，本步直接跳过。
+
+      下一步（二选一）：
+
+        # 就在本机部署
+        bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
+
+        # 要发给另一台机器
+        bash shiyongshouce/downloads/deploy/docker-00-prepare.sh --pack
+
+      物料会在那一步从源码重新拷进部署目录，装完再回来跑本脚本校验。
+MSG
+  exit 0
+fi
+
 [[ -d "$SCRIPTS_SRC" ]] || { bad "脚本源码目录不存在：$SCRIPTS_SRC"; exit 1; }
 ok "源码：$SRC"
 ok "脚本：$SCRIPTS_SRC"

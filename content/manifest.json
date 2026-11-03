@@ -1,7 +1,7 @@
 {
   "title": "能源管理平台 · 使用手册",
   "version": "v2.0",
-  "updated": "2026-11-02",
+  "updated": "2026-11-03",
   "sections": [
     {
       "id": "user",
@@ -60,7 +60,7 @@
         },
         {
           "id": "deploy",
-          "title": "② 包干到底部署",
+          "title": "② 包干到底（从源码到客户能登录）",
           "file": "admin/02-deploy.md"
         },
         {
@@ -102,11 +102,6 @@
           "id": "dev-build",
           "title": "⑩ 开发与构建",
           "file": "admin/10-dev-build.md"
-        },
-        {
-          "id": "release",
-          "title": "⑪ 从源码到新机器（一条龙发布）",
-          "file": "admin/11-release.md"
         }
       ],
       "description": "给平台方的：怎么部署、开租户、导入数据、排障"

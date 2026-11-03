@@ -8,8 +8,7 @@
 
 | 你的场景 | 看这页 |
 | --- | --- |
-| 第一次装平台，从零到能登录 | [② 包干到底部署](/admin/deploy) |
-| **改完代码，要发到另一台机器** | [⑪ 从源码到新机器](/admin/release) |
+| 第一次装平台，或改完代码要发布 | [② 包干到底](/admin/deploy) |
 | 发给客户一个账号，让他直接用 | [③ 开户与销户](/admin/onboard) |
 | 客户不合作了，连数据一起清掉 | [③ 开户与销户](/admin/onboard) |
 | 想知道库里到底有什么表、什么字段 | [④ 数据模型](/admin/data-model) |
@@ -23,31 +22,39 @@
 
 ---
 
-## 四条最短路径
+## 三条最短路径
 
-### 零、改完代码，发到另一台机器
+### 一、装平台 / 发新版本（共一页）
 
-**先选路**：发到新机器，还是就地升级已装好的那台？两条路不一样。
+**只有一页：[② 包干到底](/admin/deploy)。** 进去先选场景：
+
+| 你的处境 | 那段 | 一句话 |
+| --- | --- | --- |
+| 全新机器，或刚跑过 `uninstall --purge` | 场景 A | 打 jar → 打发布包 → 传过去 → 装 |
+| 已装好，只想换版本 | 场景 B | 同步物料 → 换 jar → 重启 |
+| 只改了部件 JSON / 脚本 | 场景 C | 推库，不用打 jar |
+
+全流程的命令、判据、失败处理都在那一页。这里只列最常见的两条入口：
 
 ```bash
 cd <仓库>
 
-# ① 【必做】物料同步校验 —— 唯一一个「一切正常」的信号
-bash shiyongshouce/downloads/scripts/32-check-deploy-sync.sh --app ~/energy-app
+# ── 发到新机器 ──────────────────
+bash guard-server/pack.sh                                        # 打 jar（约 12 分钟）
+bash shiyongshouce/downloads/deploy/docker-00-prepare.sh --pack   # 打发布包
+# 验包 → scp → 解压 → docker-01 → docker-02 → 02-onboard → 09-onboard
 
-# ② 打 jar（含前端；只改 Java 加 --skip-ui）
-bash guard-server/pack.sh
-
-# ③ 组装发布包（不碰你的 ~/energy-app）
-bash shiyongshouce/downloads/deploy/docker-00-prepare.sh --pack
-
-# ④ 验包 → scp 到目标机 → 解压 → docker-01 → docker-02
-#    → scripts/02-onboard.sh → scripts/09-onboard-customer.sh
+# ── 就地升级 ────────────────────
+bash shiyongshouce/downloads/scripts/32-check-deploy-sync.sh --app ~/energy-app --fix
+bash guard-server/pack.sh --skip-ui
+# 停容器 → 换 jar → 启容器 → 验证
 ```
 
-每一步的判据、失败处理、三个会翻车的坑，见 [⑪ 从源码到新机器](/admin/release)。
-
-### 一、新机器，从零到客户能登录
+> **唯一一个「一切正常」的信号**（部署目录已存在时）：
+> `bash shiyongshouce/downloads/scripts/32-check-deploy-sync.sh --app ~/energy-app`
+> 输出 `✓ 部署物料与源码一致`。
+> 部署目录不存在时它会提示「跳过本步」并以 0 退出 —— **那是正常的**，
+> 直接去装就行。
 
 ```bash
 # ① 准备部署目录（组装 jar / 数据 / sql）
