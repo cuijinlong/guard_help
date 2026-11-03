@@ -8,7 +8,7 @@
 
 | 你的场景 | 看这页 |
 | --- | --- |
-| 第一次装平台，或改完代码要发布 | [② 包干到底](/admin/deploy) |
+| 第一次装平台，或改完代码要发布 | [② 系统部署](/admin/deploy) |
 | 发给客户一个账号，让他直接用 | [③ 开户与销户](/admin/onboard) |
 | 客户不合作了，连数据一起清掉 | [③ 开户与销户](/admin/onboard) |
 | 想知道库里到底有什么表、什么字段 | [④ 数据模型](/admin/data-model) |
@@ -26,7 +26,7 @@
 
 ### 一、装平台 / 发新版本（共一页）
 
-**只有一页：[② 包干到底](/admin/deploy)。** 进去先选场景：
+**只有一页：[② 系统部署](/admin/deploy)。** 进去先选场景：
 
 | 你的处境 | 那段 | 一句话 |
 | --- | --- | --- |
@@ -74,7 +74,7 @@ bash scripts/02-onboard.sh --admin you@example.com --admin-pass '你的密码' \
 bash scripts/29-rtu-demo-up.sh
 ```
 
-完整说明见 [② 包干到底](/admin/deploy)。
+完整说明见 [② 系统部署](/admin/deploy)。
 
 ### 二、给一个新客户开账号
 
@@ -194,7 +194,7 @@ bash scripts/29-rtu-demo-up.sh               # 两者并存
 | 新增 / 改名 / 删除脚本 | 本页「三条最短路径」+ 对应功能页 |
 | 改脚本参数或默认值 | 同上 |
 | 改数据模型（属性键、字典 key） | [④ 数据模型](/admin/data-model) + [⑧ 运维 SQL](/admin/ops-sql) |
-| 改部署链路 | [② 包干到底](/admin/deploy) |
+| 改部署链路 | [② 系统部署](/admin/deploy) |
 | 改看板 / 部件的行为口径 | 对应功能页 + [客户使用手册](/user/index) |
 | 修了客户能感知的 bug | [⑨ 排障](/admin/troubleshoot) |
 

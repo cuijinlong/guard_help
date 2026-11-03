@@ -1,6 +1,6 @@
 # ① 安装环境（Docker）
 
-> 这一页只管 Docker 本身。平台的部署在[② 平台部署](/admin/deploy)。
+> 这一页只管 Docker 本身。平台的部署在[② 系统部署](/admin/deploy)。
 >
 > 支持三种部署宿主机：**Ubuntu/Debian**、**CentOS 7 / RHEL / Rocky**、**macOS（Docker Desktop）**。
 > 命令不通用，别跨段照抄 —— 尤其 CentOS 7 没有 `dnf`。
