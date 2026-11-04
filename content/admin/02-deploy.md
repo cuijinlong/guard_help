@@ -19,6 +19,7 @@
 | 第 5 步 | 启动 + 建系统管理员 | 1–2 分钟 |
 | 第 6 步 | 建租户 | 1 分钟 |
 | 第 7 步 | 建第一个客户 | 1–2 分钟 |
+| 第 7b 步 | 接入真实 RTU（现场演示必做） | 3 分钟 |
 | 第 8 步 | 登录验收 | 2 分钟 |
 
 **开始前记下三个密码，后面每一步都要用：**
@@ -28,6 +29,57 @@
 | 第 3 步自动生成 | 数据库密码 | 第 3 步会打印，抄下来 |
 | 第 5 步你自己定 | 系统管理员密码 | 自己想一个 |
 | 第 6 步你自己定 | 租户管理员密码 | 自己想一个 |
+
+---
+
+## 软件怎么带到现场
+
+**手册和软件包是两条路，别混。**
+
+| 东西 | 多大 | 怎么带 |
+| --- | --- | --- |
+| 这套手册 | 几 MB | Cloudflare Pages 自动发布，现场用手机/笔记本直接看 |
+| 软件包 | **约 550 MB** | **U 盘带过去**。不要往 Cloudflare 传 —— 静态站点不适合发大文件，而且现场往往没网 |
+
+### 出发前在办公室打一个包
+
+```bash
+cd <你的仓库目录>
+bash shiyongshouce/downloads/deploy/docker-00-prepare.sh --pack
+```
+
+产出 `dist/energy-deploy-<日期>.tar.gz`（约 550 MB），里面已经包含：
+
+- `guard-server-4.4.0.jar`（含前端产物）
+- 584 个部件定义、30 个看板模板
+- 建表 SQL、运维脚本、`docker-compose.yml`
+- **现场要用的 `scripts/09-onboard-customer.sh` 与 `30-rtu-env-init.py`**
+
+拷到 U 盘前先自检一遍：
+
+```bash
+ls -lh dist/energy-deploy-*.tar.gz
+tar -tzf dist/energy-deploy-*.tar.gz | head -20
+md5sum dist/energy-deploy-*.tar.gz > dist/md5.txt   # 一起拷到 U 盘
+```
+
+> **jar 是包里的主要体积**（430 MB 左右），前端产物已经打进 jar，
+> 现场不需要 `npm install`、不需要 Node、不需要联网。
+
+### 到现场解压后继续
+
+```bash
+# 目标机上（U 盘挂载后）
+tar -xzf /media/usb/energy-deploy-*.tar.gz -C /opt/
+cd /opt/energy-deploy
+md5sum -c /media/usb/md5.txt        # 先验完整性
+```
+
+然后从**第 1 步**开始（装 Docker），第 3 步不用再跑 `--pack`，
+直接按第 4 步建库即可。
+
+> **为什么现场不需要重新构建**：jar 已经带了前端产物与全部部件定义。
+> 构建那 12 分钟只在**改代码之后**才需要，客户现场不做开发。
 
 ---
 
@@ -312,6 +364,108 @@ bash scripts/09-onboard-customer.sh \
 
 ---
 
+## 第 7b 步　接入真实 RTU（现场演示必做）
+
+**平台侧不需要任何操作。** 第 7 步建客户时已经把网关建成固件认的那一台：
+
+| 项 | 值 | 谁定 |
+| --- | --- | --- |
+| 网关设备名 | `ED1-Gateway` | `rtu/main.py` 写死，平台侧跟着建 |
+| 访问令牌 | 固件里那个固定值 | 平台侧主动设成它，**不是** TB 随机生成 |
+| 下挂设备名 | `PowerMeter-DDSU666` / `Sensor-HZ8706` / `Relay-8CH` | 同上 |
+
+所以 **不用重新烧录固件**。第 7 步的输出里会有一段核对卡，直接对照：
+
+```
+--- RTU 现场核对（与固件 rtu/main.py 的配置区对照）---
+  网关名    : ED1-Gateway
+  访问令牌  : <与固件 TB_TOKEN 相同>
+  ★ 与固件 TB_TOKEN 一致 → 插入 RTU、配好网络即可上报，无需烧录
+  下挂设备  : PowerMeter-DDSU666 / Sensor-HZ8706 / Relay-8CH
+  平台地址  : 填本机局域网 IP（macOS: ipconfig getifaddr en0），不能填 127.0.0.1
+  MQTT 端口 : 11883（不通会自动回退 1883）
+```
+
+### RTU 侧只改两组
+
+打开 `rtu/main.py` 的配置区，**只动这两处**：
+
+```python
+# ① WiFi —— 改成现场的网络
+WIFI_SSID = "现场WiFi名"
+WIFI_PASS = "现场WiFi密码"
+
+# ② 平台地址 —— 跑这套系统那台电脑的局域网 IP
+TB_HOST = "192.168.1.50"        # 不能填 127.0.0.1，板子连不到
+```
+
+> **怎么查这台电脑的局域网 IP**：macOS `ipconfig getifaddr en0`，
+> Linux `hostname -I | awk '{print $1}'`，Windows `ipconfig`。
+> 必须与 RTU 连的是**同一个网段**（前三段相同）。
+
+`TB_TOKEN`、`GATEWAY_NAME`、三个设备名**一概不要动** —— 平台侧已经对准了。
+
+### 上电后按这个顺序看
+
+1. **串口第一屏是「配置自检」**：WiFi 名、平台 IP、端口、令牌末四位、三个设备名。
+   对着上面那张表核一遍，比事后猜快得多。
+2. **WiFi 连上了**：串口打印 `WiFi OK  <IP>`。
+3. **平台探活通过**：打印 `平台在线`。
+4. **MQTT 连上了**：打印 `MQTT OK`（先试 11883，不通自动回退 1883）。
+5. **开始上报**：每隔几秒打印 `电表 / 传感器 / 继电器` 的读数。
+
+### 验证它在平台侧真的进来了
+
+```bash
+cd ~/energy-app
+
+# ① 三台设备有遥测（把名字换成核对卡上的）
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+select d.name, count(*) from ts_kv k join device d on d.id=k.entity_id
+ where d.name in ('PowerMeter-DDSU666','Sensor-HZ8706','Relay-8CH')
+ group by d.name;"
+
+# ② 浏览器里看：设备管理 → 设备运维 → 网关下应挂 11 台
+#    综合能耗看板副标题应是「数据源（43 台） · 当前 25 台计量点」
+```
+
+### 对不上怎么查
+
+| 串口现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `WiFi 失败` | SSID/密码错，或路由器 5G-only | 改成 2.4G 频段；核对密码 |
+| `平台不在线` | `TB_HOST` 填了 127.0.0.1 或不是同一网段 | 改成本机局域网 IP |
+| `MQTT 认证失败` | 令牌不是固件里那个 | 平台侧重跑 `30-rtu-env-init.py`，看核对卡 |
+| `MQTT` 连上但设备不出现 | 设备名对不上（差一个字符也算） | 核对卡上的三个名字必须逐字一致 |
+| 只有电表有数，传感器没有 | 传感器没接 / 地址不对（`SENSOR_ADDR`） | 查 485 接线 |
+
+> **一个网关只能属于一个客户**（`credentials_id` 有唯一索引）。
+> 平台上已经有别的客户占着 `ED1-Gateway` 时，新建客户会退回模拟网关，
+> 输出里会有 `! ED1-Gateway 已属于客户 …` 的告警。
+> 现场单客户演示不会遇到；多客户共存时真实 RTU 只能给其中一家。
+
+### 演示时数据从哪来
+
+| 数据 | 来源 | 说明 |
+| --- | --- | --- |
+| 正泰电表 / 温湿度 / 8路继电器 | **真实 RTU 上报** | 插上就有，随硬件实时变化 |
+| 8 台 `*-SIM`（三相电、水、气、汽、热、空压、空开） | `31-rtu-simulate.py` 模拟 | 用来看多品种、多分项的效果 |
+| 单相园 / 三相园 那 21–31 台 | 建客户时铺的历史遥测 | 看板曲线立刻有形，不用等数据攒 |
+
+模拟数据要不要跑，看现场需不需要展示多品种：
+
+```bash
+cd ~/energy-app
+nohup bash scripts/29-rtu-demo-up.sh --sim-only --customer '某某厂区' \
+  --interval 30 > /tmp/rtu-sim.log 2>&1 &
+# 停：pkill -f 31-rtu-simulate.py
+```
+
+> 模拟脚本会**跳过** `PowerMeter-DDSU666` 等真实设备（`REAL_DEVICES` 白名单），
+> 不会用假数据覆盖真表读数。
+
+---
+
 ## 第 8 步　登录验收
 
 浏览器打开 `http://<这台机器的IP>:8090`，用**第 7 步的客户账号**登录。
@@ -480,6 +634,37 @@ bash docker-02-start.sh --allinone --admin-email ... --admin-pass ...
 `09` 已把超时放宽到 600 秒。看到 `timed out` 说明客户其实建好了，等 1 分钟重跑（幂等）。
 
 **② 首次 `install` 2–3 分钟** —— 建 150 上下张表 + 导入 740 上下个部件。机器慢会到 5 分钟。
+
+## 先回答一个常被问的问题：干净重装能避免翻车吗
+
+**不能。这是最容易被误解的一点，必须说清楚。**
+
+| 问题类型 | 干净重装有用吗 | 为什么 |
+| --- | --- | --- |
+| 累积脏状态：多套前端产物叠在同一个 jar、旧 jar 没换、数据库残留旧配置 | **有用** | 这些是「越用越脏」，清空重建就没了 |
+| **代码 bug**：部件管道缺失、`scope` 作用域、网关只查不建 | **没用** | 干净装上跑的还是同一份代码，一样翻车 |
+
+实测例子：2026-11-04 修的「整页空白」是 `DecimalPipe` 没进动态组件作用域，
+「没样式」是 Material 指令没进 imports —— 这两个在**全新安装的干净库里
+百分之百复现**，因为它们是构建产物的问题，跟数据一点关系都没有。
+
+**真正能防翻车的是三道机制，不是重装**：
+
+```bash
+# ① 构建前：部件依赖自检（584 个模板，缺管道/Material 直接退出码 1）
+cd ui-ngx && node esbuild/check-widget-deps.mjs
+
+# ② 部署前：jar 比前端产物旧就中止（防「只 build 前端没重打 jar」）
+#    已内置在 docker-98-rebuild.sh
+
+# ③ 装完：跑验收脚本，看实际渲染，不看退出码
+bash scripts/08-verify-release.sh
+```
+
+> 结论：干净重装解决「脏」，不解决「错」。
+> 每次改动后**按验收清单实际点一遍页面**，才是唯一的保险。
+
+---
 
 ## 三个会让你翻车的坑
 

@@ -157,7 +157,9 @@ else
       > /tmp/onboard-rtu.log 2>&1 \
       || warn "RTU 设备初始化有失败项，看 /tmp/onboard-rtu.log"
     # 只回显关键几行，完整输出留在日志里
-    sed -n '/⑥ 网关/,/⑧ 模拟设备/p' /tmp/onboard-rtu.log | sed 's/^/    /' | head -12
+    sed -n '/⑤b 真实 RTU 身份/,/⑧ 模拟设备/p' /tmp/onboard-rtu.log | sed 's/^/    /' | head -16
+    # 现场核对卡：网关名 / 令牌 / 下挂设备名，与 RTU 串口第一屏对照
+    sed -n '/RTU 现场核对/,/MQTT 端口/p' /tmp/onboard-rtu.log | sed 's/^/    /' 
   else
     warn "找不到 $HERE/30-rtu-env-init.py，跳过 RTU 设备初始化"
   fi

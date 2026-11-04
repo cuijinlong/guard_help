@@ -43,6 +43,7 @@ python3 scripts/30-rtu-env-init.py --base http://127.0.0.1:8090 \\
 """
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -53,6 +54,24 @@ import urllib.request
 # 场站名由客户名推导（demo-data 建的场站就是这个命名规则）
 # 「单相园区·<客户名>」「三相园区·<客户名>」
 DEFAULT_CUSTOMER = '平台演示中心'
+
+# ============================================================================
+# 真实 RTU 的身份（与 rtu/main.py 逐字一致，改一处必须改两处）
+#
+# <h3>为什么要把这些写死</h3>
+# 客户现场的操作顺序是：装系统 → 建客户 → 插上 RTU → 配网络 → 演示。
+# 中间**不能有"重新烧录固件"这一步**。所以平台侧必须主动把网关的
+# 访问令牌设成固件里那个固定值，而不是用 TB 随机生成的。
+#
+# <h3>为什么只有主演示客户能用</h3>
+# device_credentials.credentials_id 上有唯一索引（device_credentials_id_unq_key），
+# 一个 token 只能属于一台设备。所以「一套固件连所有客户」不成立 ——
+# 现场单客户演示时用真名+真令牌，多客户共存时才退回带后缀的模拟网关。
+RTU_GATEWAY_NAME = 'ED1-Gateway'
+# ★ 与 rtu/main.py 的 TB_TOKEN 必须是同一个字符串。
+RTU_TOKEN = '[redacted]'
+# RTU 下挂设备的基名（无后缀形态）
+RTU_DEVICE_BASES = ('PowerMeter-DDSU666', 'Sensor-HZ8706', 'Relay-8CH')
 
 
 def site_names(customer):
@@ -76,8 +95,10 @@ def sim_name(base, customer):
     return '%s·%s' % (base, customer)
 
 
-def gateway_names(customer):
+def gateway_names(customer, primary=False):
     """网关命名。
+
+    <p>primary=True 时用真实板子那套无后缀身份（见 resolve_primary）。
 
     <p>**主演示客户**：真实 RTU 用 `ED1-Gateway`（板子上写死，改不了），
     模拟设备另用一个 `ED2-Gateway·客户名`。
@@ -88,8 +109,14 @@ def gateway_names(customer):
     （实测 2026-11-02：新客户的燃气/水表被挂到了 ED1 下）。
     两个场站的区别靠设备的 `siteId` 体现，不靠网关数量。
     """
-    if customer == DEFAULT_CUSTOMER:
-        return 'ED1-Gateway', sim_name('ED2-Gateway', customer)
+    if primary:
+        # 现场演示形态：**只用一个网关**（真实板子那台）。
+        #
+        # ★ 为什么不再额外建一个 ED2 挂 SIM（2026-11-04 改）：
+        #   客户现场只有一块板子，界面里出现「数据网关 ×2」（其中一个没硬件）
+        #   会被当成系统故障。SIM 设备与真实设备靠 additionalInfo.simulated
+        #   区分已经足够，不必再分两台网关。
+        return RTU_GATEWAY_NAME, RTU_GATEWAY_NAME
     gw = sim_name('ED2-Gateway', customer)
     return gw, gw
 # 网关名由 gateway_names() 按客户推导（真实网关固定，模拟网关带后缀）
@@ -353,20 +380,65 @@ RTU_ATTACHED = [
 ]
 
 
-def rtu_attached_name(base, customer):
-    """RTU 下挂设备名：主演示客户用真名（板子写死），其余带客户后缀。"""
-    if customer == DEFAULT_CUSTOMER:
+def rtu_attached_name(base, customer, primary=False):
+    """RTU 下挂设备名：primary 用真名（板子写死），否则带客户后缀。"""
+    if primary:
         return base
     return sim_name(base, customer)
 
 
-def keep_devices(customer):
+def cleanup_shadow_rtu(api, log, customer_id, customer_name, primary):
+    """删掉「另一种命名形态」留下的 RTU 占位设备。
+
+    <p>★ 为什么需要（2026-11-04）：RTU 三件套有两种命名形态 ——
+    primary 用固件真名（`PowerMeter-DDSU666`），非 primary 带客户后缀
+    （`PowerMeter-DDSU666·某某公司`）。两种形态**同时存在**时，
+    客户在设备管理里会看到两个同名电表，看板计量点也会多算一台。
+
+    <p>清理条件三选三，缺一不删：名字是本脚本建的那几个 + 属于本客户 +
+    是自身为 simulated 的占位设备。客户自己改过名或换成真实设备的，不动。
+    """
+    keep_primary = primary
+    removed = 0
+    for spec in RTU_ATTACHED:
+        for want_primary in (True, False):
+            if want_primary == keep_primary:
+                continue          # 这是要保留的形态
+            nm = rtu_attached_name(spec['base'], customer_name, want_primary)
+            for d in api.paged('/api/tenant/devices'):
+                if d.get('name') != nm:
+                    continue
+                if (d.get('customerId') or {}).get('id') != customer_id:
+                    continue
+                ai = d.get('additionalInfo') or {}
+                if isinstance(ai, str):
+                    try:
+                        ai = json.loads(ai)
+                    except Exception:
+                        ai = {}
+                if not ai.get('simulated'):
+                    continue      # 不是本脚本建的占位，别碰
+                code, _ = api.call('DELETE', '/api/device/' + d['id']['id'])
+                if code in (200, 204):
+                    removed += 1
+                    log('    - 已清理重复占位 %s' % nm)
+    if removed:
+        log('  共清理 %d 台重复占位（保留 %s 形态）'
+            % (removed, '真名' if primary else '带后缀'))
+    return removed
+
+
+def keep_devices(customer, primary=False):
     """本客户下不允许被 prune 删掉的设备名。"""
     names = {'ED1-Gateway'} | REAL_DEVICES
-    names |= set(gateway_names(customer))
+    names |= set(gateway_names(customer, primary))
     names |= {sim_name(d['name'], customer) for d in SIM_DEVICES}
-    # RTU 下挂三件套（带后缀形态）
-    names |= {rtu_attached_name(d['base'], customer) for d in RTU_ATTACHED}
+    # RTU 下挂三件套（primary 无后缀，否则带客户后缀）
+    names |= {rtu_attached_name(d['base'], customer, primary) for d in RTU_ATTACHED}
+    # 两种形态都留着：客户在 primary / 非 primary 之间切换过一次时，
+    # 旧那套也不能被误删
+    names |= {rtu_attached_name(d['base'], customer, True) for d in RTU_ATTACHED}
+    names |= {rtu_attached_name(d['base'], customer, False) for d in RTU_ATTACHED}
     return names
 
 
@@ -748,7 +820,7 @@ def ensure_profile(api, name, spec, kind_ids, log):
     return prof
 
 
-def ensure_gateway(api, name, site, customer_id, log):
+def ensure_gateway(api, name, site, customer_id, log, token=None):
     dev = next((d for d in api.paged('/api/tenant/devices') if d.get('name') == name), None)
     prof = find_profile(api, '网关')
     ai = {'siteId': site['id']['id'], 'gateway': True,
@@ -772,7 +844,97 @@ def ensure_gateway(api, name, site, customer_id, log):
         if dev.get('customerId'):
             upd['customerId'] = dev['customerId']
         api.post('/api/device', upd)
+
+    # ★ 固定令牌（2026-11-04）：不固定的话每次重装都变，现场必须重新烧录固件
+    if token and dev is not None and not api.dry:
+        did = dev['id']['id']
+        got = ensure_token(api, did, token, log)
+        if got == token:
+            log('    ⌁ 访问令牌已固定（RTU 侧无需改固件）')
     return dev
+
+
+def ensure_token(api, device_id, wanted, log):
+    """把设备的访问令牌固定成 wanted。
+
+    <p>★ 不能省（2026-11-04）：TB 每建一台设备就随机生成令牌，重装一次变一次。
+    不固定的话，客户现场装完系统、插上 RTU，日志报「MQTT 认证失败」，
+    只能回平台复制新令牌再**重新烧录固件** —— 而这正是要避免的动作。
+
+    <p>取凭证用 GET /api/device/{id}/credentials（不是 ?deviceId= 查询参数）。
+    """
+    code, cur = api.call('GET', '/api/device/%s/credentials' % device_id)
+    if code != 200 or not isinstance(cur, dict):
+        log('    ⚠ 读不到设备令牌（HTTP %s），跳过固定' % code)
+        return None
+    if cur.get('credentialsId') == wanted:
+        return wanted
+    body = {
+        'id': cur['id'],
+        'deviceId': {'entityType': 'DEVICE', 'id': device_id},
+        'credentialsType': 'ACCESS_TOKEN',
+        'credentialsId': wanted,
+    }
+    code, _ = api.call('POST', '/api/device/credentials', body)
+    if code in (200, 201, 204):
+        return wanted
+    log('    ⚠ 设置固定令牌失败（HTTP %s）' % code)
+    return None
+
+
+def derive_token(customer_id):
+    """非主客户网关的令牌：由客户 id 派生，**可预测**（重装/重建客户都不变）。
+
+    <p>为什么不随机：随机值每重建一次就变，现场就得改固件。
+    <p>为什么不复用主令牌：credentials_id 唯一，一台设备一个。
+    """
+    return hashlib.md5(('guard-rtu-' + customer_id).encode('utf-8')).hexdigest()[:20]
+
+
+def resolve_primary(api, customer_id):
+    """判断本客户能否使用真实 RTU 身份（ED1-Gateway + 固定令牌）。
+
+    <p>规则：ED1-Gateway 不存在 → 可用；已存在且属于本客户 → 可用；
+    属于别的客户 → 不可用（不能抢，会把别人的真实设备抢过来）。
+
+    <p>这样做了以后，现场**客户名随便起**，只要平台上还没有真实 RTU，
+    建客户时就会自动采用固件里的那套身份，插上板子就能上报。
+    """
+    for d in api.paged('/api/tenant/devices'):
+        if d.get('name') == RTU_GATEWAY_NAME:
+            owner = (d.get('customerId') or {}).get('id')
+            return owner == customer_id, d
+    return True, None
+
+
+def repoint_gateway(api, dev_id, gw_id, log):
+    """确保设备只挂在 gw_id 这一台网关下。
+
+    <p>★ 为什么必须做（2026-11-04）：`POST /api/relation` 只增不删。
+    切换命名形态（带后缀 ↔ 真名）或换网关后，同一台设备会同时挂在
+    新旧两台网关下 —— 设备树里出现两份，看板计量点也会重复计数。
+
+    <p>反向查用 `GET /api/relations?toId=&toType=DEVICE`；
+    只清 `from.entityType === 'DEVICE'` 的边，资产/场站的归属边一律不碰。
+    """
+    code, rels = api.call('GET', '/api/relations?toId=%s&toType=DEVICE&relationTypeGroup=COMMON' % dev_id)
+    if code == 200 and isinstance(rels, list):
+        for r in rels:
+            frm = r.get('from') or {}
+            if frm.get('entityType') != 'DEVICE':
+                continue
+            if frm.get('id') == gw_id:
+                continue
+            api.call('DELETE', '/api/relation', {
+                'from': frm, 'to': r.get('to'),
+                'type': r.get('type'), 'typeGroup': r.get('typeGroup') or 'COMMON',
+            })
+            log('    - 解除旧网关挂载')
+    api.call('POST', '/api/relation', {
+        'from': {'entityType': 'DEVICE', 'id': gw_id},
+        'to': {'entityType': 'DEVICE', 'id': dev_id},
+        'type': 'Contains', 'typeGroup': 'COMMON',
+    })
 
 
 def ensure_device(api, spec, site, customer_id, gw_id, log):
@@ -843,15 +1005,11 @@ def ensure_device(api, spec, site, customer_id, gw_id, log):
         api.post('/api/plugins/telemetry/DEVICE/%s/SERVER_SCOPE' % did,
                  {'rpcCommands': rpc})
 
-    api.call('POST', '/api/relation', {
-        'from': {'entityType': 'DEVICE', 'id': gw_id},
-        'to': {'entityType': 'DEVICE', 'id': did},
-        'type': 'Contains', 'typeGroup': 'COMMON',
-    })
+    repoint_gateway(api, did, gw_id, log)
     return dev
 
 
-def prune(api, log, dry, customer_id, customer_name):
+def prune(api, log, dry, customer_id, customer_name, primary=False):
     """删掉**本客户**名下不在白名单里的设备。
 
     <p>★ 必须按客户收窄（2026-11-02 实测踩过）：一个租户下可能有好几个客户，
@@ -860,7 +1018,7 @@ def prune(api, log, dry, customer_id, customer_name):
 
     <p>演示设备（repair-init 的 repairHvacModule 重建的那 10 台）也在其中。
     """
-    keep = keep_devices(customer_name)
+    keep = keep_devices(customer_name, primary)
     victims = []
     for d in api.paged('/api/tenant/devices'):
         cid = (d.get('customerId') or {}).get('id')
@@ -1197,9 +1355,27 @@ def main():
         except Exception as e:
             log('  ✗ 档案「%s」: %s' % (nm, e))
 
+    # ⑤b 真实 RTU 身份可用性
+    #
+    # ★ 2026-11-04 加。客户现场的流程是「装系统 → 建客户 → 插 RTU → 配网络 → 演示」，
+    #   中间不能有「重新烧录固件」这一步。要做到这点，平台侧的网关必须用
+    #   固件里写死的那个名字与令牌（rtu/main.py 的 GATEWAY_NAME / TB_TOKEN）。
+    #
+    #   判断规则见 resolve_primary()：ED1-Gateway 空着、或本来就属于本客户，
+    #   就采用真实身份。这样**客户名随便起**，插上板子就能上报。
+    log('\n=== ⑤b 真实 RTU 身份 ===')
+    primary, existing_gw = resolve_primary(api, customer_id)
+    if primary:
+        log('  ✓ 本客户采用真实 RTU 身份（网关 %s，令牌固定）' % RTU_GATEWAY_NAME)
+        log('    插上 RTU、配好网络即可上报，固件无需改动')
+    else:
+        owner = (existing_gw.get('customerId') or {}).get('id', '')[:8]
+        log('  ! %s 已属于客户 %s…，本客户退回模拟网关' % (RTU_GATEWAY_NAME, owner))
+        log('    真实 RTU 只能连一个客户；现场单客户演示请先销掉占用者')
+
     # ⑥ 网关
     log('\n=== ⑥ 网关 ===')
-    gw_single_name, gw_three_name = gateway_names(customer_name)
+    gw_single_name, gw_three_name = gateway_names(customer_name, primary)
     # ★ ED1-Gateway 是**真实板子**，全局只有一套，只属于主演示客户。
     #   非主客户跑脚本时必须跳过它 —— 否则会把它的场站改成这个客户的场站，
     #   主演示客户的真实设备就从这个场站里消失了（实测 2026-11-02）。
@@ -1213,16 +1389,48 @@ def main():
     #
     #   非主客户用的名字是 ED2-Gateway·客户名（gateway_names 已保证），
     #   不会与真实板子的 ED1-Gateway 相撞，所以可以直接建。
-    gw_single = ensure_gateway(api, gw_single_name, site_single, customer_id, log)
+    # primary 的网关用固件里的固定令牌；模拟网关用按客户 id 派生的确定值
+    gw_single_token = RTU_TOKEN if primary else derive_token(customer_id)
+    gw_single = ensure_gateway(api, gw_single_name, site_single, customer_id, log,
+                               token=gw_single_token)
     if gw_three_name == gw_single_name:
         gw_three = gw_single          # 同一台网关管两个场站
     else:
-        gw_three = ensure_gateway(api, gw_three_name, site_three, customer_id, log)
+        gw_three = ensure_gateway(api, gw_three_name, site_three, customer_id, log,
+                                  token=derive_token(customer_id))
     if not gw_single or not gw_three:
         log('✗ 网关创建失败')
         return 1
     sites = {'single': site_single, 'three': site_three}
     gws = {'single': gw_single, 'three': gw_three}
+
+    # ⑥a primary 模式下清掉空的旧模拟网关
+    #
+    # 之前建过 ED2-Gateway·客户名 挂 SIM；改成单网关后它不再需要。
+    # 只在它名下**一台设备都不剩**时删 —— 还有设备就先留着（⑦⑧ 会迁走），
+    # 下一轮再删。绝不因为「名字看着多余」就删掉有内容的网关。
+    if primary:
+        for d in api.paged('/api/tenant/devices'):
+            if d.get('name') != sim_name('ED2-Gateway', customer_name):
+                continue
+            if (d.get('customerId') or {}).get('id') != customer_id:
+                continue
+            did = d['id']['id']
+            code, rels = api.call(
+                'GET', '/api/relations?fromId=%s&fromType=DEVICE&relationTypeGroup=COMMON' % did)
+            left = [r for r in (rels or []) if isinstance(r, dict)]
+            if left:
+                log('  · 旧模拟网关 %s 下还有 %d 条关系，暂留' % (d.get('name'), len(left)))
+                continue
+            code, _ = api.call('DELETE', '/api/device/' + did)
+            if code in (200, 204):
+                log('  - 已删除空的旧模拟网关 %s' % d.get('name'))
+
+    # ⑥b 清理另一种命名形态留下的重复占位
+    try:
+        cleanup_shadow_rtu(api, log, customer_id, customer_name, primary)
+    except Exception as e:
+        log('  ⚠ 清理重复占位失败: %s' % e)
 
     # ⑦ RTU 下挂设备（网关 → 正泰电表 / 温湿度 / 8 路继电器）
     #
@@ -1236,7 +1444,7 @@ def main():
     # 真实设备也要有**人话 label**（2026-11-02 客户要求）：
     #   设备技术名只用于唯一性与匹配，界面上一律显示 label。
     for spec in RTU_ATTACHED:
-        nm = rtu_attached_name(spec['base'], customer_name)
+        nm = rtu_attached_name(spec['base'], customer_name, primary)
         try:
             named = dict(spec, name=nm)
             # 真实 RTU 设备由网关转发上报，meterLevel 走 0（不进汇总）
@@ -1273,11 +1481,11 @@ def main():
     if args.prune:
         log('\n=== ⑨ 清理演示设备（保留场站/分项/区域资产）===')
         try:
-            prune(api, log, args.dry_run, customer_id, customer_name)
+            prune(api, log, args.dry_run, customer_id, customer_name, primary)
         except Exception as e:
             log('  ✗ 清理失败: %s' % e)
     else:
-        keep = keep_devices(customer_name)
+        keep = keep_devices(customer_name, primary)
         extra = [d.get('name') for d in api.paged('/api/tenant/devices')
                  if (d.get('customerId') or {}).get('id') == customer_id
                  and d.get('name') not in keep]
@@ -1305,6 +1513,27 @@ def main():
             log('            密码沿用原值（本脚本没改）；忘了就去「客户与用户 → 用户」重置')
     log('场站      : %s / %s' % (site_single_name, site_three_name))
     log('模拟设备  : %d / %d' % (ok, len(SIM_DEVICES)))
+
+    # ---- 现场核对卡：插 RTU 之前对着看一遍 ----
+    #
+    # ★ 这一段是给「客户现场」用的（2026-11-04 加）。
+    #   现场最常卡的是三件事：网段不对、端口不对、令牌不是固件里那个。
+    #   把平台侧的真实值原样打出来，与 RTU 串口第一屏「配置自检」对照即可。
+    gw_dev = gw_single or {}
+    gw_tok = gw_single_token if gw_single_name == RTU_GATEWAY_NAME else derive_token(customer_id)
+    log('\n--- RTU 现场核对（与固件 rtu/main.py 的配置区对照）---')
+    log('  网关名    : %s' % gw_single_name)
+    log('  访问令牌  : %s' % gw_tok)
+    if primary and gw_single_name == RTU_GATEWAY_NAME:
+        log('  ★ 与固件 TB_TOKEN 一致 → 插入 RTU、配好网络即可上报，无需烧录')
+    else:
+        log('  ! 这不是固件里的固定令牌（%s 已被别的客户占用）' % RTU_GATEWAY_NAME)
+        log('    现场要用真实 RTU 时，需把固件 TB_TOKEN 改成上面的值')
+    log('  下挂设备  : %s' % ' / '.join(
+        rtu_attached_name(b, customer_name, primary) for b in RTU_DEVICE_BASES))
+    log('  平台地址  : 填本机局域网 IP（macOS: ipconfig getifaddr en0），不能填 127.0.0.1')
+    log('  MQTT 端口 : 11883（不通会自动回退 1883）')
+
     if args.dry_run:
         log('（dry-run 共计划写入 %d 次）' % api.writes)
     log('\n下一步：')
