@@ -28,10 +28,24 @@
 #
 # 常用命令（可直接复制）：
 #
-#   # 【最常用】客户已建好，恢复模拟上报（常驻，Ctrl-C 或 pkill 停）
-#   nohup bash scripts/29-rtu-demo-up.sh --sim-only --interval 30 \
-#     > /tmp/rtu-sim.log 2>&1 &
-#   # 停： pkill -f 31-rtu-simulate.py
+#   # 【三种数据来源，按现场情况选】
+#   #
+#   #  A. 真实 RTU + 模拟同跑（推荐，演示效果最全）
+#   #     bash scripts/29-rtu-demo-up.sh --sim-only    ← 已在后台常驻，不用 nohup
+#   #     真实板子自己上报，不受影响；两者写不同设备，互不覆盖。
+#   #
+#   #  B. 只要真实 RTU（板子接好了，不想掺假数据）
+#   #     python3 scripts/31-rtu-simulate.py --stop
+#   #
+#   #  C. 只要模拟（板子没带 / 现场没网口）
+#   #     bash scripts/29-rtu-demo-up.sh --sim-only
+#   #     模拟脚本自带 REAL_DEVICES 白名单，不会碰真实板子那三台；
+#   #     板子不在时它就是「只有模拟」，不用额外开关。
+#   #
+#   # 常驻管理：
+#   #   python3 scripts/31-rtu-simulate.py --status
+#   #   python3 scripts/31-rtu-simulate.py --stop
+#   #   日志： tail -f /tmp/guard-rtu-sim.log
 #
 #   bash scripts/29-rtu-demo-up.sh --status             # 谁在报、谁停了
 #   bash scripts/29-rtu-demo-up.sh --check              # 改数据前先看一眼
@@ -277,11 +291,26 @@ if [[ $SIM_ONLY == 1 || $CHECK_ONLY == 1 ]]; then
   fi
   step "只跑模拟上报（${CUSTOMER}，每 ${INTERVAL}s 一轮）"
   echo "  真实 RTU 不受影响，会照常上报（两者写不同设备，互不覆盖）"
-  echo "  Ctrl-C 停"
+  echo "  这是**后台常驻**模式：命令立刻返回，进程脱离终端"
   show_status
   echo
-  exec "$PY" -u "$HERE/31-rtu-simulate.py" --base "${BASE}" --customer "${CUSTOMER}" \
-    --tenant "${TENANT}" --tenant-pass "$TENANT_PASS" --interval "${INTERVAL}"
+  # ★ 用 --daemon 而不是 nohup &（2026-11-04 改）：
+  #   现场让客户敲 nohup 容易漏，终端一关进程就没了，
+  #   表现是「看板数据停在某一刻」，很难想到是进程被杀。
+  #   --daemon 自己 fork+setsid+重定向日志，并写 pid 文件，可 --stop/--status。
+  "$PY" "$HERE/31-rtu-simulate.py" --base "${BASE}" --customer "${CUSTOMER}" \
+    --tenant "${TENANT}" --tenant-pass "$TENANT_PASS" --interval "${INTERVAL}" --daemon
+  RC=$?
+  echo
+  if [[ $RC -eq 0 ]]; then
+    ok "模拟上报已在后台运行"
+    echo "     日志：tail -f /tmp/guard-rtu-sim.log"
+    echo "     状态：python3 scripts/31-rtu-simulate.py --status"
+    echo "     停止：python3 scripts/31-rtu-simulate.py --stop"
+  else
+    bad "启动失败（退出码 $RC）"
+  fi
+  exit $RC
 fi
 
 # ---------------------------------------------------------------- 3. 客户 + 场站 + 设备

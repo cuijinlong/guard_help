@@ -33,6 +33,8 @@ python3 scripts/31-rtu-simulate.py --dry-run       # 只算不发
 
 import argparse
 import json
+import os
+import signal
 import math
 import random
 import sys
@@ -561,6 +563,21 @@ def backfill(base, token, sims, days, dry, reading_only=False):
     return total
 
 
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _read_pid(path):
+    try:
+        return int(open(path).read().strip())
+    except Exception:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description='RTU 模拟上报（ED2-Gateway 下的 7 台设备）')
     ap.add_argument('--base', default='http://127.0.0.1:8090')
@@ -585,10 +602,70 @@ def main():
                     help='只上报累积表底（energy_reading），不报本周期增量（energy）。'
                          '现场真实仪表就是这样 —— 平台必须能从表底差出用量。'
                          '用于验证资产汇总的差分路径')
+    ap.add_argument('--daemon', action='store_true',
+                    help='后台常驻（自己脱离终端，写 pid 文件）。现场演示推荐。')
+    ap.add_argument('--stop', action='store_true', help='停掉 --daemon 启动的进程')
+    ap.add_argument('--status', action='store_true', help='看后台进程是否在跑')
+    ap.add_argument('--pidfile', default='/tmp/guard-rtu-sim.pid',
+                    help='pid 文件路径（默认 /tmp/guard-rtu-sim.pid）')
     ap.add_argument('--customer', default=None,
                     help='只给这个客户名下的模拟设备发数据（默认全部）。'
                          '多客户同租户时建议指定，避免一个客户的数据串到另一个')
     args = ap.parse_args()
+
+    # ---- 后台常驻管理（2026-11-04 加）----
+    #
+    # ★ 为什么要有 --daemon：现场让客户敲 `nohup ... &` 容易漏掉，
+    #   终端一关进程就没了，表现是「数据停在某一刻」。
+    #   这个选项自己 fork + setsid，与终端彻底脱钩，并写 pid 文件，
+    #   配合 --stop / --status 就能干净地起停。
+    pidf = args.pidfile
+    if args.stop:
+        pid = _read_pid(pidf)
+        if pid and _pid_alive(pid):
+            os.kill(pid, signal.SIGTERM)
+            print('已停止模拟上报（pid %d）' % pid)
+        else:
+            print('没有在跑（pid 文件 %s）' % pidf)
+        try:
+            os.remove(pidf)
+        except OSError:
+            pass
+        return 0
+
+    if args.status:
+        pid = _read_pid(pidf)
+        if pid and _pid_alive(pid):
+            print('✓ 模拟上报在跑（pid %d）' % pid)
+            return 0
+        print('✗ 模拟上报没在跑')
+        return 1
+
+    if args.daemon:
+        # 已经在子进程里（用环境变量标记，避免无限 fork）
+        if os.environ.get('_GUARD_SIM_DAEMON') == '1':
+            pass
+        else:
+            pid = os.fork()
+            if pid > 0:
+                # 父进程：写 pid 文件后退出
+                with open(pidf, 'w') as f:
+                    f.write(str(pid))
+                print('✓ 已转入后台（pid %d）' % pid)
+                print('  停止：python3 %s --stop' % sys.argv[0])
+                print('  状态：python3 %s --status' % sys.argv[0])
+                return 0
+            os.setsid()                 # 脱离终端会话
+            os.environ['_GUARD_SIM_DAEMON'] = '1'
+            # 修正 pid 文件（fork 后子进程 pid 才是真的）
+            with open(pidf, 'w') as f:
+                f.write(str(os.getpid()))
+            # 重定向标准流，避免父终端关闭后写失败
+            devnull = os.open(os.devnull, os.O_RDWR)
+            os.dup2(devnull, 0)
+            logf = os.open('/tmp/guard-rtu-sim.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            os.dup2(logf, 1)
+            os.dup2(logf, 2)
 
     global PQ_ANOMALY
     PQ_ANOMALY = not args.no_pq_anomaly

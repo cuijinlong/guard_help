@@ -69,7 +69,7 @@ DEFAULT_CUSTOMER = '平台演示中心'
 # 现场单客户演示时用真名+真令牌，多客户共存时才退回带后缀的模拟网关。
 RTU_GATEWAY_NAME = 'ED1-Gateway'
 # ★ 与 rtu/main.py 的 TB_TOKEN 必须是同一个字符串。
-RTU_TOKEN = '[redacted]'
+RTU_TOKEN = 'ED1GatewayDemoRig2026'
 # RTU 下挂设备的基名（无后缀形态）
 RTU_DEVICE_BASES = ('PowerMeter-DDSU666', 'Sensor-HZ8706', 'Relay-8CH')
 
@@ -349,9 +349,14 @@ RTU_ATTACHED = [
         'profile': '单相电能表', 'meterLevel': 0,
         'type1': 'elec', 'type2': 'normal', 'l1': 'elec_meter',
         'model': 'DDSU666', 'brand': '正泰', 'wiring': '1P2W',
+        # ★ deviceField 必须与固件实际发出的 key 逐字一致（2026-11-04 实测）。
+        #   固件发的是 U/I/P/Q/S/PF/Freq/Ep，规则链按这张表翻译成标准字段；
+        #   少一项，那一项就以原名落库，看板取标准字段时看不到。
         'points': [mp('U', 'voltage_a', 'A相电压', 'V'),
                    mp('I', 'current_a', 'A相电流', 'A'),
                    mp('P', 'power_total', '总有功功率', 'kW'),
+                   mp('Q', 'reactive_power_total', '总无功功率', 'kVar'),
+                   mp('S', 'apparent_power_total', '总视在功率', 'kVA'),
                    mp('PF', 'power_factor_total', '总功率因数', ''),
                    mp('Freq', 'frequency', '频率F', 'Hz'),
                    mp('Ep', 'energy_reading', '累积读数', 'kW·h')],
@@ -361,8 +366,11 @@ RTU_ATTACHED = [
         'profile': '温湿度变送器', 'meterLevel': 0,
         'type1': 'env', 'type2': 'normal', 'l1': 'th_sensor',
         'model': 'HZ8706', 'brand': '华控', 'wiring': '',
-        'points': [mp('T', 'temperature', '温度', '℃'),
-                   mp('H', 'humidity', '湿度', '%')],
+        # ★ 固件发的是 temp / humi（不是 T / H）—— 2026-11-04 从串口日志实测。
+        #   写错时规则链找不到映射，库里就存 temp/humi 原样，
+        #   而看板/测点表按 temperature/humidity 取，表现为「设备在线、温度空着」。
+        'points': [mp('temp', 'temperature', '温度', '℃'),
+                   mp('humi', 'humidity', '湿度', '%RH')],
     },
     {
         # 8 路继电器没有专用档案，落 default（与 21-rtu-onboard.py 一致）
@@ -375,6 +383,9 @@ RTU_ATTACHED = [
         #   'ctrl' 不在品种白名单里 → 被正确跳过。
         'type1': 'ctrl', 'type2': 'normal', 'l1': 'relay',
         'model': '8CH', 'brand': '通用', 'wiring': '',
+        # ★ 空是有意的：继电器是执行器，relay1..8 是通道状态、不是计量测点。
+        #   给它们配 standardField 会让规则链把状态值当遥测翻译，
+        #   看板的计量池会把它算成一台表（永远 0 电量）。
         'points': [],
     },
 ]
