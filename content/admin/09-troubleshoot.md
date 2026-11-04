@@ -129,6 +129,55 @@ cd ~/energy-app && docker compose --profile split restart energy-server
 `node esbuild/gen-material-jit-directives.mjs` 生成清单；
 清单从 Material 各模块的 `ɵɵngDeclareNgModule(exports)` 自动抽取，不要手写。
 
+#### 还有第四层：`tb-datetime` 这类 TB 自有组件会渲染成空白框（2026-11-04 实测）
+
+**症状**：日期区域只有分隔符 `~`，两个输入框位置是空的。
+点不到、也没有报错 —— 开关报错、控制台干净、日志干净。
+
+**判据（F12）**
+
+```js
+const d = document.querySelectorAll('tb-datetime');
+d.length                                    // 元素在，比如 2
+[...d].filter(x => !x.children.length).length  // 期望 0；是 2 就是全空
+d[0].getBoundingClientRect().height         // 0 —— 元素在但没有高度
+```
+
+**根因**：`<tb-datetime>` 是 `standalone: false` 的组件，只能经 `SharedModule`
+引入；而 `SharedModule` 的 exports 在 AOT 产物里是空的（与上一条同一个
+`linkerJitMode`）。于是它被当作**未知元素**原样保留 —— 元素在、内容空、不报错。
+
+**修法**：改用 standalone 等价物。日期选择器用
+
+```html
+<mat-form-field appearance="outline">
+  <input matInput [matDatepicker]="dp" [value]="dateFrom" (dateChange)="onPick($event.value, 'from')">
+  <mat-datepicker-toggle matIconSuffix [for]="dp"></mat-datepicker-toggle>
+  <mat-datepicker #dp></mat-datepicker>
+</mat-form-field>
+```
+
+`MatDatepicker*` 系列已全部在 `material-jit-directives.ts` 清单里，直接可用。
+
+> ⚠️ **绝对不要**为了救它去手工补 `SharedModule.ɵmod` 的
+> `declarations` / `exports`。实测后果：全站报
+> `InvalidCharacterError ... DOMTokenList` +
+> `Failed to load default widget types!`，
+> **所有部件的默认类型都加载失败**，比原问题严重一个数量级。
+> 详见 `AGENTS.md` 的 A2d3。
+
+**自检已经覆盖这一层**：
+
+```bash
+cd ui-ngx && node esbuild/check-widget-deps.mjs
+# 有 tb-datetime 的部件会被列出来，退出码 1
+# 应急构建（修完前）：加 --report-only
+```
+
+**当前遗留**（2026-11-04）：`tb-datetime` 出现在 8 个自研部件
+（分析条件、资产统计、预测上下文…）、`tb-details-panel` 在 3 个。
+日期框在修完之前是空白的，可用时间轴/顶部时间选择器替代操作。
+
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
 **症状**：看板框架、筛选条、KPI 卡片都在，但数字全 0，
