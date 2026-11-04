@@ -309,6 +309,46 @@ done; wait
 3. **热路径加 single-flight**：一屏多部件同时请求，缓存冷时要只算一次。
 4. **要「每个实体的最新值」就用 `ts_kv_latest`**，只有查历史区间才碰 `ts_kv`。
 
+**前端也有 N+1：一个页面发出几百个请求**（2026-11-05 实测）
+
+如果后端接口都很快（curl 测几十毫秒），但**页面还是要等十几秒**，
+那就是前端在逐条查数据。
+
+**判据**：F12 → Network，按 Name 看重复次数。
+
+```js
+// 控制台里统计（需要先刷新页面一次）
+performance.getEntriesByType('resource')
+  .filter(r => r.name.includes('/api/'))
+  .reduce((m, r) => { const k = r.name.split('?')[0]; m[k] = (m[k]||0)+1; return m; }, {});
+```
+
+2026-11-05 的实测：分项能耗页一次刷新 **293 个 API**，
+其中 **210 个 `GET /api/asset/{id}`** —— 4 个部件各自在构图时逐节点取名字。
+而整站走 **HTTP/1.1，浏览器每个域名只有 6 个并发连接**，
+210 个请求排队，页面 14 秒才完成（实际只有 122 个资产）。
+
+**决定性证据**：14 个 `deviceProfileInfo` 请求的 TTFB
+
+```
+#1-6   TTFB 125~343ms   ← 真的在跑
+#7-14  TTFB 397~856ms   ← 纯排队（同样的单查只要 15ms）
+```
+
+**已修复的批量接口**（部件里直接用）：
+
+- `GET /api/energy/entity-briefs?ids=a,b,c`
+  → 一次拿 name / label / 实体类型（替代逐 id 查 `/api/asset/{id}`）
+- `GET /api/energy/device-profile-names?ids=a,b,c`
+  → 一次拿设备档案名（替代逐 id 查 `/api/deviceProfileInfo/{id}`）
+
+**修复后**：分项能耗 API 293 → 134，`/api/asset/` 210 → 8；
+历史能耗的 `deviceProfileInfo` 14 → 0。
+
+> ⚠️ 为什么不用 TB 自带的 `/api/deviceProfileInfos?deviceProfileIds=...`：
+> 它带 `@PreAuthorize("hasAuthority('TENANT_ADMIN')")`，**客户用户直接 403**。
+> 这也是当初为什么要逐个查 —— 现在改走自研接口。
+
 **排查工具**：容器镜像只有 JRE（没有 `jstack` / `jcmd`），
 `/actuator/loggers` 被前端路由拦成 HTML 页面（不是真端点）。
 量 SQL 用 `docker exec energy-postgres psql -c "\timing on" -c "<SQL>"`，
