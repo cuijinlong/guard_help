@@ -147,17 +147,46 @@ d[0].getBoundingClientRect().height         // 0 —— 元素在但没有高度
 引入；而 `SharedModule` 的 exports 在 AOT 产物里是空的（与上一条同一个
 `linkerJitMode`）。于是它被当作**未知元素**原样保留 —— 元素在、内容空、不报错。
 
-**修法**：改用 standalone 等价物。日期选择器用
+**修法（2026-11-04 已落地）**：改用自研 standalone 组件，直接用，别再自己写一套。
+
+| 不要用 | 改用 |
+| --- | --- |
+| `<tb-datetime>` | `<energy-date-picker>` |
+| `<tb-details-panel>` | `<energy-details-panel>` |
+
+`energy-date-picker` 与 `tb-datetime` 接口**逐字段一致**（毫秒时间戳、
+`type` = date/month/year、`minDate`/`maxDate`、`showLabel`、`fieldClass`）。
+所以换标签时 controllerScript **一行不用改**，只改两处绑定名：
 
 ```html
-<mat-form-field appearance="outline">
-  <input matInput [matDatepicker]="dp" [value]="dateFrom" (dateChange)="onPick($event.value, 'from')">
-  <mat-datepicker-toggle matIconSuffix [for]="dp"></mat-datepicker-toggle>
-  <mat-datepicker #dp></mat-datepicker>
-</mat-form-field>
+<!-- 改前 -->
+<tb-datetime class="eqp-pick" type="date" [minDate]="minTs" [maxDate]="maxTs"
+             [ngModel]="tsOf(fromDate)" (ngModelChange)="onPick($event,'from')">
+</tb-datetime>
+
+<!-- 改后：只换标签 + [ngModel] -> [value]、(ngModelChange) -> (valueChange) -->
+<energy-date-picker class="eqp-pick" type="date" [minDate]="minTs" [maxDate]="maxTs"
+                    [value]="tsOf(fromDate)" (valueChange)="onPick($event,'from')">
+</energy-date-picker>
 ```
 
-`MatDatepicker*` 系列已全部在 `material-jit-directives.ts` 清单里，直接可用。
+> ⚠️ **为什么不能用 `[ngModel]`**：`NgModel` 属于 `FormsModule`，
+> 也是 `standalone: false` 且展不开（实测 `@angular/forms` 的 fesm：
+> `ɵɵngDeclareNgModule` ×3、`setNgModuleScope` ×0）。
+> 绑 `[ngModel]` 会报 `Can't bind to 'ngModel'`，比原来的空白更糟。
+
+**为什么自研组件能工作**：它是我们自己源码里的 `standalone: true` 组件，
+由 ngc 做 **AOT 编译** —— 编译器在编译期读 `@mat-datetimepicker/core` 的
+`.d.ts` 拿到 exports，静态写进组件的依赖列表，不依赖运行时
+`ɵɵsetNgModuleScope`。JIT 只需要 `imports: [EnergyDatePickerComponent]`。
+
+> 反例：把 `MatDatetimepickerModule` **直接**放进 JIT 的 `imports` 仍然无效，
+> 因为那是模块。一定要通过自研 standalone 组件中转一层。
+
+**新增自研组件必须两道登记**（漏一道 = 静默空白，不报错）：
+
+1. `standalone: true`
+2. 加进 `dynamic-component-factory.service.ts` 的 `componentImports`
 
 > ⚠️ **绝对不要**为了救它去手工补 `SharedModule.ɵmod` 的
 > `declarations` / `exports`。实测后果：全站报
@@ -166,17 +195,76 @@ d[0].getBoundingClientRect().height         // 0 —— 元素在但没有高度
 > **所有部件的默认类型都加载失败**，比原问题严重一个数量级。
 > 详见 `AGENTS.md` 的 A2d3。
 
-**自检已经覆盖这一层**：
+**自检已经覆盖这一层（现为五层）**：
 
 ```bash
 cd ui-ngx && node esbuild/check-widget-deps.mjs
-# 有 tb-datetime 的部件会被列出来，退出码 1
-# 应急构建（修完前）：加 --report-only
+# 管道 / 结构指令 / Material / 非 standalone 的 tb-* / 自研组件是否注册
+# 有问题退出码 1；应急构建（修完前）：加 --report-only
 ```
 
-**当前遗留**（2026-11-04）：`tb-datetime` 出现在 8 个自研部件
-（分析条件、资产统计、预测上下文…）、`tb-details-panel` 在 3 个。
-日期框在修完之前是空白的，可用时间轴/顶部时间选择器替代操作。
+第五层（2026-11-04 加）抓的是「写了 `<energy-xxx>` 但没登记进 JIT」——
+它跟 `tb-datetime` 是同一个坑：元素在、什么都不显示、不报错。
+靠扫源码判断，不靠手维护名单。
+
+**验收（必须浏览器实测，不能只看退出码）**
+
+```js
+document.querySelectorAll('tb-datetime').length                          // 0
+document.querySelectorAll('energy-date-picker').length                   // > 0
+document.querySelectorAll('energy-date-picker .mat-mdc-form-field').length  // 等于上一行
+document.querySelectorAll('energy-details-panel').length                 // > 0（整页部件）
+```
+
+> **分量判据（最重要）**：`<energy-date-picker>` 外面有没有 `_nghost-ng-xxx` 属性。
+> `_nghost` 存在 = 组件被 JIT 识别；**不存在 = 被当成未知元素**（作用域被 poison
+> 或组件没登记），子元素 0 个、高度 0、控制台干净。
+>
+> ```js
+> [...document.querySelectorAll('energy-date-picker')]
+>   .filter(e => ![...e.attributes].some(a => a.name.startsWith('_nghost')))
+>   .length   // 期望 0
+> ```
+
+### 日期框/抽屉又空白了？先查「装配清单里有没有非 standalone 的类」（2026-11-04 实测）
+
+**症状**：换了 `energy-date-picker` 之后日期框仍然空白，元素在、高度 0、不报错。
+如果 `_nghost` 属性也没有，就是这个原因。
+
+**根因**：`@angular/core` 的 `computeStandaloneComponentScope` 逐项校验 `imports`：
+
+```js
+try { verifyStandaloneImport(imported, type); }
+catch (e) { ans.compilation.isPoisoned = true; return ans; }   // 立即返回
+```
+
+**一个非法项 → 整个作用域作废 → 排在它后面的所有指令与组件全丢，且不报错。**
+
+实测事故：`material-jit-directives.ts` 里混进了 `@mat-datetimepicker/core` 的
+12 个符号（其 10 个组件是 `isStandalone: false`），它们排在清单末尾，
+于是排在**其后**的 `energy-date-picker` / `energy-details-panel` 被整段吞掉。
+
+**检查与修复**：
+
+```bash
+cd ui-ngx
+node esbuild/check-widget-deps.mjs        # 第六层会报「装配清单含非 standalone」
+node esbuild/gen-material-jit-directives.mjs   # 自动剔除并报出剔除清单
+```
+
+**为什么不用 `@mat-datetimepicker/core`**：它没有 standalone 版本。
+日期控件统一用 `energy-date-picker`（基于 `@angular/material` 原生 `MatDatepicker`，
+Material 20 的组件全是 standalone）。
+
+**两道保险**（代码里已经做好，改的时候别破坏）：
+
+1. 生成脚本自动剔除 `isStandalone: false` 的类，并在剔除时报错；
+2. 自研组件在 `componentImports` 里排在 `MATERIAL_JIT_IMPORTS` **之前** ——
+   将来清单再被污染，排在前面也不会被丢。
+
+**状态**（2026-11-04）：26 处 `tb-datetime`、5 处 `tb-details-panel`
+已全部替换完，自检退出码 0。8 个客户看板 + 9 个租户看板已浏览器实测：
+日期框 `host`/`.mat-mdc-form-field` 全部成对，无 `tb-datetime` 残留，控制台无异常。
 
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
@@ -626,7 +714,7 @@ tb-station-select 写 StationContextService
 | `mat-tab` 页签不显示 | `mat-tab` 上用了 `*ngIf` | 用 `[hidden]` 或改结构 |
 | `[(ngModel)]="obj?.a"` 整块不渲染 | Angular JIT 直接失败 | 换成 `[ngModel]` + `(ngModelChange)` |
 | dev 模式报 NG0100 | `mat-select` 用了 `placeholder` | 改 `mat-label` |
-| 部件自绘控件与其他看板两套样式 | 没复用 TB 组件 | 用 `tb-datetime` / `mat-select` 等原生组件 |
+| 部件自绘控件与其他看板两套样式 | 没复用同类控件 | 日期用 `energy-date-picker`，下拉用 `mat-select`（**不要**用 `tb-datetime`，见上文第四层） |
 | N 个 worker 轮询队列只处理前 N 条 | 并发写法错误 | 用显式分批 |
 
 ### 反引号这个坑踩过三次
