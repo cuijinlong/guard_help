@@ -176,6 +176,10 @@ class Sim:
             return self._ahu(f)
         if self.kind == 'breaker':
             return self._breaker(f, hours)
+        if self.kind == 'th':
+            return self._th(f)
+        if self.kind == 'relay':
+            return self._relay(f)
         return {}
 
     # ---- 三相电表：含电能质量全场景 ----
@@ -365,6 +369,30 @@ class Sim:
             'frequency': round(35 + f * 10 + random.uniform(-2, 2), 1),
         }
 
+    # ---- 温湿度传感器 HZ8706（RTU 下挂）----
+    #
+    # 只上报温度与湿度：这台是**非计量设备**，写 energy 会被计量池误判成表计。
+    def _th(self, f):
+        return {
+            'temperature': round(24 + f * 4 + random.uniform(-1.2, 1.2), 1),
+            'humidity': round(52 + f * 8 + random.uniform(-3, 3), 1),
+        }
+
+    # ---- 8 路继电器（RTU 下挂，RPC 控制）----
+    #
+    # ★ 绝不能上报 energy：继电器是执行器不是表计。
+    #   通道状态走 relay_ch1…ch8（0/1），与 default 档案的测点一致。
+    def _relay(self, f):
+        payload = {}
+        for ch in range(1, 9):
+            # 前 4 路跟随负载（白天开、夜间关），后 4 路常开
+            if ch <= 4:
+                payload['relay_ch%d' % ch] = 1 if f > 0.45 else 0
+            else:
+                payload['relay_ch%d' % ch] = 1
+        payload['relay_count'] = 8
+        return payload
+
     # ---- 智能空开（可控，带计量）----
     #
     # ★ 开关次数绝不能写进 energy（2026-11-02 实测）：
@@ -390,6 +418,20 @@ class Sim:
 
 # ---------------------------------------------------------------- 设备分类
 def classify(name, profile):
+    # ★ RTU 下挂三件（2026-11-04 加）。
+    #
+    #   为什么它们要能被模拟：30-rtu-env-init.py 现在给**每个**客户都建
+    #   「网关 + 正泰电表 + 温湿度 + 8路继电器」。主演示客户有真实板子出数，
+    #   其它客户没有 —— 不模拟的话这三台永远空着，客户看到「设备在、没数据」。
+    #
+    #   为什么不会污染主客户：主客户的真名（无后缀）在 REAL_DEVICES 里，
+    #   在上游就被过滤掉了；这里接到的都是带 `·客户名` 后缀的模拟形态。
+    if name.startswith('PowerMeter-DDSU666'):
+        return 'elec1'
+    if name.startswith('Sensor-HZ8706'):
+        return 'th'
+    if name.startswith('Relay-8CH'):
+        return 'relay'
     if name.startswith('PowerMeter-3P'):
         return 'elec3'
     if name.startswith('PowerMeter-1P'):
@@ -608,7 +650,9 @@ def main():
                 if args.dry_run or args.once or args.interval == 0:
                     keys = [k for k in payload if k in
                             ('energy_reading', 'power_total', 'voltage_a', 'voltage_unbalance',
-                             'flicker_pst', 'heat_power', 'power')]
+                             'flicker_pst', 'heat_power', 'power',
+                             # RTU 下挂三件（2026-11-04 加）：不列出来这俩会打成 {}
+                             'temperature', 'humidity', 'relay_count')]
                     print('  %-20s %s' % (s.name, {k: payload[k] for k in keys}))
             except Exception as e:
                 fail += 1

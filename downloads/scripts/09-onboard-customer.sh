@@ -19,6 +19,7 @@
 #   1. 建客户
 #   2. 建客户管理员账号并激活（密码就是 --password）
 #   3. 确保演示数据（2 个场站 / 12 个分项 / 21 台设备 / 逐小时遥测）
+#      并补齐 RTU 现场形态（网关 + 正泰电表 + 温湿度 + 8路继电器 + 8 台 SIM）
 #   4. 确保客户菜单（13 项，第一项是落地页）+ 复制 20 个看板
 #   5. 逐项验证，任何一样缺失就报错
 #   6. 打印登录信息 + 数据落表清单 + 查询 SQL
@@ -134,6 +135,33 @@ else
   api POST /api/energy/demo-data "{\"customerId\":\"$CID\",\"customerName\":\"$NAME\"}" \
     > /tmp/onboard-demo.json 2>&1 || warn "演示数据接口调用失败，看 /tmp/onboard-demo.json"
 
+  # ---- 2b. RTU 现场形态（网关 + 正泰电表 + 温湿度 + 8路继电器）----
+  #
+  # ★ 2026-11-04 加。demo-data 只建「单相园 / 三相园」那套分项/区域演示，
+  #   **不含网关与下挂设备**。少了这一支，客户登录看不到现场接入形态
+  #   （客户原话：「之前是带真实 RTU 网关设备、下面挂着正泰单相电表、
+  #   温湿度传感器、8路继电器的，现在都没有了」）。
+  #
+  #   30-rtu-env-init.py 负责：
+  #     · 建本客户的网关（主演示客户用 ED1-Gateway 真名，其余 ED2-Gateway·客户名）
+  #     · 建 RTU 下挂三件套（PowerMeter-DDSU666 / Sensor-HZ8706 / Relay-8CH，
+  #       非主客户带 `·客户名` 后缀）
+  #     · 建 8 台 SIM 设备并全部挂到网关下
+  #     · 补设备 → 场站/区域/分项的归属关系
+  #   它自身幂等，重复跑只修不建。
+  log "步骤 2b/3　RTU 网关与下挂设备（正泰电表 / 温湿度 / 8路继电器）"
+  if [[ -f "$HERE/30-rtu-env-init.py" ]]; then
+    python3 "$HERE/30-rtu-env-init.py" \
+      --base "$BASE" --customer "$NAME" \
+      --tenant "$TENANT_EMAIL" --tenant-pass "$TENANT_PASS" \
+      > /tmp/onboard-rtu.log 2>&1 \
+      || warn "RTU 设备初始化有失败项，看 /tmp/onboard-rtu.log"
+    # 只回显关键几行，完整输出留在日志里
+    sed -n '/⑥ 网关/,/⑧ 模拟设备/p' /tmp/onboard-rtu.log | sed 's/^/    /' | head -12
+  else
+    warn "找不到 $HERE/30-rtu-env-init.py，跳过 RTU 设备初始化"
+  fi
+
   # 资产汇总遥测（energy_total / water_total / …）。
   #
   # 看板在「选场站 / 选分项」时读的是**资产**上的汇总遥测，
@@ -188,6 +216,9 @@ chk() {  # 名称 实际 下限 缺失提示
 chk "场站"            "$SITE_N"  2  "演示数据没生成"
 chk "分项（分类）"     "$ITEM_N"  6  "维度树不完整"
 chk "设备"            "$DEV_N"  10  "演示设备缺失"
+# 网关是 RTU 现场形态的入口：没有它，SIM/RTU 设备都是孤儿（看板按网关树取数时为空）
+GW_N=$(echo "$DEVICES" | python3 -c "import json,sys;print(sum(1 for d in json.load(sys.stdin).get('data',[]) if d.get('type')=='网关'))" 2>/dev/null || echo 0)
+chk "网关（RTU）"      "$GW_N"    1  "RTU 现场形态缺失，跑 scripts/30-rtu-env-init.py"
 chk "拓扑图"          "$TOPO_N"  2  "每个场站应有一张"
 chk "客户看板"        "$DASH_N" 10  "看板没复制给客户"
 chk "客户菜单项"      "$MENU_N" 10  "侧边栏会是空的"

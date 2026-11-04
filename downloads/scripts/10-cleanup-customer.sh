@@ -325,6 +325,14 @@ import json,sys
 rows=(json.load(sys.stdin) or {}).get('data',[])
 print(' '.join(d['id']['id'] for d in rows))" 2>/dev/null || true)
 
+# 资产 id（2026-11-04 补）：资产上也有遥测（energy_total / power_total / energy_day
+# 等汇总），销户时一并删除。ts_outside() 必须把它们也排除，
+# 否则会把自己删掉的资产遥测算成「别人的」，误报「遥测减少了 N 点」。
+ASSET_IDS=$(echo "$ASSETS" | python3 -c "
+import json,sys
+rows=(json.load(sys.stdin) or {}).get('data',[])
+print(' '.join(a['id']['id'] for a in rows))" 2>/dev/null || true)
+
 TS_N=0
 TS_WITH=0
 if [[ -n "$DEV_IDS" && "$KEEP_TELEMETRY" != "true" ]]; then
@@ -397,13 +405,28 @@ ts_outside() {
     echo "skip"
     return
   fi
+  # ★ 必须把**设备与资产**都排除（2026-11-04 修）。
+  #
+  #   原来只排除了设备 id，而资产上也有遥测（资产汇总 energy_total /
+  #   power_total / energy_day）。销户会把目标客户的资产连遥测一起删掉，
+  #   那些点原本被算进「目标以外」→ 删后再数就少了 →
+  #   误报「目标以外的遥测减少了 N 点，需人工介入」。
+  #   实测：销一个 33 台设备的新客户，误报减少了 53097 点，
+  #   而其他客户数据完全正常（43 台设备 / 610623 点一个不少）。
+  local parts=()
   if [[ -n "${DEV_IDS:-}" ]]; then
-    local ids
-    ids=$(echo "$DEV_IDS" | tr ' ' ',' | sed "s/[^,]*/'&'/g")
-    psql_q "SELECT count(*) FROM ts_kv WHERE entity_id NOT IN ($ids);"
-  else
-    psql_q "SELECT count(*) FROM ts_kv;"
+    parts+=("entity_id NOT IN ($(echo "$DEV_IDS" | tr ' ' ',' | sed "s/[^,]*/'&'/g"))")
   fi
+  if [[ -n "${ASSET_IDS:-}" ]]; then
+    parts+=("entity_id NOT IN ($(echo "$ASSET_IDS" | tr ' ' ',' | sed "s/[^,]*/'&'/g"))")
+  fi
+  if [[ ${#parts[@]} -eq 0 ]]; then
+    psql_q "SELECT count(*) FROM ts_kv;"
+    return
+  fi
+  local where
+  where=$(printf ' AND %s' "${parts[@]}")
+  psql_q "SELECT count(*) FROM ts_kv WHERE 1=1$where;"
 }
 
 FP_BEFORE=$(outside_fingerprint)

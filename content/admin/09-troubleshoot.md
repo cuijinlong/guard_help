@@ -172,6 +172,96 @@ energy_overview  power_quality  sankey_flow  saving_records  audit_report
 **验收**：页面副标题应显示 `范围：数据源（31 台） · 当前 17 台计量点`，
 KPI 有非零数字。改完用 `31-deploy-widget.sh <名>` 推库，**不用重启后端**。
 
+### 客户名下没有网关 / 正泰电表 / 温湿度 / 8路继电器（2026-11-04 实测）
+
+**症状**：客户登录后只有「单相园-*」「三相园-*」那批分项设备，
+设备管理里搜不到 `ED2-Gateway`、`PowerMeter-DDSU666`、`Sensor-HZ8706`、`Relay-8CH`。
+
+**先看库里到底有没有**（把 `<CID>` 换成客户 id）：
+
+```bash
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+select name, type from device where customer_id='<CID>'
+  and (type='网关' or name ~ 'DDSU666|HZ8706|Relay-8CH') order by name;"
+```
+
+一条都没有 → 跑一次初始化（幂等，只修不建）：
+
+```bash
+cd ~/energy-app
+python3 scripts/30-rtu-env-init.py --base http://127.0.0.1:8090 \
+  --customer '<客户名>' --tenant tenant@126.com --tenant-pass '<密码>'
+```
+
+出来「⚠ 真实网关 ED2-Gateway·客户名 不存在」这条警告 → 你用的是旧脚本，
+按本页末尾「三个已修的 bug」对一下版本。
+
+**三个已修的 bug，症状各不相同但都表现为「设备不见了」**：
+
+| bug | 症状 | 修 |
+| --- | --- | --- |
+| 非主客户「只查网关不建网关」 | 客户下 0 台网关；8 台 SIM 全部孤儿（0 条 DEVICE→DEVICE 关系） | 统一走 `ensure_gateway()` |
+| `--prune` 删掉 `demo:true` 设备 | 跑一次初始化，31 台演示设备全没，只剩 8 台 SIM | `is_demo_device()` 按 `additionalInfo.demo` 豁免 |
+| `21-rtu-onboard.py` 写 `DDSU777` | 真实 RTU 上报后平台**自动新建**一台 `PowerMeter-DDSU666`（无档案、无归属），数据分裂两台 | 三处统一 `PowerMeter-DDSU666`：`rtu/main.py` / `21-rtu-onboard.py` / `30-rtu-env-init.py` |
+
+**验收判据**：
+
+```bash
+# 网关下应挂 11 台（8 SIM + DDSU666 + HZ8706 + Relay-8CH）
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+select g.name||'  └─ '||d.name from device g
+ join relation r on r.from_id=g.id and r.relation_type='Contains' and r.from_type='DEVICE'
+ join device d on d.id=r.to_id
+ where g.customer_id='<CID>' and g.type='网关' order by d.name;"
+
+# 没被网关挂载的设备应只剩「31 台 demo + 网关自己」
+```
+
+看板副标题应显示 `范围：数据源（43 台） · 当前 25 台计量点`。
+`当前 N 台计量点`里**不含**温湿度与继电器 —— 它们不是计量器具，
+`energyTypeCode` 分别是 `env` 与 `ctrl`，被计量池正确跳过。
+
+**模拟上报要覆盖 RTU 下挂三件**：`31-rtu-simulate.py` 现在会一并上报
+`PowerMeter-DDSU666·客户名`（电量）、`Sensor-HZ8706·客户名`（温湿度）、
+`Relay-8CH·客户名`（8 路通道状态）。跑一轮应该有 `成功 11 / 失败 0`。
+数量只有 8 台说明脚本是旧版。
+
+**主演示客户「平台演示中心」例外**：它那四台是**真实板子**上报，
+`31-rtu-simulate.py` 会按 `REAL_DEVICES` 白名单跳过，不会造假数据覆盖。
+
+### 销户时误报「目标以外的遥测减少了 N 点」（2026-11-04 修）
+
+**症状**：`10-cleanup-customer.sh` 删完客户，其他数据明明都在，
+却报 `目标以外的遥测减少了 53097 点！需要人工介入`。
+
+**先别慌，先核实其他客户还在不在**：
+
+```bash
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+select c.title, count(distinct d.id) as 设备,
+       count(k.entity_id) as 遥测点
+  from customer c
+  left join device d on d.customer_id=c.id
+  left join ts_kv k on k.entity_id=d.id
+ group by c.title;"
+```
+
+数字没少 → 是**校验脚本的误报**，不是真删了。
+
+**根因**：`ts_outside()` 只排除了目标**设备** id，没排除目标**资产** id。
+资产上也有遥测（`energy_total` / `power_total` / `energy_day` 等汇总），
+销户时一并删除，于是被算成「别人的点在减少」。
+实测销一个 33 台设备的新客户，误报减少 53097 点。
+
+**修**：`ts_outside()` 同时排除设备与资产 id（已改，见
+`downloads/scripts/10-cleanup-customer.sh` 的 `ASSET_IDS`）。
+修好后同一场景输出：
+
+```
+✓ 遥测：目标以外 737761 → 737768 点（本次删了 21 点，未波及他人）
+✓ 隔离校验通过：其他客户 224 个实体与租户级数据均未受影响
+```
+
 ### 改完部件 JSON 前端没变化
 
 | 层次 | 判据 | 修 |

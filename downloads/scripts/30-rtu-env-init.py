@@ -294,13 +294,101 @@ SIM_DEVICES = [
 # 真实 RTU 设备（名字写死在板子上，全局唯一）
 REAL_DEVICES = {'PowerMeter-DDSU666', 'Sensor-HZ8706', 'Relay-8CH'}
 
+# ============================================================================
+# RTU 下挂设备的三件套（2026-11-04 新增）
+#
+# <h3>为什么要有这份定义</h3>
+# 原实现只对「主演示客户」处理真实 RTU 设备，而且**只查找不创建** ——
+# 其它客户跑完初始化后，网关下什么都没有，客户登录只看到一堆 SIM 设备，
+# 找不到「RTU 网关 + 正泰电表 + 温湿度 + 8路继电器」那套现场形态。
+# 客户原话：「之前初始化数据是带真实 RTU 网关设备、下面挂着正泰单相电表、
+# 温湿度传感器、8路继电器的，现在都没有了」。
+#
+# <h3>命名规则</h3>
+#   · 主演示客户「平台演示中心」用**无后缀**的真实名 —— 板子 main.py 里写死，
+#     改不了；真实 RTU 上报时 TB 按 name 匹配，名字必须逐字一致。
+#   · 其它客户用 `名·客户名` —— 与 demo-data / SIM 设备同一套后缀规则。
+#     同一租户下设备唯一键是 (tenant_id, name)，不带后缀会撞主客户那台，
+#     而且 TB 不允许改 owner，最后两个客户互相污染（2026-11-02 实测）。
+#
+# <h3>为什么 meterLevel = 0</h3>
+# 演示数据（单相园 / 三相园）的账单与「层级守恒」断言按 meterLevel 分层算。
+# 给 1/2 级会让它进入场站汇总，演示数字莫名其妙地变。
+# level=0 的语义是「不计入汇总」，但它仍是 isMeter=true 的表计：
+# 设备管理能看、实时数据能看、一键抄表能抄、台账能出账。
+RTU_ATTACHED = [
+    {
+        'base': 'PowerMeter-DDSU666', 'label': '正泰单相电表 DDSU666',
+        'profile': '单相电能表', 'meterLevel': 0,
+        'type1': 'elec', 'type2': 'normal', 'l1': 'elec_meter',
+        'model': 'DDSU666', 'brand': '正泰', 'wiring': '1P2W',
+        'points': [mp('U', 'voltage_a', 'A相电压', 'V'),
+                   mp('I', 'current_a', 'A相电流', 'A'),
+                   mp('P', 'power_total', '总有功功率', 'kW'),
+                   mp('PF', 'power_factor_total', '总功率因数', ''),
+                   mp('Freq', 'frequency', '频率F', 'Hz'),
+                   mp('Ep', 'energy_reading', '累积读数', 'kW·h')],
+    },
+    {
+        'base': 'Sensor-HZ8706', 'label': '温湿度传感器',
+        'profile': '温湿度变送器', 'meterLevel': 0,
+        'type1': 'env', 'type2': 'normal', 'l1': 'th_sensor',
+        'model': 'HZ8706', 'brand': '华控', 'wiring': '',
+        'points': [mp('T', 'temperature', '温度', '℃'),
+                   mp('H', 'humidity', '湿度', '%')],
+    },
+    {
+        # 8 路继电器没有专用档案，落 default（与 21-rtu-onboard.py 一致）
+        'base': 'Relay-8CH', 'label': '8路继电器',
+        'profile': 'default', 'meterLevel': 0,
+        # ★ type1 不能写 'elec'（2026-11-04）：看板部件的 energyOf() 先看
+        #   additionalInfo.energyTypeCode，命中 TYPE1_OF 就当成计量表。
+        #   继电器是执行器，混进计量池会让「当前 N 台计量点」多算一台、
+        #   而它永远没有电量，客户会怀疑数据不准。
+        #   'ctrl' 不在品种白名单里 → 被正确跳过。
+        'type1': 'ctrl', 'type2': 'normal', 'l1': 'relay',
+        'model': '8CH', 'brand': '通用', 'wiring': '',
+        'points': [],
+    },
+]
+
+
+def rtu_attached_name(base, customer):
+    """RTU 下挂设备名：主演示客户用真名（板子写死），其余带客户后缀。"""
+    if customer == DEFAULT_CUSTOMER:
+        return base
+    return sim_name(base, customer)
+
 
 def keep_devices(customer):
     """本客户下不允许被 prune 删掉的设备名。"""
     names = {'ED1-Gateway'} | REAL_DEVICES
     names |= set(gateway_names(customer))
     names |= {sim_name(d['name'], customer) for d in SIM_DEVICES}
+    # RTU 下挂三件套（带后缀形态）
+    names |= {rtu_attached_name(d['base'], customer) for d in RTU_ATTACHED}
     return names
+
+
+def is_demo_device(dev):
+    """demo-data（/api/energy/demo-data）建的演示设备。
+
+    <p>★ 这些设备必须免于 prune（2026-11-04 客户报的 bug）：
+    开户脚本 09-onboard-customer.sh 会调 demo-data 建 31 台覆盖
+    「单相园 / 三相园 / A栋锅炉」的演示设备，它们与 RTU 那套是**互补**的
+    两部分 —— 一个演示现场总线，一个演示分项/区域/多品种。
+    原 prune 白名单只认 SIM 与真实 RTU 名，于是跑一次初始化就把这 31 台
+    全删了，客户看到「模拟的三相电和各类设备类型的设备都没了」。
+
+    <p>判据用 additionalInfo.demo，与后端 EnergyBootstrapInstaller 写的一致。
+    """
+    ai = dev.get('additionalInfo') or {}
+    if isinstance(ai, str):
+        try:
+            ai = json.loads(ai)
+        except Exception:
+            ai = {}
+    return ai.get('demo') is True
 
 
 # ============ RPC 能力（写进设备属性，供界面/脚本查）============
@@ -780,6 +868,9 @@ def prune(api, log, dry, customer_id, customer_name):
             continue          # 别的客户，一概不碰
         if d.get('name') in keep:
             continue
+        if is_demo_device(d):
+            # demo-data 建的演示设备（单相园/三相园/锅炉…）保留 —— 见 is_demo_device
+            continue
         victims.append(d)
     if not victims:
         log('  无需清理：只剩白名单设备')
@@ -1112,17 +1203,17 @@ def main():
     # ★ ED1-Gateway 是**真实板子**，全局只有一套，只属于主演示客户。
     #   非主客户跑脚本时必须跳过它 —— 否则会把它的场站改成这个客户的场站，
     #   主演示客户的真实设备就从这个场站里消失了（实测 2026-11-02）。
-    if customer_name == DEFAULT_CUSTOMER:
-        gw_single = ensure_gateway(api, gw_single_name, site_single, customer_id, log)
-    else:
-        gw_single = next((d for d in api.paged('/api/tenant/devices')
-                          if d.get('name') == gw_single_name), None)
-        if gw_single is None:
-            if api.dry:
-                gw_single = {'id': {'id': 'dry-gw-1'}}
-            else:
-                log('  ⚠ 真实网关 %s 不存在（主演示客户尚未初始化）' % gw_single_name)
-                gw_single = {'id': {'id': 'no-gw'}}
+    # ★ 每个客户都要有自己的网关（2026-11-04 修）。
+    #
+    #   原实现在「非主演示客户」分支里**只查找不创建**，查不到就把 id 塞成
+    #   字符串 'no-gw' 继续往下跑。后果：
+    #     ① 客户名下永远没有网关设备，客户看到「网关没了」；
+    #     ② 第⑧步用它建 Contains 关系时 UUID 非法、静默失败，
+    #        8 台 SIM 设备全部成了孤儿（实测：0 条 DEVICE→DEVICE 关系）。
+    #
+    #   非主客户用的名字是 ED2-Gateway·客户名（gateway_names 已保证），
+    #   不会与真实板子的 ED1-Gateway 相撞，所以可以直接建。
+    gw_single = ensure_gateway(api, gw_single_name, site_single, customer_id, log)
     if gw_three_name == gw_single_name:
         gw_three = gw_single          # 同一台网关管两个场站
     else:
@@ -1133,57 +1224,38 @@ def main():
     sites = {'single': site_single, 'three': site_three}
     gws = {'single': gw_single, 'three': gw_three}
 
-    # ⑦ 真实设备补场站 + RPC 能力（只在这个客户的场站下有意义）
-    log('\n=== ⑦ 真实设备（RTU 实际接入）===')
-    if customer_name != DEFAULT_CUSTOMER:
-        log('  · 跳过：真实 RTU 设备只属于主演示客户「%s」' % DEFAULT_CUSTOMER)
-        real_targets = []
-    else:
-        real_targets = ['PowerMeter-DDSU666', 'Sensor-HZ8706', 'Relay-8CH']
-    # ★ 真实设备也要有**人话 label**（2026-11-02 客户要求）：
-    #   设备技术名（PowerMeter-DDSU666 / Relay-8CH）只用于唯一性与匹配，
-    #   界面上一律显示 label。空 label 会退回 name，客户看到的就是技术名。
-    REAL_LABELS = {
-        'PowerMeter-DDSU666': '正泰单相电表 DDSU666',
-        'Sensor-HZ8706': '温湿度传感器',
-        'Relay-8CH': '8路继电器',
-    }
-    for nm in real_targets:
-        d = next((x for x in api.paged('/api/tenant/devices') if x.get('name') == nm), None)
-        if d is None:
-            log('  · %s 尚未接入（RTU 上电后会自动出现，届时重跑本脚本）' % nm)
-            continue
-        ai = d.get('additionalInfo') or {}
-        if isinstance(ai, str):
-            try:
-                ai = json.loads(ai)
-            except Exception:
-                ai = {}
-        ai['siteId'] = site_single['id']['id']
-        # RTU 自动建的设备 customerId 是 NULL_UUID —— 必须用 owner 接口改成该客户，
-        # 否则它不出现在客户设备列表里（看板按客户过滤时整台表消失）
-        cur_owner = (d.get('customerId') or {}).get('id')
-        if cur_owner != customer_id:
-            assign_owner(api, 'DEVICE', d['id']['id'], customer_id, log)
-        upd = {'id': d['id'], 'name': nm,
-               'label': REAL_LABELS.get(nm) or d.get('label') or nm,
-               'type': d.get('type'), 'additionalInfo': ai}
-        upd['customerId'] = {'entityType': 'CUSTOMER', 'id': customer_id}
-        api.post('/api/device', upd)
-        log('  ✓ %s 场站 → %s' % (nm, site_single_name))
-        api.call('POST', '/api/relation', {
-            'from': {'entityType': 'DEVICE', 'id': gw_single['id']['id']},
-            'to': {'entityType': 'DEVICE', 'id': d['id']['id']},
-            'type': 'Contains', 'typeGroup': 'COMMON',
-        })
-        # meterLevel：真实表计是 RTU 上报时自动建的，没有这个属性；
-        # 缺了资产汇总就取不到它（看板空）。2 = 分项/回路级
-        real_attrs = {'meterLevel': 2 if nm == 'PowerMeter-DDSU666' else 0}
-        rpc = RPC_SPECS.get(nm)
-        if rpc:
-            real_attrs['rpcCommands'] = rpc
-            log('    + RPC 能力（%d 条命令）' % len(rpc['methods']))
-        api.post('/api/plugins/telemetry/DEVICE/%s/SERVER_SCOPE' % d['id']['id'], real_attrs)
+    # ⑦ RTU 下挂设备（网关 → 正泰电表 / 温湿度 / 8 路继电器）
+    #
+    # ★ 2026-11-04 重写。原实现只对主演示客户「处理」真实设备，而且
+    #   **只查找不创建** —— 其它客户的网关下永远是空的；
+    #   即便是主客户，RTU 没上电时那三台也不存在，演示数据不完整。
+    #
+    #   现在改成：每个客户都保证这三台存在并挂在网关上。
+    #   主客户用真实名（板子写死），其余带客户后缀（互不冲突）。
+    log('\n=== ⑦ RTU 下挂设备（正泰电表 / 温湿度 / 8路继电器）===')
+    # 真实设备也要有**人话 label**（2026-11-02 客户要求）：
+    #   设备技术名只用于唯一性与匹配，界面上一律显示 label。
+    for spec in RTU_ATTACHED:
+        nm = rtu_attached_name(spec['base'], customer_name)
+        try:
+            named = dict(spec, name=nm)
+            # 真实 RTU 设备由网关转发上报，meterLevel 走 0（不进汇总）
+            dev = ensure_device(api, named, site_single, customer_id,
+                                gw_single['id']['id'], log)
+            if dev is None:
+                log('  ✗ %s 创建失败' % nm)
+                continue
+            # RTU 自动建的设备 customerId 是 NULL_UUID —— 必须用 owner 接口改成该客户，
+            # 否则它不出现在客户设备列表里（看板按客户过滤时整台表消失）
+            cur_owner = (dev.get('customerId') or {}).get('id')
+            if cur_owner and cur_owner != customer_id:
+                assign_owner(api, 'DEVICE', dev['id']['id'], customer_id, log)
+            if spec['base'] in RPC_SPECS:
+                api.post('/api/plugins/telemetry/DEVICE/%s/SERVER_SCOPE' % dev['id']['id'],
+                         {'rpcCommands': RPC_SPECS[spec['base']]})
+                log('    + RPC 能力（%d 条命令）' % len(RPC_SPECS[spec['base']]['methods']))
+        except Exception as e:
+            log('  ✗ %s: %s' % (nm, e))
 
     # ⑧ 模拟设备
     log('\n=== ⑧ 模拟设备 ===')

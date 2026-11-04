@@ -16,7 +16,7 @@ RTU 一上电就会：
 | 设备 | 档案 | meterLevel | 说明 |
 | --- | --- | --- | --- |
 | ED1-Gateway | 网关 | - | MQTT 网关本体，令牌固定 |
-| PowerMeter-DDSU777 | 单相电能表 | 0 | 真实单相电表；level=0 = 不计入场站汇总 |
+| PowerMeter-DDSU666 | 单相电能表 | 0 | 真实单相电表；level=0 = 不计入场站汇总 |
 | Sensor-HZ8706 | 温湿度变送器 | - | 温湿度 |
 | Relay-8CH | default | - | 8 路继电器（RPC 控制） |
 
@@ -62,7 +62,7 @@ import urllib.request
 
 # 与 rtu/main.py 的配置区逐字对应 —— 改这里必须同步改固件
 GATEWAY_NAME = "ED1-Gateway"
-METER_NAME = "PowerMeter-DDSU777"
+METER_NAME = "PowerMeter-DDSU666"   # ★ 必须与 rtu/main.py 的 METER_DEVICE 逐字一致
 SENSOR_NAME = "Sensor-HZ8706"
 RELAY_NAME = "Relay-8CH"
 GATEWAY_TOKEN = "ED1GatewayDemoRig2026"
