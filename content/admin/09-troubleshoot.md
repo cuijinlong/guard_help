@@ -266,6 +266,54 @@ Material 20 的组件全是 standalone）。
 已全部替换完，自检退出码 0。8 个客户看板 + 9 个租户看板已浏览器实测：
 日期框 `host`/`.mat-mdc-form-field` 全部成对，无 `tb-datetime` 残留，控制台无异常。
 
+### 系统整体很慢 / 点开看板要等好几秒（2026-11-04 实测修复）
+
+**症状**：数据量明明很小（几十台设备），打开看板却要等 5 秒以上，
+多个部件同时加载时更慢，甚至十几秒。
+
+**先量化，别猜**。三个数分别测：
+
+```bash
+TOKEN=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' -d '{"username":"demo@126.com","password":"12345678"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+
+# ① 单个接口耗时 + 返回大小
+curl -s --noproxy '*' -o /dev/null -w "%{time_total}s %{size_download}B\n" \
+  "http://127.0.0.1:8090/api/energy/meters" -H "X-Authorization: Bearer $TOKEN"
+
+# ② 8 并发（模拟一屏 8 个部件）
+for i in $(seq 1 8); do
+  curl -s --noproxy '*' -o /dev/null -w "%{time_total}s\n" \
+    "http://127.0.0.1:8090/api/energy/meters" -H "X-Authorization: Bearer $TOKEN" &
+done; wait
+```
+
+**判据**：如果「返回很小（几 KB）却耗时很长」，那就是**纯往返开销**，与数据量无关。
+
+**根因（2026-11-04 修复前）**：`/api/energy/meters` 在循环里逐台查数据库：
+31 台设备 ≈ 93 次串行往返；`energyTypes()` 又对全部 122 个资产逐个查属性。
+再加上每次都跑一条 `SELECT max(ts) FROM ts_kv GROUP BY entity_id`
+（82 万行的分区表，261ms），而 `ts_kv_latest` 只有 905 行、8.7ms、语义完全相同。
+
+**修复后实测**：
+
+- 热态单次：`0.9–8.8s` → **`0.12–0.28s`**
+- 8 并发：`34–85s` → **`0.26–0.41s`**
+- `metric-params`（带 siteId）：`1.1s` → **`56–107ms`**
+
+**如果你自己要给别的接口做同样的优化**，四条规则：
+
+1. **循环里不查库**：循环前一次 `IN` 批量取，循环里只查内存 Map。
+2. **缓存按租户分键**：用 `tenantId` 作 key，不要用一个全局变量。
+3. **热路径加 single-flight**：一屏多部件同时请求，缓存冷时要只算一次。
+4. **要「每个实体的最新值」就用 `ts_kv_latest`**，只有查历史区间才碰 `ts_kv`。
+
+**排查工具**：容器镜像只有 JRE（没有 `jstack` / `jcmd`），
+`/actuator/loggers` 被前端路由拦成 HTML 页面（不是真端点）。
+量 SQL 用 `docker exec energy-postgres psql -c "\timing on" -c "<SQL>"`，
+量接口用浏览器 F12 的 Network 面板看每个请求耗时。
+
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
 **症状**：看板框架、筛选条、KPI 卡片都在，但数字全 0，
