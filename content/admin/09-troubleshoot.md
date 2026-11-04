@@ -262,6 +262,85 @@ select c.title, count(distinct d.id) as 设备,
 ✓ 隔离校验通过：其他客户 224 个实体与租户级数据均未受影响
 ```
 
+### 实时能耗看不到数据变化 / RTU 通电但不上报（2026-11-04 实测）
+
+**先用一条命令诊断**（平台侧该查的全查一遍）：
+
+```bash
+cd ~/energy-app
+bash scripts/34-rtu-diagnose.sh --customer '<客户名>'
+```
+
+它按顺序检查 ①本机 IP ②固件 TB_HOST 是否匹配 ③端口监听+局域网可达
+④已建立的 MQTT 连接 ⑤局域网里的 ESP32 ⑥设备上报时间，最后给结论。
+
+**判据分水岭：第 ④ 项「已建立的 MQTT 连接」**
+
+```bash
+netstat -an | grep -E '\.1883|\.11883' | grep ESTABLISHED | wc -l
+# 0    → RTU 根本没连上来，看下面的「连不上」三条
+# >0   → 连上了但没数据，跳到「连上了但没数据」
+```
+
+#### 连不上（0 条连接）—— 按这三个顺序查
+
+| 顺序 | 查什么 | 判据 / 修 |
+| --- | --- | --- |
+| ① | **Thonny 是不是开着** | `pgrep -fl Thonny`。开着 = 板子上的 `main.py` 被 Ctrl-C 中断了。**完全退出**（Cmd+Q），按 RST 复位 |
+| ② | 板子上的 `TB_HOST` | 改电脑上的 `rtu/main.py` 不影响板子。`bash scripts/35-rtu-flash.sh --dry-run` 并排看两边 |
+| ③ | 令牌 | `34-rtu-diagnose.sh` 会直接比对固件与平台，不一致会标 ✗ |
+
+> **Thonny 这条最坑**：串口输出看着正常、WiFi 也连上了、板子灯在闪，
+> 但平台就是 0 连接 —— 因为程序根本没在跑，你看到的只是 REPL。
+
+#### 连上了但没数据
+
+| 查什么 | 判据 |
+| --- | --- |
+| 看的是哪台设备 | 界面「单相电表」= 模拟设备；「正泰单相电表 DDSU666」= 真实 RTU 那台 |
+| 真实表是否在数据源范围内 | 「实时能耗」默认只看「单相园区」场站，电表没挂进去就看不到 |
+| 规则链是否翻译了 key | 板子发 `U/I/P/Ep`，平台读 `voltage_a/...`。规则链「电表Key标准化」没跑通就是有连接没数据 |
+
+#### 「单相电表」还是「正泰单相电表 DDSU666」？
+
+一台设备有**三层名字**，界面上只显示中间那层：
+
+| 层 | 值 | 用途 |
+| --- | --- | --- |
+| `name`（技术名） | `PowerMeter-DDSU666` | 网关按它匹配，**必须与固件逐字一致** |
+| `label`（显示名） | 正泰单相电表 DDSU666 | **界面上看到的是这个** |
+| `type`（设备档案） | 单相电能表 | 决定测点模板与计量口径 |
+
+而界面上的「单相电表」是另一台：
+
+| 显示名 | name | 谁在上报 |
+| --- | --- | --- |
+| 单相电表 | `PowerMeter-1P-SIM·<客户名>` | `31-rtu-simulate.py` 模拟 |
+| 正泰单相电表 DDSU666 | `PowerMeter-DDSU666` | **真实 RTU 板子** |
+
+所以「实时能耗有变化但看不到真实表」= 模拟在跑、板子没连上；
+「两台都没变化」= 模拟脚本也没常驻（`--once` 跑完就退出了）。
+
+```bash
+# 模拟上报要常驻，否则数据停在最后一次
+nohup bash scripts/29-rtu-demo-up.sh --sim-only --customer '<客户名>' \
+  --interval 30 > /tmp/rtu-sim.log 2>&1 &
+```
+
+#### 换电脑后必做
+
+```bash
+# ① 查新 IP
+ipconfig getifaddr en1        # macOS；Linux: hostname -I
+
+# ② 改 rtu/main.py 的 TB_HOST 为新 IP
+# ③ 上传到板子（关键：只改文件不上传 = 没改）
+bash scripts/35-rtu-flash.sh --serial /dev/cu.wchusbserial1410
+
+# ④ 验证
+bash scripts/34-rtu-diagnose.sh --customer '<客户名>'
+```
+
 ### 改完部件 JSON 前端没变化
 
 | 层次 | 判据 | 修 |

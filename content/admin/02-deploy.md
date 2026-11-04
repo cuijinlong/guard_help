@@ -405,6 +405,55 @@ TB_HOST = "192.168.1.50"        # 不能填 127.0.0.1，板子连不到
 
 `TB_TOKEN`、`GATEWAY_NAME`、三个设备名**一概不要动** —— 平台侧已经对准了。
 
+### ⚠️ 最常见的坑：Thonny 开着，板子就不上报
+
+**症状**：板子通电、WiFi 也连上了、串口看着正常，但平台侧
+`netstat | grep 1883` **0 条连接**，设备「从未上报」。
+
+**原因**：Thonny 连接板子时带 `interrupt_on_connect` ——
+一连上就按 Ctrl-C **中断正在运行的 `main.py`**。
+你以为在看日志，其实程序已经停了。
+
+**判据**：
+
+```bash
+pgrep -fl Thonny          # 有输出 = Thonny 开着
+lsof /dev/cu.wchusbserial* # 有输出 = 串口被占
+```
+
+**处理**：**完全退出 Thonny**（`Cmd+Q`，不是关窗口），然后按 `RST` 或重新插拔 USB，
+让板子重新跑 `main.py`。
+
+> 要在 Thonny 里看日志也可以，但看完必须点「运行 ▶」把程序放回去，
+> 否则拔掉 USB 后板子复位了才会重新跑。
+
+### 改完 `main.py` 必须重新上传到板子
+
+改电脑上的 `rtu/main.py` **不影响板子** —— 板子跑的是 flash 里的副本。
+换电脑、换网段后 `TB_HOST` 变了，必须上传。
+
+```bash
+cd ~/energy-app
+
+# ① 先看板子上现在是什么（只读，安全）
+bash scripts/35-rtu-flash.sh --dry-run
+
+#    输出会并排列出「板子上」与「本地」的 TB_HOST / 端口 / 网关名 / 令牌末四位。
+#    两边不一致 —— 就是「改了没生效」。
+
+# ② 上传（会重启板子）
+bash scripts/35-rtu-flash.sh --serial /dev/cu.wchusbserial1410
+
+# ③ 验证平台侧真的收到了
+bash scripts/34-rtu-diagnose.sh --customer '某某厂区'
+```
+
+`35-rtu-flash.sh` 会推 `main.py` 与整个 `lib/`（`serial.py` / `functions.py` / `const.py`），
+`lib/` 是 `from serial import Serial` 的依赖，漏了板子会报 `ImportError`。
+
+> **只需装一次 mpremote**：`pip3 install --user mpremote`
+> macOS 上装完在 `~/Library/Python/3.9/bin`，脚本会自动加进 PATH。
+
 ### 上电后按这个顺序看
 
 1. **串口第一屏是「配置自检」**：WiFi 名、平台 IP、端口、令牌末四位、三个设备名。
@@ -436,6 +485,8 @@ select d.name, count(*) from ts_kv k join device d on d.id=k.entity_id
 | `WiFi 失败` | SSID/密码错，或路由器 5G-only | 改成 2.4G 频段；核对密码 |
 | `平台不在线` | `TB_HOST` 填了 127.0.0.1 或不是同一网段 | 改成本机局域网 IP |
 | `MQTT 认证失败` | 令牌不是固件里那个 | 平台侧重跑 `30-rtu-env-init.py`，看核对卡 |
+| 串口正常但平台 0 连接 | **Thonny 挂着，把程序中断了** | 完全退出 Thonny，按 RST 复位 |
+| 改了 `main.py` 没变化 | 只改了电脑上那份 | `35-rtu-flash.sh` 上传到板子 |
 | `MQTT` 连上但设备不出现 | 设备名对不上（差一个字符也算） | 核对卡上的三个名字必须逐字一致 |
 | 只有电表有数，传感器没有 | 传感器没接 / 地址不对（`SENSOR_ADDR`） | 查 485 接线 |
 
