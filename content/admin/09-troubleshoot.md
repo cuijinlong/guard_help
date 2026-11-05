@@ -474,6 +474,28 @@ th:not([mat-header-cell]) { font-size: 16px; }                        /* (0,1,1)
 
 **判据**：`getComputedStyle(th).fontSize` 应为 `12px`、`td` 应为 `13px`。看到 16px 就是没生效。
 
+**时间选择框的三个坑（2026-11-05 客户逐条报）**
+
+| 症状 | 根因 | 修法 |
+| --- | --- | --- |
+| 又大（78px / 16px） | 模板早换成 `<energy-date-picker>`，`<style>` 里的选择器还写着 `tb-datetime`，一条都不匹配 | 改标签名 = 模板与 CSS 必须同时全量替换 |
+| 又英文（`29/10/2026`、`OCT 2026`） | 全局 `MAT_DATE_LOCALE` 是 `'en-GB'` | 组件级 `providers` 覆盖 `DateAdapter` + `MAT_DATE_FORMATS`，不动全局 |
+| 日期格子写「1日 2日」 | `NativeDateAdapter.getDateNames()` 用 `Intl` 的 `day:'numeric'`，zh-CN 下就是 `"1日"` | 覆写 `getDateNames()` 返回 `['1','2',…,'31']` |
+| `Close calendar` / `2003 to 2026` | `MatDatepickerIntl` 是英文默认值 | 组件级覆盖 `MatDatepickerIntl` |
+
+三个都只在 `<energy-date-picker>` 里生效，**不改 Material 源码、不动全局 token**。
+
+**判据**：
+
+```js
+const pk = document.querySelector('energy-date-picker');
+getComputedStyle(pk.querySelector('.mat-mdc-form-field')).fontSize;      // '13px'
+Math.round(pk.querySelector('.mat-mdc-form-field').getBoundingClientRect().height); // 34~36
+pk.querySelector('input').value;                                        // '2026-10-29'
+[...document.querySelectorAll('.mat-calendar-body-cell-content')].slice(0,5).map(x=>x.textContent.trim());
+// 期望 ['1','2','3','4','5']
+```
+
 > 改完 CSS 要重打前端 + 重打 jar（静态资源在 jar 里），只重启容器不够。
 
 **顺带修的**：分页原来是自己画的 `‹ 1 2 3 ›` 按钮 + 原生 `<select>`，
