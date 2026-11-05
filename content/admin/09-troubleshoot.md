@@ -554,6 +554,43 @@ const pk = document.querySelector('.eqab-picker energy-date-picker');
   .map(s => Math.round(pk.querySelector(s).getBoundingClientRect().height)); // 34,34,32,32
 ```
 
+### 分析条件的「分项/区域」为什么只有一级 / 怎么加演示层级（2026-11-05）
+
+**现象**：级联下拉打开只有两列（「全部」→ 分项列表），看不到「楼栋 / 回路」等更深层。
+
+**原因**：演示数据本身只有「场站 → 分项」两层。级联控件没问题，是数据不够深。
+
+**加子级演示数据的三条硬规矩**：
+
+1. **必须按比例拆父级的聚合值**（两个子各 ×0.5），否则父子总和不等，
+   总量会翻倍或对不上。实测：父 `energy_total` 4979.76 → 两子各 2489.88，精确相等。
+2. `ts_kv` **没有 `version` 列**，`asset.external_id` 是 **uuid 类型**，
+   空值要写 `NULL` 不能写 `''`。
+3. 建完资产/关系**必须重启 energy-server** —— TB 的资产缓存不会自动失效，
+   `/api/relations` 会看不到新建的子资产（但数据库里明明有）。
+
+```sql
+-- 子级聚合值 = 父级 × 0.5（两个子）
+INSERT INTO ts_kv (entity_id, key, ts, dbl_v, long_v)
+SELECT '<子id>', kv.key, kv.ts,
+       COALESCE(kv.dbl_v, kv.long_v::double precision) / 2.0, NULL
+FROM ts_kv kv WHERE kv.entity_id='<父id>'
+  AND kv.key=(SELECT key_id FROM key_dictionary WHERE key='energy_total');
+```
+
+**判据**：
+
+```js
+// 打开级联，悬停有子级的节点（带 ▸ 箭头）应展开出第三列
+[...document.querySelectorAll('.eqab-node')]
+  .find(n => n.querySelector('.eqab-node-txt').textContent.trim() === '照明')
+  .dispatchEvent(new MouseEvent('mouseenter', {bubbles: false}));
+document.querySelectorAll('.eqab-casc-col').length;   // 2 → 3
+```
+
+> ⚠️ 测 hover 必须派发 **`mouseenter`**，不能派发 `mouseover` ——
+> `mouseenter` 不冒泡，Angular 绑的是它。派发 `mouseover` 永远不触发。
+
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
 **症状**：看板框架、筛选条、KPI 卡片都在，但数字全 0，
