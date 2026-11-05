@@ -390,6 +390,38 @@ setTimeout(done, 15000);          // 硬超时兜底
 | 一层树的 Contains 关系 | `GET /api/energy/child-relations?ids=&dir=from` |
 | 实体名称/label/类型 | `GET /api/energy/entity-briefs?ids=` |
 | 设备档案名 | `GET /api/energy/device-profile-names?ids=` |
+| 一批设备的完整档案（要 profileId/customerId） | `GET /api/devices?deviceIds=a,b,c`（TB 原生，实测客户账号可用） |
+
+**第三批（2026-11-05）：左侧「查询设置」与实时趋势**
+
+如果后端和批量接口都快了，但左侧设备树仍要等 1~3 秒，
+问题在部件自己发的单查：
+
+| 位置 | 改前 | 改后 |
+| --- | --- | --- |
+| 查询设置：根类型 / 品种名 / 按名找品种 | 逐 id `/api/asset/{id}`（404 再试 `/api/device/{id}`） | 1 次 `entity-briefs` |
+| 查询设置：补设备 | 逐 id `/api/device/{id}` | 1 次 `GET /api/devices?deviceIds=` |
+| 实时趋势：`loadNames` | 逐实体单查（一屏 12 个并发） | 1 次 `entity-briefs` |
+
+实测（实时能耗，客户账号，整页刷新）：`/api/asset/{id}` **20+ → 0**，
+总请求 **131 → 85**，「部件出现 → 树成型」**908ms → 607ms**；
+SPA 内切回该看板（用户真实操作）**1 秒出 25 行**。
+
+> 冷启动那 3.6 秒里，**3.3 秒是 Angular 自己**（bootstrap + 14 个懒加载 chunk + 翻译），
+> 部件的业务请求只占最后约 600ms。
+> 判据：分别量「部件出现」与「树成型」两个时间点，看**差值** ——
+> 差值大才是部件的问题，整体大是框架启动成本。
+
+**合并前端查询：用「预取」，不要用「微批」**（这条踩过两次）
+
+| 做法 | 改哪里 | 结果 |
+| --- | --- | --- |
+| 微批：在 `loadName` 里用 `setTimeout(0)` 收集同一 tick 的 id | 改被调函数内部 | **会卡死**：10 次切换有 2 次永久「加载中」 |
+| 预取：`forEach` 之前先把整层 id 批量灌进 `nameCache` | 只改调用点 | **安全**：14 轮切换 0 卡死 |
+
+原因：树加载是逐层异步递归，完成靠上层 `pending--; if (!pending) cb()` 计数。
+在被调方里插一层宏任务（`setTimeout`）会把「同步回调」变成「异步回调」，
+计数节奏乱掉。预取不改被调方，之后每条都命中缓存、仍然是同步回调。
 
 **排查工具**：容器镜像只有 JRE（没有 `jstack` / `jcmd`），
 `/actuator/loggers` 被前端路由拦成 HTML 页面（不是真端点）。
