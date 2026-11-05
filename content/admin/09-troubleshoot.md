@@ -517,6 +517,43 @@ pk.querySelector('input').value;                                        // '2026
 **顺带修的**：分页原来是自己画的 `‹ 1 2 3 ›` 按钮 + 原生 `<select>`，
 已换成 TB 标准的 `mat-paginator`（与其它数据表一致）。
 
+### 分析条件的「分项/区域」下拉很小 / 与旁边控件不一样（2026-11-05 实测修复）
+
+**症状**：分析条件部件里，场站、品种下拉正常，中间的「分项/区域」下拉
+只有很小一个框（实测 18×26px），旁边两个是 34px 高 / 120~132px 宽。
+
+**根因**：上一轮把场站/品种换成 `mat-select` 时，把自绘下拉的 CSS 一起删了，
+但「分项/区域」还在用自绘壳 —— 样式找不到，塌成内容尺寸。
+
+**修法**：改成 `mat-select` 平铺，用 `padding-left = depth * 14` 表达层级
+（Material 没有 tree-select，而树深最多 3 层，平铺够用）。
+
+> **不要 `[disabled]="treeBusy"`**：禁用态下拉打不开，「加载中…」永远看不见。
+
+**⚠️ 顺手清理 CSS 时踩的坑（同类改动请避开）**
+
+用前缀批量删 `.eqab-*` 行时把 `.eqab-picker`（日期框容器）也删了 ——
+同前缀，日期框从 34px 退回 56/78px。
+
+更隐蔽的是第二层：那些规则是**多行**的，只按行首 grep 恢复会漏掉续行，
+大括号不闭合 → **整段 CSS 被浏览器丢弃且不报错**。
+症状：`wrapper` 是 34px 但 `flex`/`infix` 还是 56px、`subscript` 22px。
+
+硬规矩：① 用完整选择器名集合精确匹配；② 改完检查 `templateHtml` 里
+`{` 与 `}` 数量相等；③ 恢复规则整段拷贝。
+
+**判据**：
+
+```js
+[...document.querySelectorAll('.eqab-root mat-form-field')]
+  .map(f => Math.round(f.getBoundingClientRect().height));   // 期望全部 34
+
+const pk = document.querySelector('.eqab-picker energy-date-picker');
+['.mat-mdc-form-field','.mat-mdc-text-field-wrapper',
+ '.mat-mdc-form-field-flex','.mat-mdc-form-field-infix']
+  .map(s => Math.round(pk.querySelector(s).getBoundingClientRect().height)); // 34,34,32,32
+```
+
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
 **症状**：看板框架、筛选条、KPI 卡片都在，但数字全 0，
