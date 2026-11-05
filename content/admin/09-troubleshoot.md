@@ -349,6 +349,48 @@ performance.getEntriesByType('resource')
 > 它带 `@PreAuthorize("hasAuthority('TENANT_ADMIN')")`，**客户用户直接 403**。
 > 这也是当初为什么要逐个查 —— 现在改走自研接口。
 
+**部件永久卡在「加载中…」**（2026-11-05 修复）
+
+这不是慢，是**永不结束**。判据：部件一直显示「加载中」，控制台无任何报错。
+
+根因是部件的完成判定写了 `finished === total`：
+
+```js
+worker(item, function () { finished++; if (finished === total) { done(); } });
+```
+
+只要有一个回调重复触发（HttpClient 同时触发 error 与 complete）
+或缺失，`finished` 就越过 `total`，`===` 永远不成立 → 永不结束、不报错。
+
+修法（已应用到 `realtime_trend` 等部件）：
+
+```js
+var settled = false;
+worker(item, function () {
+  if (settled) { return; }        // 幂等：重复回调丢弃
+  settled = true;
+  running--; finished++;
+  if (finished >= total) { done(); }
+});
+setTimeout(done, 15000);          // 硬超时兜底
+```
+
+同批还做了两件事，让这类问题不会再出现：
+
+1. **逐实体取数改批量**：21~89 个 `/values/timeseries` → 1~8 个
+   `/api/energy/telemetry-series`；
+2. **逐节点取关系改批量**：87 个 `/api/relations` →
+   5 个 `/api/energy/child-relations`。
+
+**多实体取数/取关系现在都有批量接口**（写新部件时直接用）：
+
+| 用途 | 接口 |
+| --- | --- |
+| 多实体遥测序列 | `GET /api/energy/telemetry-series?ids=ASSET:a,DEVICE:b&keys=&startTs=&endTs=&interval=&agg=&limit=` |
+| 一层树的 Contains 关系 | `GET /api/energy/child-relations?ids=&dir=from` |
+| 实体名称/label/类型 | `GET /api/energy/entity-briefs?ids=` |
+| 设备档案名 | `GET /api/energy/device-profile-names?ids=` |
+
 **排查工具**：容器镜像只有 JRE（没有 `jstack` / `jcmd`），
 `/actuator/loggers` 被前端路由拦成 HTML 页面（不是真端点）。
 量 SQL 用 `docker exec energy-postgres psql -c "\timing on" -c "<SQL>"`，
