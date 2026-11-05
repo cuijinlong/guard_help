@@ -21,6 +21,7 @@
 | **分项/区域能耗页的合计对不上 / 两页数字一样** | §6.2b 统计核算 |
 | **账单金额对不上 / 账单页与分时拆解页金额不同** | §6.2c 账单核算 |
 | **基础报表/参数报表的曲线或明细对不上** | §6.2d 报表核对 |
+| **手工填报页的月度数字/合计对不上** | §6.2e 手工填报核对 |
 | 数字是天文数字 | §6.3 哨兵读数 |
 | 抄表读不出表底 | §8 抄表 |
 | 磁盘满了 / 要备份 | §9 表结构与空间、§10 备份 |
@@ -842,6 +843,83 @@ GROUP BY d.label ORDER BY 全天合计 DESC;
 **核对一律用 `d.id`，不要用 `label` / `name` 之外的模糊条件**。
 要按可读名查就先跑一次 `SELECT id, name, label FROM device WHERE label = '…'`，
 确认只命中一台。
+
+---
+
+### 6.2e 手工填报的数字怎么核对
+
+**什么时候用**：客户问「我填的数怎么没上去」「合计跟 Excel 对不上」
+「某个月为什么是空的」。
+
+**口径**（三条，和报表页完全不同，别套 §6.2d 的聚合）：
+
+1. 手工填报只认**虚拟设备**的 `energy` 键；接了 RTU 的真实表不在候选里，
+   查真实表得到 0 行是正常的，不是故障。
+2. 每个设备每个月**只有 1 个点**，时间戳是**该月 1 日 00:00**，值就是这个月的用量。
+   所以核对**直接 `SUM(dbl_v)`，不要再按日/小时聚合** —— 再切一次时间片会把一个点拆散。
+3. 页面的「合计」= 所选月份区间内所有点之和；**未来月份没有点 → 画空柱**，
+   空柱不等于 0，也不等于漏填。
+
+```sql
+-- ① 某虚拟设备逐月用量（与页面抽屉里的 12 个格子、月度用量柱一一对应）
+SET TIME ZONE 'Asia/Shanghai';
+WITH win AS (
+  SELECT EXTRACT(EPOCH FROM (TIMESTAMP '2026-01-01 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM (TIMESTAMP '2027-01-01 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+)
+SELECT to_char(date_trunc('month', to_timestamp(kv.ts/1000) AT TIME ZONE 'Asia/Shanghai'),
+               'YYYY-MM') AS 月,
+       round(sum(kv.dbl_v)::numeric, 2) AS 用量, count(*) AS 点数
+FROM key_dictionary kd
+JOIN ts_kv kv ON kv.key = kd.key_id
+CROSS JOIN win
+WHERE kd.key = 'energy'
+  AND kv.entity_id = '<虚拟设备id>'::uuid
+  AND kv.ts >= win.s AND kv.ts < win.e
+GROUP BY 月 ORDER BY 月;
+```
+
+```sql
+-- ② 全年合计与数据跨度（核对页面顶部的「合计」）
+SET TIME ZONE 'Asia/Shanghai';
+SELECT to_char(to_timestamp(min(kv.ts)/1000) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS 最早,
+       to_char(to_timestamp(max(kv.ts)/1000) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS 最晚,
+       round(sum(kv.dbl_v)::numeric, 2) AS 合计,
+       count(*) AS 点数
+FROM key_dictionary kd
+JOIN ts_kv kv ON kv.key = kd.key_id
+WHERE kd.key = 'energy' AND kv.entity_id = '<虚拟设备id>'::uuid;
+```
+
+**判据**：
+
+- `点数` = 实际填过的月份数（**不是 12** 就说明有空月，属正常）；
+- 页面「合计」= ② 的 `合计`；抽屉里逐月的数 = ① 的 `用量`；
+- 页面上空着的月 = ① 里没有该月的行（不是 0）。
+
+**实测样例**（演示厂区A / 空调虚拟表 `c4e37c80-d7a3-11f1-b139-b367a33eb8e4`，2026 年）：
+
+| 月 | 用量 | 月 | 用量 |
+| --- | --- | --- | --- |
+| 2026-01 | 1820.00 | 2026-07 | 1450.00 |
+| 2026-02 | 1650.00 | 2026-08 | 1780.00 |
+| 2026-03 | 980.00 | 2026-09 | 1520.00 |
+| 2026-04 | 420.00 | 2026-10 | 760.00 |
+| 2026-05 | 310.00 | 2026-11 | 480.00 |
+| 2026-06 | 620.00 | 2026-12 | （无点，空柱） |
+
+合计 `11790.00`、`点数 11`、跨度 `2026-01-01 ~ 2026-11-01` ——
+与页面「合计 11.8k kW·h」、12 根柱（12 月空）、抽屉里 11 个有数格完全一致。
+
+**为什么 12 月是空的**：演示数据只填到 2026-11；页面按区间铺 12 根柱，
+没点的月份画空柱。**不要把它当成 bug 去补 0** —— 补 0 会和「填了 0 度」混淆。
+
+**两个容易误判的现象**：
+
+- **虚拟表在分项/区域能耗里缺席**：先看设备的「参与厂站能耗计算」开关。
+  关掉后手工填报页照常能填能看，但分项/区域汇总不含它（详见 §6.2b）。
+- **改了数页面没变**：抽屉「保存」写的是资产/设备遥测，保存后要**点查询**才刷新；
+  另外浏览器缓存会让旧值停留，`Cmd/Ctrl + Shift + R` 硬刷新一次。
 
 ---
 
