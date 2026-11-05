@@ -392,8 +392,12 @@ setTimeout(done, 15000);          // 硬超时兜底
 | 设备档案名 | `GET /api/energy/device-profile-names?ids=` |
 | 一批设备的完整档案（要 profileId/customerId） | `GET /api/devices?deviceIds=a,b,c`（TB 原生，实测客户账号可用） |
 
-**第三批（2026-11-05）：左侧「查询设置」与实时趋势**
+> `telemetry-series` 的 `keys` **支持多键**（`keys=power_a,power_b,power_c,power_total`）：
+> 一次带回全部 (实体, 键)，响应里每项多了 `key` 字段。
+> 前端要自己按实体分批（参考 `timeseries_chart` 的 60 台一批），
+> 不要把上百台塞进一个请求 —— 那是服务端上限，不是目标。
 
+**第三批（2026-11-05）：左侧「查询设置」与实时趋势**
 如果后端和批量接口都快了，但左侧设备树仍要等 1~3 秒，
 问题在部件自己发的单查：
 
@@ -427,6 +431,53 @@ SPA 内切回该看板（用户真实操作）**1 秒出 25 行**。
 `/actuator/loggers` 被前端路由拦成 HTML 页面（不是真端点）。
 量 SQL 用 `docker exec energy-postgres psql -c "\timing on" -c "<SQL>"`，
 量接口用浏览器 F12 的 Network 面板看每个请求耗时。
+
+### 历史能耗右侧很慢 / 表格看着和系统自带的不一样（2026-11-05 实测修复）
+
+**症状**：左侧选完设备点「查询」，右侧要等好几秒；
+而且表格的表头、数字比其它页面的表格明显大一圈。
+
+**慢的根因**：右侧「时序图表」部件按「每个参数 × 每台设备 × 每个时间块」
+逐个发 `/values/timeseries`。一次查询 **20 个请求**，每个只返回 1KB，
+耗时却从 2.6 秒排到 **10.2 秒** —— 全部同时发出，而 HTTP/1.1 每域只有 6 条连接。
+
+**判据**：F12 看 Network，按请求耗时降序，如果几十个请求的「起跑」
+都在同一毫秒、「耗时」却依次递增（2.6s / 3.2s / 4.0s … 10.2s），就是排队。
+
+**修法**：后端 `telemetry-series` 支持多键，一次 SQL 出全部 (实体, 键)；
+前端改成每个（参数组 × 时间块）只发 **1 个**请求。
+
+**实测**：
+
+- 取数请求 **20 → 5**
+- 累计耗时 **109709ms → 805ms**
+- 最慢单个 **10257ms → 203ms**
+- 数值逐点一致（`power_a` / `power_total` 的 7 个日桶完全相同）
+
+**表格变大的根因**：TB 内核的全局样式里有两条：
+
+```css
+body, button, html, input, select, textarea, td { font-size: 16px; }  /* (0,0,1) */
+th:not([mat-header-cell]) { font-size: 16px; }                        /* (0,1,1) */
+```
+
+而 `.tb-data-table` 的规范为了允许部件覆盖，全套了 `:where()`，特异性只有 **(0,1,0)**，
+**压不过上面两条**。所以手写 `<table>` 套上 `.tb-data-table` 后，
+表头与单元格仍然是 16px，而 TB 原生 mat-table 是 12 / 13px。
+
+已在 `ui-ngx/src/styles.scss` 用 (0,1,2) 只夺回字号：
+
+```css
+.tb-data-table thead th { font-size: 12px; }
+.tb-data-table tbody td { font-size: 13px; }
+```
+
+**判据**：`getComputedStyle(th).fontSize` 应为 `12px`、`td` 应为 `13px`。看到 16px 就是没生效。
+
+> 改完 CSS 要重打前端 + 重打 jar（静态资源在 jar 里），只重启容器不够。
+
+**顺带修的**：分页原来是自己画的 `‹ 1 2 3 ›` 按钮 + 原生 `<select>`，
+已换成 TB 标准的 `mat-paginator`（与其它数据表一致）。
 
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
