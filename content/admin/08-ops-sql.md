@@ -20,6 +20,7 @@
 | 分项显示 kWh 但装的是水表 | §6.2 按品种分键 |
 | **分项/区域能耗页的合计对不上 / 两页数字一样** | §6.2b 统计核算 |
 | **账单金额对不上 / 账单页与分时拆解页金额不同** | §6.2c 账单核算 |
+| **基础报表/参数报表的曲线或明细对不上** | §6.2d 报表核对 |
 | 数字是天文数字 | §6.3 哨兵读数 |
 | 抄表读不出表底 | §8 抄表 |
 | 磁盘满了 / 要备份 | §9 表结构与空间、§10 备份 |
@@ -748,6 +749,99 @@ FROM b GROUP BY 1,2,3 HAVING count(*) > 1;
 | SQL 能跑但金额列全是空 | 金额字段在 `str_v`，写成 `kv.dbl_v` | 用 `coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric)` |
 | 账单页总额远大于「实际用电」 | 账单按表逐张出，含上下级重复（总表+分表各一张），供分层分摊 | 见页面绿色「实际用电/实际电费」条 |
 | 客户看不到别人的账单 | TB owner 机制：`asset.customer_id` 隔离 | 租户账号查是全量 |
+
+---
+
+### 6.2d 基础报表 / 参数报表的数字怎么核对
+
+**什么时候用**：客户问「图上这条线对不对」「明细表某个格子为什么是 `/`」
+「合计跟别处对不上」。
+
+**口径**（三条，缺一条就对不上）：
+
+1. 报表读的是**设备遥测的原始键**（`energy` / `voltage_a` / `power_total` …），
+   不是资产的汇总键（`energy_total` 那套是分项/区域能耗用的）；
+2. 页面按**时间片聚合**：`interval=3600000&agg=SUM` 表示"每小时求和"，
+   所以核对也要先按小时 `SUM`，别直接拿原始点求和；
+3. **同一小时可能有多条原始点**（演示数据 10 分钟一条），按小时 SUM 后才是页面上的格子值。
+
+```sql
+-- ① 某设备某天，按小时聚合（与页面 interval=3600000 完全同口径）
+SET TIME ZONE 'Asia/Shanghai';
+WITH win AS (
+  SELECT EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-04 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-05 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+), h AS (
+  SELECT kv.entity_id,
+         date_trunc('hour', to_timestamp(kv.ts/1000) AT TIME ZONE 'Asia/Shanghai') AS 小时,
+         sum(kv.dbl_v) AS 值, count(*) AS 原始点数
+  FROM key_dictionary kd
+  JOIN ts_kv kv ON kv.key = kd.key_id
+  CROSS JOIN win
+  WHERE kd.key = 'energy' AND kv.ts >= win.s AND kv.ts < win.e
+  GROUP BY kv.entity_id, 小时
+)
+SELECT d.label AS 设备, h.小时, round(h.值::numeric, 2) AS 小时值, h.原始点数
+FROM h JOIN device d ON d.id = h.entity_id
+WHERE d.id = '<设备id>'::uuid
+ORDER BY h.小时;
+```
+
+**判据**：页面「数据明细」页签里该设备的每个非 `/` 格子 = 上表对应小时的 `小时值`；
+格子数 = 有数据的小时数。
+
+```sql
+-- ② 全天合计与极值（核对图上的峰值标注与整日合计）
+SET TIME ZONE 'Asia/Shanghai';
+WITH win AS (
+  SELECT EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-04 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-05 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+), h AS (
+  SELECT kv.entity_id,
+         date_trunc('hour', to_timestamp(kv.ts/1000) AT TIME ZONE 'Asia/Shanghai') AS 小时,
+         sum(kv.dbl_v) AS 值
+  FROM key_dictionary kd
+  JOIN ts_kv kv ON kv.key = kd.key_id
+  CROSS JOIN win
+  WHERE kd.key = 'energy' AND kv.ts >= win.s AND kv.ts < win.e
+  GROUP BY kv.entity_id, 小时
+)
+SELECT d.label AS 设备, count(*) AS 有数小时,
+       round(sum(h.值)::numeric, 2) AS 全天合计,
+       round(min(h.值)::numeric, 2) AS 小时最小,
+       round(max(h.值)::numeric, 2) AS 小时最大
+FROM h JOIN device d ON d.id = h.entity_id
+WHERE d.id IN ('<设备id>'::uuid, '<设备id>'::uuid)
+GROUP BY d.label ORDER BY 全天合计 DESC;
+```
+
+**判据**：`小时最大` = 图上峰值标注；`有数小时` = 明细表里该行的非 `/` 格数。
+
+**实测样例**（演示厂区A / 办公园区 / 2026-11-04，与页面逐项核对一致）：
+
+| 设备 | 有数小时 | 全天合计 | 小时最小 | 小时最大 | 页面 |
+| --- | --- | --- | --- | --- | --- |
+| 单相电表 | 9 | 296.57 | 0.59 | 101.78 | 峰值标签 `101.8`、明细 9 格合计 `296.58` |
+| 1#进线总表 | 1 | 2.21 | 2.21 | 2.21 | 明细首格 `2.21` |
+
+> 明细 9 格手工相加是 296.58、SQL 是 296.57 —— 差 0.01 是**每格已四舍五入到两位**
+> 再相加造成的，属正常；核对时看「到分」即可，不要追到厘。
+
+#### ⚠️ 核对时最容易踩的一条：`label` 不唯一
+
+演示数据里**两台设备 label 都叫「1#进线总表」**：
+
+| name | label |
+| --- | --- |
+| `单相园-1#进线总表·演示厂区A` | `1#进线总表` |
+| `三相园-1#进线总表·演示厂区A` | `1#进线总表` |
+
+按 `WHERE d.label = '1#进线总表'` 查会把两台加在一起（实测 62.51 = 2.21 + 60.30），
+而页面只画了一台（2.21）—— 看着像"页面少了一半数据"，其实是 SQL 多算了。
+
+**核对一律用 `d.id`，不要用 `label` / `name` 之外的模糊条件**。
+要按可读名查就先跑一次 `SELECT id, name, label FROM device WHERE label = '…'`，
+确认只命中一台。
 
 ---
 

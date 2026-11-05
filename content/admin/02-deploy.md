@@ -51,7 +51,7 @@ bash shiyongshouce/downloads/deploy/docker-00-prepare.sh --pack
 产出 `dist/energy-deploy-<日期>.tar.gz`（约 550 MB），里面已经包含：
 
 - `guard-server-4.4.0.jar`（含前端产物）
-- 585 个部件定义、30 个看板模板
+- 586 个部件定义、30 个看板模板
 - 建表 SQL、运维脚本、`docker-compose.yml`
 - **现场要用的 `scripts/09-onboard-customer.sh` 与 `30-rtu-env-init.py`**
 
@@ -673,7 +673,7 @@ bash docker-02-start.sh --allinone --admin-email ... --admin-pass ...
 | --- | --- |
 | 库表 | 150 上下（`SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`） |
 | 系统部件（install 后 DB 行数） | 740 上下 |
-| 交付的部件文件 | 585 个 |
+| 交付的部件文件 | 586 个 |
 | 客户看板模板 | 30 个 |
 | 建表 SQL | 8 个 |
 | 能源参数字典 | 1 个资产，标准 key **137** 个（电能 122） |
@@ -702,7 +702,7 @@ bash docker-02-start.sh --allinone --admin-email ... --admin-pass ...
 **真正能防翻车的是三道机制，不是重装**：
 
 ```bash
-# ① 构建前：部件依赖自检（585 个模板，缺管道/Material 直接退出码 1）
+# ① 构建前：部件依赖自检（586 个模板，缺管道/Material 直接退出码 1）
 cd ui-ngx && node esbuild/check-widget-deps.mjs
 
 # ② 部署前：jar 比前端产物旧就中止（防「只 build 前端没重打 jar」）
