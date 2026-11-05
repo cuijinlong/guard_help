@@ -74,13 +74,27 @@
 
 | 表 | 存什么 |
 | --- | --- |
-| `billing` / `billing_detail` | 用能账单与明细 |
+| `billing` / `billing_detail` | ⚠️ **空表，建了没用**（0 行）。账单存在 `asset`（`type='energy_bill'`）+ `attribute_kv`，见下 |
 | `rate_template` | 电价模板（峰平谷单价） |
 | `tou_scheme` | 分时时段方案 |
 | `alarm` / `alarm_rule` | 告警与告警规则 |
 | `calculated_field` | 派生指标定义（如三相不平衡度） |
 | `audit_log` | 审计日志 |
 | `api_usage_state` | 接口调用计次（限流用） |
+
+**⚠️ 账单不在 `billing` 表**（2026-11-06 实测：`billing` / `billing_detail` 各 0 行）：
+
+出账由 `EnergyBillingService` 完成，写的是**资产**，不是这两张表：
+
+- 账单资产：`asset` 里 `type = 'energy_bill'`，`name` = `BILL-<客户码>-<账期>-<品种>`
+- 账单字段：`attribute_kv` 里 `attribute_type = 2`（SERVER_SCOPE），
+  键包括 `period` / `energy` / `usage` / `amount` / `energyFee` / `basicFee` / `status` / `details` 等
+- 归属：`asset.customer_id`，客户账号靠 TB owner 机制隔离
+
+后端注释原文：「不写 `billing` 表 —— 现有两个消费方（抄表台账的「账单金额」、
+峰谷页的账单交叉表）读的都是资产属性；换表等于把已跑通的链路推倒。」
+
+排查账单请用 `08-ops-sql.md` §6.2c 的 SQL，别去 `billing` 表里找（永远 0 行）。
 
 > 业务扩展表的结构随版本会变，**排查前先用
 > `\d 表名` 看一眼当前列**，不要照旧文档猜。

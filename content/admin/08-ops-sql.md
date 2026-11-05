@@ -19,6 +19,7 @@
 | 设备不在场站/区域/分项下 | §6 归属关系 |
 | 分项显示 kWh 但装的是水表 | §6.2 按品种分键 |
 | **分项/区域能耗页的合计对不上 / 两页数字一样** | §6.2b 统计核算 |
+| **账单金额对不上 / 账单页与分时拆解页金额不同** | §6.2c 账单核算 |
 | 数字是天文数字 | §6.3 哨兵读数 |
 | 抄表读不出表底 | §8 抄表 |
 | 磁盘满了 / 要备份 | §9 表结构与空间、§10 备份 |
@@ -573,6 +574,183 @@ ORDER BY a.type, 区间合计 DESC;
 
 ---
 
+### 6.2c 用能账单的数字怎么核对（含与分时拆解对不上时）
+
+**什么时候用**：客户问「这张单为什么这么多钱」「账单页和分时拆解页金额不一样」
+「账单是不是算错了」。
+
+#### 先记死两件事，否则查出来全是空
+
+**① 账单不在 `billing` 表**
+
+`billing` / `billing_detail` 建好了但**没有任何写入方**（2026-11-06 实测各 0 行），
+按它们查永远是空。账单是**资产**：
+
+| 存什么 | 在哪 |
+| --- | --- |
+| 账单本体 | `asset`，`type = 'energy_bill'`，`name = BILL-<客户码>-<账期>-<品种>` |
+| 账单字段 | `attribute_kv`，`attribute_type = 2`（SERVER_SCOPE） |
+| 归属客户 | `asset.customer_id` |
+
+**② 账单的金额字段存在 `str_v`，不是 `dbl_v`**
+
+这是最容易踩的一条 —— 写成 `kv.dbl_v` 全部返回 NULL，看起来像「账单没数据」。
+
+实测某张账单每个字段的落列（2026-11-06）：
+
+| 存储列 | 字段 |
+| --- | --- |
+| `str_v` | `amount` `energyFee` `basicFee` `powerFactorFee` `surchargeFee` `usage` `ratio` `readingDelta` |
+| `dbl_v` | `dataFrom` `dueDate` `generatedAt` `hourlyPoints` `meterLevel` |
+| `bool_v` | `partialPeriod` |
+| `json_v` | `details` |
+| `str_v`（标识类） | `period` `energy` `unit` `status` `billingNo` `deviceId` `deviceName` `customerId` |
+
+所以取数值一律用（片段，不是完整语句）：
+
+```
+coalesce(kv.dbl_v, nullif(kv.str_v, '')::numeric)
+```
+
+> 手册里的 ```sql 代码块会被 `check-docs.py` **真实执行**校验，
+> 所以纯片段不要标 sql 语言，否则校验会报语法错误。
+
+#### ① 某客户某账期，逐张核对（最常用）
+
+```sql
+SET TIME ZONE 'Asia/Shanghai';
+WITH b AS (
+  SELECT a.id,
+    max(CASE WHEN kd.key='deviceName' THEN kv.str_v END) AS 计量点,
+    max(CASE WHEN kd.key='period'     THEN kv.str_v END) AS 账期,
+    max(CASE WHEN kd.key='energyFee'  THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS 电度,
+    max(CASE WHEN kd.key='basicFee'   THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS 基本,
+    max(CASE WHEN kd.key='powerFactorFee' THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS 力调,
+    max(CASE WHEN kd.key='surchargeFee'   THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS 附加,
+    max(CASE WHEN kd.key='amount'     THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS 应付
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+  JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+  WHERE a.type = 'energy_bill' AND a.customer_id = '<客户id>'::uuid
+  GROUP BY a.id
+)
+SELECT 计量点, 电度, 基本, 应付,
+       round((coalesce(电度,0)+coalesce(基本,0)+coalesce(力调,0)+coalesce(附加,0))::numeric,2) AS 四项之和,
+       round((应付 - (coalesce(电度,0)+coalesce(基本,0)+coalesce(力调,0)+coalesce(附加,0)))::numeric,2) AS 差
+FROM b WHERE 账期 = '2026-11' ORDER BY 应付 DESC;
+```
+
+**判据 ①**：`应付 = 电度 + 基本 + 力调 + 附加`，`差` 应为 **0.00**（浮点四舍五入允许 0.01）。
+
+实测（演示厂区A / 2026-11，19 张全部 `差 = 0.00`）：
+
+| 计量点 | 电度 | 基本 | 应付 |
+| --- | --- | --- | --- |
+| 三相园-1#进线总表 | 12,004.42 | 1,500 | 13,504.42 |
+| 三相园-车间动力总表 | 11,059.27 | 0 | 11,059.27 |
+| 单相园-1#进线总表 | 264.48 | 1,500 | 1,764.48 |
+
+#### ② 汇总构成
+
+```sql
+SELECT count(*) AS 账单数,
+       round(sum(amount)::numeric,2)     AS 应付合计,
+       round(sum(energy_fee)::numeric,2) AS 电度合计,
+       round(sum(coalesce(basic_fee,0))::numeric,2) AS 基本合计,
+       round(sum(coalesce(pf_fee,0))::numeric,2)    AS 力调合计,
+       round(sum(coalesce(sur_fee,0))::numeric,2)   AS 附加合计
+FROM (
+  SELECT a.id,
+    max(CASE WHEN kd.key='amount'     THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS amount,
+    max(CASE WHEN kd.key='energyFee'  THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS energy_fee,
+    max(CASE WHEN kd.key='basicFee'   THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS basic_fee,
+    max(CASE WHEN kd.key='powerFactorFee' THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS pf_fee,
+    max(CASE WHEN kd.key='surchargeFee'   THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS sur_fee
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+  JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+  WHERE a.type='energy_bill' AND a.customer_id = '<客户id>'::uuid
+  GROUP BY a.id) x;
+```
+
+实测：`19 | 56,746.35 | 53,746.35 | 3,000.00 | 0.00 | 0.00`
+（53,746.35 + 3,000 = 56,746.35 ✓，基本电费正好是两张进线表各 1,500）
+
+#### ③ 按月汇总（核对月度趋势）
+
+```sql
+WITH b AS (
+  SELECT a.id,
+    max(CASE WHEN kd.key='period' THEN kv.str_v END) AS period,
+    max(CASE WHEN kd.key='amount' THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS amount
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+  JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+  WHERE a.type='energy_bill' AND a.customer_id = '<客户id>'::uuid
+    AND kd.key IN ('period','amount')
+  GROUP BY a.id)
+SELECT period AS 账期, count(*) AS 账单数, round(sum(amount)::numeric,2) AS 合计
+FROM b GROUP BY period ORDER BY period;
+```
+
+#### ④ 账单是否重复（出账幂等被破坏时）
+
+```sql
+WITH b AS (
+  SELECT a.id,
+    max(CASE WHEN kd.key='period'   THEN kv.str_v END) AS period,
+    max(CASE WHEN kd.key='energy'   THEN kv.str_v END) AS energy,
+    max(CASE WHEN kd.key='deviceId' THEN kv.str_v END) AS device_id
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+  JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+  WHERE a.type = 'energy_bill' GROUP BY a.id)
+SELECT period, energy, device_id, count(*) AS 张数
+FROM b GROUP BY 1,2,3 HAVING count(*) > 1;
+```
+
+**判据 ④**：结果应为**空**。出账幂等靠「资产名 = `BILL-<客户码>-<账期>-<能源>`」，
+重跑只更新属性不新增。出现多行说明资产名规则被改过，或有手工建的账单。
+
+#### 账单页和「分时拆解」页金额不一样 —— 两个数都没错
+
+**实测样例**（三相园-1#进线总表 / 2026-11）：
+
+| 页面 | 显示 | 含义 |
+| --- | --- | --- |
+| 账单明细 | 13,504.42 | **应付金额**（含基本电费） |
+| 分时拆解 | 12,004.41 | **分时电度电费**（按逐时遥测 × 分时单价） |
+| 差额 | **1,500.00** | 就是该表的基本电费 |
+
+**只算电**的全客户核对（2026-11，与上面 ② 的全品种口径不同）：
+
+```
+分时拆解 feeTotal 合计        35,337.36
+全部电费账单 energyFee 合计   35,337.36   ← 完全相等
+全部电费账单 amount 合计      38,337.36
+差额                           3,000.00   ← 两张进线表各 1,500 基本电费
+```
+
+所以界面上有一条对账：`分时电度电费 + 不可分摊 = 应付合计`，
+其中「应付合计」一定与账单明细相等。这两个数永远对不上才是 bug。
+
+**金额对不上时的排查顺序**：
+
+1. 跑 ②，看 `应付合计` 是否等于页面「合计」 —— 不等是页面取数问题；
+2. 相等，再看差额是否正好等于 `基本合计` —— 是则属口径正常，不是 bug；
+3. 都不是，查分时单价与时段方案（见 §7 档案）。
+
+#### 已知坑
+
+| 现象 | 根因 | 判据 |
+| --- | --- | --- |
+| 按 `billing` 表查永远 0 行 | 账单存 `asset` 资产，不写那两张表 | `SELECT count(*) FROM billing` = 0 |
+| SQL 能跑但金额列全是空 | 金额字段在 `str_v`，写成 `kv.dbl_v` | 用 `coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric)` |
+| 账单页总额远大于「实际用电」 | 账单按表逐张出，含上下级重复（总表+分表各一张），供分层分摊 | 见页面绿色「实际用电/实际电费」条 |
+| 客户看不到别人的账单 | TB owner 机制：`asset.customer_id` 隔离 | 租户账号查是全量 |
+
+---
+
 ### 6.3 哨兵读数：真实表底会突然变成 7777.7 / 8888.8
 
 ```sql
@@ -726,8 +904,8 @@ ORDER BY lv.long_v DESC NULLS LAST;
 | 分项能耗 | 分项资产各品种 `*_total` | 选电能时水/气/汽/热为空，正常 |
 | 区域能耗 | 区域资产各品种 `*_total` | 同一台表挂两个区域会双算 |
 | 峰谷分析 | 设备 `energy_reading` 按小时切片 | 与台账口径不同，不是 bug |
-| 用能账单 | `billing` / `billing_detail` | 金额 = 电度 + 基本 + 力调 + 其他 |
-| 抄表台账 | `billing_detail` 或 `energy_reading` 区间差 | 「用量来源」列说明用的是哪种 |
+| 用能账单 | **`asset`（`type='energy_bill'`）+ `attribute_kv`** | 金额 = 电度 + 基本 + 力调 + 其他；**不在 `billing` 表**（空表） |
+| 抄表台账 | `meter_reading_record` / `meter_reading_batch` | 「用量来源」列说明用的是哪种（`source` = auto/manual） |
 | 电能质量 | 设备 `voltage_thd_*` / `unbalance` / `flicker_*` | 逐桶判极值，不用均值 |
 | 告警事件 | `alarm` 表 | 只读未清除的（`clear_ts IS NULL`） |
 
