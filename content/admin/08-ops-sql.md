@@ -18,6 +18,7 @@
 | **设备有数、看板是 0** | §5 资产汇总（最常见） |
 | 设备不在场站/区域/分项下 | §6 归属关系 |
 | 分项显示 kWh 但装的是水表 | §6.2 按品种分键 |
+| **分项/区域能耗页的合计对不上 / 两页数字一样** | §6.2b 统计核算 |
 | 数字是天文数字 | §6.3 哨兵读数 |
 | 抄表读不出表底 | §8 抄表 |
 | 磁盘满了 / 要备份 | §9 表结构与空间、§10 备份 |
@@ -488,6 +489,87 @@ GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
 
 > 「分项能耗」选**电能**时，燃气/水/汽/热分项是空的 —— 这是**正确**的，不是没数据。
 > 切到对应品种才会出数。
+
+---
+
+### 6.2b 分项 / 区域能耗看板的数字怎么核对（统计准确性验收）
+
+**什么时候用**：客户问「这个分布图的数字对不对」「分项和区域两页为什么差不多」
+「合计是不是虚高了」。**不要凭观感点头**，一条 SQL 对到底。
+
+**口径**（先记清这四条，否则算出来必定对不上）：
+
+1. 看板读的是**资产的 `energy_total` 遥测**，不是设备、不是属性表 `attribute_kv`；
+2. `energy_total` 是**每个时间桶的用量**（不是累积表底），所以区间合计 = `SUM`；
+3. 分项与区域是**场站下两套并列分类**（`asset.type` = `分项` / `区域`），
+   同一个场站下两者都存在 —— 交叉混入就会虚高约一倍；
+4. 「按日」档是**单期**（只选一天），所以窗口 = 当天 `00:00` ~ 次日 `00:00`。
+
+```sql
+-- ① 某场站某一天，分项与区域各自的合计（把日期/场站 id 换掉）
+SET TIME ZONE 'Asia/Shanghai';
+WITH win AS (
+  SELECT EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-04 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-05 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+)
+SELECT a.type AS 维度, a.label AS 名称,
+       ROUND(SUM(COALESCE(kv.dbl_v, kv.long_v))::numeric, 2) AS 当日合计,
+       count(*) AS 数据点
+FROM relation r
+JOIN asset a     ON a.id = r.to_id AND r.to_type = 'ASSET'
+JOIN key_dictionary kd ON kd.key = 'energy_total'
+JOIN ts_kv kv    ON kv.entity_id = a.id AND kv.key = kd.key_id
+CROSS JOIN win
+WHERE r.relation_type = 'Contains' AND r.relation_type_group = 'COMMON'
+  AND r.from_id = '<场站资产id>'::uuid
+  AND kv.ts >= win.s AND kv.ts < win.e
+GROUP BY a.type, a.label
+ORDER BY a.type, 当日合计 DESC;
+```
+
+**判据**（这就是「对」的样子）：
+
+- `维度 = 分项` 的行加起来 = 分项能耗页分布图的「总用电量」；
+- `维度 = 区域` 的行加起来 = 区域能耗页分布图的「总用电量」；
+- **两个合计一般不相等**（两套分类各算各的），相等反而说明过滤没生效。
+
+实测样例（演示厂区A / 办公园区 / 2026-11-04）：
+
+| 维度 | 名称 | 当日合计 |
+| --- | --- | --- |
+| 分项 | 照明 | 297.83 |
+| 分项 | 插座 | 0.90 |
+| 区域 | 公共区域 | 406.97 |
+| 区域 | A栋办公区 | 120.56 |
+
+→ 分项页应显示 **298.73**，区域页应显示 **527.53**。
+
+```sql
+-- ② 换区间批量核对（近 N 天，按天出）
+SELECT a.type AS 维度, a.label AS 名称,
+       count(DISTINCT date_trunc('day', to_timestamp(kv.ts/1000) AT TIME ZONE 'Asia/Shanghai')) AS 天数,
+       ROUND(SUM(COALESCE(kv.dbl_v, kv.long_v))::numeric, 2) AS 区间合计
+FROM relation r
+JOIN asset a ON a.id = r.to_id AND r.to_type = 'ASSET'
+JOIN key_dictionary kd ON kd.key = 'energy_total'
+JOIN ts_kv kv ON kv.entity_id = a.id AND kv.key = kd.key_id
+WHERE r.relation_type = 'Contains' AND r.relation_type_group = 'COMMON'
+  AND r.from_id = '<场站资产id>'::uuid
+  AND kv.ts > (extract(epoch from now()) * 1000)::bigint - 7*86400000
+GROUP BY a.type, a.label
+ORDER BY a.type, 区间合计 DESC;
+```
+
+**三个已知的历史坑**（都实测踩过，见到对应现象直接按表处理）：
+
+| 现象 | 根因 | 判据 |
+| --- | --- | --- |
+| 两页数字**完全相同**、合计约虚高一倍 | 消费部件没读 `childType`，分项和区域混算 | 分布图里出现「公共区域」（分项页）或「照明」（区域页） |
+| 趋势图只有坐标轴、y 轴 `0.0~1.0`、一根柱都没有 | 读 `pt.value` 而接口返回 `pt.v` → 全 NaN | 浏览器里 `svg rect` 数为 0 |
+| 趋势图空白，但分布图有数 | 趋势图下钻到叶子资产，而数据只到父级 | 叶子资产该区间 `energy_total` 为空 |
+
+> 前两条是 2026-11-05 修掉的（`distribution_chart` / `asset_stats_chart`），
+> 第三条同时修（趋势图在维度约束下不再下钻，与分布图同口径）。
 
 ---
 
