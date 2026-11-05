@@ -115,7 +115,7 @@ document.querySelectorAll('.mat-mdc-form-field').length
 
 ```bash
 cd ui-ngx
-node esbuild/check-widget-deps.mjs          # 必须先过：584 个模板，缺一个就退出码 1
+node esbuild/check-widget-deps.mjs          # 必须先过：585 个模板，缺一个就退出码 1
 ./node_modules/.bin/ng build --configuration production   # 约 4-5 分钟
 cd ../guard-server && mvn -o package -DskipTests          # 把前端打进 jar
 cp target/guard-server-4.4.0.jar ~/energy-app/

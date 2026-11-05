@@ -248,7 +248,7 @@ cd ../guard_help && git add -A && git commit -m 'update manual' && git push
 cd ui-ngx
 
 # ── 0. 先过部件依赖自检（2026-11-04 加，必跑）
-#    584 个部件模板里的管道 / 结构指令 / Material 控件，是否都在动态组件
+#    585 个部件模板里的管道 / 结构指令 / Material 控件，是否都在动态组件
 #    imports 的作用域里。缺管道的后果是「整页空白且几乎不报错」，
 #    缺 Material 的后果是「全站控件没样式」。
 node esbuild/check-widget-deps.mjs
