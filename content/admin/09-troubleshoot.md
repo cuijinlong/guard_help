@@ -482,6 +482,22 @@ th:not([mat-header-cell]) { font-size: 16px; }                        /* (0,1,1)
 | 又英文（`29/10/2026`、`OCT 2026`） | 全局 `MAT_DATE_LOCALE` 是 `'en-GB'` | 组件级 `providers` 覆盖 `DateAdapter` + `MAT_DATE_FORMATS`，不动全局 |
 | 日期格子写「1日 2日」 | `NativeDateAdapter.getDateNames()` 用 `Intl` 的 `day:'numeric'`，zh-CN 下就是 `"1日"` | 覆写 `getDateNames()` 返回 `['1','2',…,'31']` |
 | `Close calendar` / `2003 to 2026` | `MatDatepickerIntl` 是英文默认值 | 组件级覆盖 `MatDatepickerIntl` |
+| 必须点右侧日历图标才弹出 | Material 默认行为（点输入框只聚焦） | input 加 `(click)="openPicker(dp)"` |
+
+**「点输入框就弹出」只能用 `click`，不能用 `focus`**：
+
+`MatDatepicker.restoreFocus` 默认 true，面板关闭后把焦点还给 input ——
+绑在 `focus` 上会立刻重新 `open()`，变成关不掉的死循环。
+`open()` 本身幂等（`_opened` 为真直接 return），重复点击不会闪。
+`_onBlur()` 只重格式化输入值、不关闭面板，所以焦点被日历拿走也不会关掉。
+
+**判据**：
+
+```js
+inp.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+!!document.querySelector('.mat-datepicker-content');   // true
+// 连采 3 秒，open/closed 翻转次数应为 0（>2 就是 focus 死循环）
+```
 
 三个都只在 `<energy-date-picker>` 里生效，**不改 Material 源码、不动全局 token**。
 
