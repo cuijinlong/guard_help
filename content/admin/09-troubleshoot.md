@@ -725,6 +725,109 @@ GET: /api/relations?fromId=00000000-0000-0000-0000-0000000005a1&fromType=ASSET&r
 > 而 `resolveRootFromDs` 的 `singleEntity` 分支校验了** —— 两条路径不对称
 > 本身就是 bug。如果以后再加“从上下文取根节点”的路径，记得也过一遍 brief。
 
+### 基础报表点「按分组维度」报 `/api/device/…d102 404`（2026-11-07 实测修复）
+
+**症状**：客户账号打开「基础报表」，在查询设置里点「按分组维度」，
+页底弹红条：
+
+```
+GET: /api/device/00000000-0000-0000-0000-00000000d102
+404: OK
+```
+
+「我的账单」「区域能耗」「历史能耗」同样中招（凡是用四个维度根作数据源的看板）。
+
+**根因有两层，缺一层都修不好。**
+
+**① 客户看板里的维度根还是占位符（数据层）**
+
+`00000000-…-d101~d104` 是四个**维度根**的母版占位符（对应
+用能分项 / 用能区域 / 能耗类型 / 空间位置），复制看板给客户时应该换成客户的真实 id。
+
+实测发现客户的「基础报表」副本与租户模板**字节完全一致（3897 B）** ——
+一个字符都没替换。而库里四个维度根都在，且都有 `energyRoot:true`；
+时间戳也对得上（根 00:29:40 建、副本 00:32:29 复制，根更早）。
+
+**为什么替换没生效**：`buildDashboardPlaceholders` 里那段 d101~d104 的映射
+正常应按 `findDimensionRoot`/名字兜底逐个填，但只要有一个根取不到就**整项不填**
+（代码里是 `if (root != null) ph.put(...)`，没有“取不到就报错”）。
+结果是看板复制成功、场站别名正常替换（`05a1`），**只有 entityList 里的维度根被漏掉** ——
+所以现象很隐蔽：页面能打开，只是部件去查一个不存在的 id。
+
+**② 首装流程从不调 `repair-init`（流程层）**
+
+`repairCustomerDashboards()` 就是干这个的：把客户看板里残留的占位符补成真实 id（幂等）。
+但只有 `09-onboard-customer.sh`（建**新客户**时）会调它；
+**首装走的 `docker-02-start.sh` → `02-onboard.sh` 从来没调过** ——
+于是全新部署出来的演示客户必定带着这批占位符。
+
+**修法**
+
+```bash
+# 一次性把那批残留补好（幂等，顺手修拓扑/菜单/标签）
+curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/energy/repair-init \
+  -H "X-Authorization: Bearer $TOKEN" | python3 -m json.tool | grep -i dashboardsFixed
+# 期望："dashboardsFixed": 11
+```
+
+`02-onboard.sh` 已补上两步（在验证段末尾）：
+
+1. 自动调一次 `repair-init`（与 `09-onboard-customer.sh` 对齐）
+2. **新增占位符残留检查** —— 除 `11b7`（能源参数字典）/ `e1ec`（电能品种）
+   这两个故意保留的租户级哨兵外，客户看板里再出现 `00000000-…-xxxx` 就报错
+
+> **为什么 `11b7` / `e1ec` 不算残留**：它们是**租户级**资产，客户账号直接读会 403，
+> 部件走 `/api/energy/metric-params` 取品种，不依赖这两个实体。
+> 换成真实 id 反而会把 403 引回来 —— 详见 `buildDashboardPlaceholders` 的长注释。
+
+**部件侧也改了（第二道防线）**
+
+`energy_management.query_panel` 原先对 entityList 里每个 id 做两级试探：
+先 `GET /api/asset/<id>`，失败再 `GET /api/device/<id>` ——
+占位符两个都 404，全局拦截器就弹两条红条。现在改成
+`POST /api/entitiesQuery/find` 带 entityList 过滤器一次解析：
+
+| | 旧（逐个试探） | 新（服务端一次解析） |
+| --- | --- | --- |
+| 全占位符 | 8 个 404 + 2 条红条 | 1 个 200，`data:[]` |
+| 4 个真实根 | 4 个请求 | 1 个请求 |
+| 类型识别 | 靠 404 回退猜 | 服务端回填 `entityType` |
+
+> **`singleEntity` 分支不能照搬**：那里的占位符 `11b7` 是租户级字典，
+> 客户查它会 403。保持“不发请求”才是对的。
+
+**⚠️ 一个连带回归（已修）**：数据修好、真实 id 能解析出来后，
+下拉默认选中却落到了**品种根**（树只有一个「电能」节点）。
+因为 `finRoots` 靠 `isDimLib` 标记找第一个维度库，而别名解析回来的项只有
+`{id, type:'ASSET', name}`，不带这个标记。之前一直是 `libRoots()` 兜底顶着（它自带标记），
+占位符换成真实 id 后反而暴露出缺失。已在 `finRoots` 里用 `assetTypeMap` 反查补上，
+并按 `DIM_LIB_TYPES` 排序（与兜底路径顺序一致）。
+
+**判据**（客户「基础报表」）：
+
+```js
+// ① 点「按分组维度」后，下拉默认应是「用能分项」而不是「电能」
+[...document.querySelectorAll('.widget-type-system-energy_management-query_panel mat-select .mat-mdc-select-value-text')]
+  .map(e=>e.textContent.trim());   // 期望含 '用能分项'
+
+// ② 展开首节点，应列出分项（照明/插座/给排水/炊事/蒸汽/空调 —— 实测 7 行）
+document.querySelectorAll('.widget-type-system-energy_management-query_panel .eqp-node').length;
+```
+
+**实测结果**
+
+| 场景 | 结果 |
+| --- | --- |
+| 客户「基础报表」`297c81f0` 点分组维度 | 无 404，下拉「用能分项」，展开 7 行分项 |
+| 同上看板点设备层级 | 无 404，树 5 行（办公园区 → 进线总表 → 三台设备） |
+| 租户模板「基础报表」`9d32ec30`（占位符仍在） | 无 404，下拉「用能分项」 |
+| 客户「我的账单」`2971d390` / 「历史能耗」`29781520` | 无 404，树 5 行 |
+| `repair-init` 前后 | `dashboardsFixed=11`，残留检查由“3 份”转空 |
+
+> **顺手记**：容器内 `09-onboard-customer.sh` 与新客户端两条路都调 repair-init，
+> 但首装这条从来没调 —— 以后新增“建客户”入口，记得把 repair-init 一并接上，
+> 或直接依赖 `02-onboard.sh` 的残留检查报错。
+
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
 **症状**：看板框架、筛选条、KPI 卡片都在，但数字全 0，
