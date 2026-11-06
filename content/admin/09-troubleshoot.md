@@ -888,6 +888,130 @@ else if (filter && filter.type === 'entityList' && filter.entityList && filter.e
 > `entityList` 的元素是**字符串**，`singleEntity` 才是对象 `{id, entityType}`。
 > 两者混写就是上面这个 bug。
 
+### 品种资产能不能当取数目标（`usable()` 到底在防什么）
+
+`overview_stats` / `calendar_heatmap` 里有个 `usable(id)`，同时挡两类东西：
+品种 id、`00000000-…` 占位符。占位符那条一目了然，品种那条值得写清楚 ——
+因为原注释归因错了，后人照它会误判。
+
+**结论：只能防“空数据”，不是防越权。**
+
+| 原注释的说法 | 实测（2026-11-07） |
+| --- | --- |
+| 品种的 Contains 子节点横跨同租户所有客户 | ✓ 数据上确实如此（电能下挂着 18 个本客户节点） |
+| 遍历子树会读到别的客户的分项（越权） | ✗ **不成立**。服务端 `/api/relations` 已按客户过滤 |
+| 客户读租户级实体 `GET /api/asset/<id>` 返 403 | ✗ **不一定**（见下方 cache 一节） |
+
+证明方式（两个都实测过）：
+
+```bash
+# ① 客户查租户级「电能」的 Contains —— 只回自己的 18 个
+curl -s --noproxy '*' \
+  "http://127.0.0.1:8090/api/relations?fromId=9ec5e840-d7a2-11f1-b139-b367a33eb8e4&fromType=ASSET&relationType=Contains" \
+  -H "X-Authorization: Bearer $CUSTOMER_TOKEN" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))'
+
+# ② 造一个“别家客户”的资产挂到电能下，再用客户账号试读
+#    详情 403、遥测 403，且它根本不出现在 ① 的列表里
+```
+
+**那为什么还必须排除品种**：品种资产只有 `paramDict` 属性，**从不采集遥测**。
+拿它当取数目标 `GET .../values/timeseries` 返回 `{}` → 卡片显示空/0。
+就这一个理由，与安全无关。
+
+**⚠ 一个容易误判的现象：客户读租户级资产的 200/403 不一致**
+
+实测同一时刻、同一租户级（`customer_id = NULL_UUID`）的资产：
+
+| 资产 | 客户读 `GET /api/asset/<id>` |
+| --- | --- |
+| 电能（品种） | **200** |
+| 能源参数字典 | **200** |
+| 工商业分时电价（费率模板） | **200** |
+| 费率模板（库） | 403 |
+| 厂商 ABB | 403 |
+| 设备型号 ACREL DTSD1352 | 403 |
+
+差别不在资产本身，而在 **owners cache**：`DefaultOwnerService.fetchOwners`
+把“这个实体的 owner 集合”缓存在 `ENTITY_OWNERS_CACHE`。演示数据初始化时
+这些资产曾属于客户，后来 `customerId` 被改回 `NULL_UUID`，但 **cache 没失效** ——
+旧记录还在，权限判断就放行。重启 energy-server（cache 变冷）后会统一变 403。
+
+实测印证：重启前电能 200；重启后客户视角探针仍然全绿，因为部件取品种走的是
+`/api/energy/metric-params`，本来就不依赖读这些实体。
+
+> **落规矩**：
+> 1. 不要拿“客户读得到 / 读不到租户级资产”当分支依据 —— 它随 cache 状态变。
+> 2. 部件需要品种名/单位 → 一律走 `/api/energy/metric-params`，别直接读资产。
+> 3. `usable()` 的品种守卫保留（防空数据），但**不要**用它去论证“防越权”。
+
+**顺手做的加固（代码层）**：`kindId` 改成两个来源兜底：
+
+```js
+// 原来：kind 为 null 时守卫静默失效
+var kindId = (kind && kind.id) || null;
+// 现在：多一个状态键兜底，不依赖“调用方先等 loadKindInfo 回来”这个约定
+var kindId = (kind && kind.id) || p.sourceId || null;
+```
+
+当前没有可达的触发路径（`analysis_bar` 与 `query_panel` 都同时写
+`sourceId` 与 `entityId`），所以这是**纯防御性改动**，实测行为完全一致：
+加固前后都是今日 57.8 / 本月 1191.9 / 今年 8418.9。
+
+### ⚠ 别在生产库上建“临时客户”做测试（2026-11-07 亲身踩坑）
+
+为了验证越权，我用 API 建了一个临时客户，结果造成 20 分钟的排障和事故：
+
+**事故链**：
+
+1. `POST /api/customer` 触发 `EnergyBootstrapInstaller.onCreateCustomer` →
+   **自动铺整套演示数据**（场站、维度根、分项、组织、 56 万条遥测）
+2. 我删客户时只 `DELETE FROM customer` → **TB 不级联删资产**，19 个资产、
+   21 台设备、56 万遥测点全成了无主孤儿
+3. 这些孤儿资产的 `customerId` 指向已删客户 → 后端每轮汇总报
+   `AssetTotals validation: Can't assign asset to non-existent customer!`
+4. 更诡异的是：**客户「能耗概览」的 KPI 变成了全 0.0**
+   （之前 49.1 / 1183.2 / 8410.2）。拦截请求才发现部件去查的是
+   `7c636460-…` —— 那个临时客户名下的「单相园区」场站
+
+**为什么看板会指向临时客户的场站**：现场站列表/状态链路把无主孤儿场站
+当成了可用场站，选中后就拿它当统计范围。它没有任何遥测 → 全 0。
+
+**正确做法**（测越权不要建客户）：
+
+- 直接查权限源码 + 读现成数据判关系过滤（本次就是这么定的结论）
+- 必须造数据时，用**租户级资产**（`customer_id = NULL_UUID`），不碰客户
+- 真要建客户，测完按下面顺序清：
+
+```bash
+ZZ=<客户id>
+# 1) 遥测（latest + 主表）
+DELETE FROM ts_kv_latest WHERE entity_id IN (
+  SELECT id FROM asset WHERE customer_id='$ZZ')
+  OR entity_id IN (SELECT id FROM device WHERE customer_id='$ZZ');
+DELETE FROM ts_kv WHERE entity_id IN (
+  SELECT id FROM asset WHERE customer_id='$ZZ')
+  OR entity_id IN (SELECT id FROM device WHERE customer_id='$ZZ');
+# 2) 关系（资产/设备 + 实体组→客户 那条）
+DELETE FROM relation WHERE from_id IN (SELECT id FROM asset WHERE customer_id='$ZZ')
+  OR to_id IN (SELECT id FROM asset WHERE customer_id='$ZZ')
+  OR to_id='$ZZ';
+# 3) 设备 → 资产 → 客户
+delete from device where customer_id='$ZZ';
+delete from asset  where customer_id='$ZZ';
+delete from customer where id='$ZZ';
+# 4) ★ 必须重启：owners cache 里还留着这些实体的旧 owner
+cd ~/energy-app && docker compose --profile split restart energy-server
+```
+
+> **验证清干净了吗**（四个都应返回 0）：
+> `SELECT count(*) FROM asset WHERE customer_id='<id>'`、
+> `... FROM device`、`... FROM relation WHERE from_id::text LIKE '%<id前缀>%'`、
+> `... FROM dashboard WHERE customer_id='<id>'`。
+>
+> **对比清理前后别只看看板** —— 这次就是看板显示 0.0 才发现问题的。
+> 清前清后各跑一次：`SELECT count(*) FROM ts_kv WHERE entity_id IN
+> (SELECT id FROM asset WHERE customer_id='<正式客户>')`。
+
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
 **症状**：看板框架、筛选条、KPI 卡片都在，但数字全 0，
