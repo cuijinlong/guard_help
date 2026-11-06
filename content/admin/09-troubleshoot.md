@@ -660,6 +660,71 @@ Math.round(ff.getBoundingClientRect().top - item.getBoundingClientRect().top);  
 > 只压上面是刻意的。2560 宽下方会留 50px，但客户要的是「有点间距就好，不要太过」，
 > 上下都夹死反而更难看。
 
+### 页面底部挂红条「…0000000005a1 … 404: OK」（2026-11-07 实测修复）
+
+**症状**：打开**租户级**看板模板（不是客户副本）时，底部有条红色错误条：
+
+```
+GET: /api/relations?fromId=00000000-0000-0000-0000-0000000005a1&fromType=ASSET&relationType=Contains
+404: OK
+```
+
+「能耗概览」「实时能耗」各一条；客户账号看不到（他们的副本已换绑真实场站）。
+
+**根因**：`00000000-0000-0000-0000-0000000005a1` 是**母版占位符**
+（`EnergyBootstrapInstaller.SITE_PLACEHOLDER`），库里**故意没有**这个资产 ——
+它的用途是复制看板给客户时被 `substitutePlaceholders` 换成该客户的实际场站。
+租户级模板永久保留占位符，于是模板自己被打开时就指向了不存在的实体。
+
+**为什么 `fetchChildren` 已经有 error 回调还弹条**：那回调只能防组件崩溃。
+弹条是 `ui-ngx/src/app/core/interceptors/global-http-interceptor.ts` 对**所有**
+非 2xx 的统一行为（除非请求带 `ignoreErrors: true`），订阅侧抑制不了。
+**唯一办法是根本不发这个请求。**
+
+**修法**（已改，两个部件）：拿到数据源别名/场站上下文给的 id 后，先走
+批量 brief（`/api/energy/entity-briefs`）确认实体存在，不存在就回空态：
+
+| 部件 | 位置 | 原行为 |
+| --- | --- | --- |
+| `energy_management.ranking_list` | `resolveFromDs` 末尾 | `cb({id, type})` 直接用 |
+| `energy_management.analysis_bar` | `resolveRoot` 的场站分支 | `done([{id: site}])` 直接用 |
+
+批量接口对未知 id 返回 **200 + 空 items**（实测），不会再制造 404。
+`briefCache` 命中后净增 0 次请求 —— 紧接着的 `loadName` 查同一个 id。
+
+> **为什么不建一个 id 为 `...05a1` 的假资产**：那样 404 变成静默空数据。
+> 客户看板若因故残留占位符（客户还没建场站时 `repairCustomerDashboards`
+> 会跳过），指向假资产比报错更难查。空态 + 诚实提示才是对的。
+
+**判据**：
+
+```bash
+# 租户级「能耗概览」打开后，控制台不应出现下列 URL
+# /api/asset/00000000-0000-0000-0000-0000000005a1
+# /api/relations?fromId=00000000-0000-0000-0000-0000000005a1
+
+# 客户看板必须仍有数据（护拦不能误伤）——「能耗概览」排名应 7 行
+```
+
+```js
+// 客户看板：排名列表仍要有行
+[...document.querySelectorAll('.widget-type-system-energy_management-ranking_list .eqrk-row')].length;  // 期望 7
+```
+
+**验证场景**（都实测过）
+
+| 场景 | 结果 |
+| --- | --- |
+| 租户级模板「能耗概览」`9d6df960` | 无 404，空态，第一排 46px/上留白 6px |
+| 租户级模板「实时能耗」`9d612820` | 无 404 |
+| 客户「能耗概览」`29997fd0` | 无 404，排名 7 行，KPI 有真值 |
+| 客户「分项能耗」/「区域能耗」 | 无 404，排名 3 行 / 1 行 |
+| cookie 里塞失效场站 id | 顶栏自行纠回「办公园区」，无 404 |
+
+> 顺手记下一条：**`analysis_bar` 的场站分支原先不校验实体存在性，
+> 而 `resolveRootFromDs` 的 `singleEntity` 分支校验了** —— 两条路径不对称
+> 本身就是 bug。如果以后再加“从上下文取根节点”的路径，记得也过一遍 brief。
+
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
 **症状**：看板框架、筛选条、KPI 卡片都在，但数字全 0，

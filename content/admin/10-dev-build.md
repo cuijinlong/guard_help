@@ -265,6 +265,42 @@ cd ../../guard-server && mvn package -DskipTests -o
 > 前端改动**不能用增量脚本**：`ui-ngx` 是独立的 jar 依赖，
 > `jar uf` 改不了嵌套 jar 里的资源。
 
+### ⚠ 部件 JSON 的真实来源：`widget_types/*.json` 本身，不是生成器
+
+`nenghaobao/widgets/build-*.mjs` 里有几个脚本会写
+`guard-server/src/main/data/json/system/widget_types/*.json`：
+
+| 生成器 | 写哪个部件 |
+| --- | --- |
+| `build-energy-analysis.mjs` | `energy_management_analysis_bar.json` |
+| `build-energy-analysis-results.mjs` | `energy_management_ranking_list.json` 等 |
+
+**但这些生成器已经落后于产物了，不要重跑。** 实测对比（2026-11-07）：
+
+| 特征 | 产物里有 | 生成器里有 |
+| --- | --- | --- |
+| `activeSiteId` | ✓ | ✗ |
+| `externalSiteCtx` | ✓ | ✗ |
+| `watchExternalSite` | ✓ | ✗ |
+| `assetTypeCache` | ✓ | ✗ |
+
+这些都是 2026-10-25 之后加进产物的（顶栏场站跟随、批量 brief、缓存）。
+重跑 `build-energy-analysis.mjs` 会把 `analysis_bar` **回退到十月底的旧版**：
+场站不跟顶栏、每个节点单查一次实体，整页卡十几秒。
+
+**改部件的正确姿势只有两条**：
+
+```bash
+# ① 直接改产物 JSON（它已入 git，是唯一真相源），然后用部署脚本推库
+vim guard-server/src/main/data/json/system/widget_types/energy_management_xxx.json
+bash shiyongshouce/downloads/scripts/31-deploy-widget.sh --yes energy_management_xxx
+
+# ② 新增部件才用生成器（生成完就不再回头跑）
+```
+
+> `nenghaobao/` 在 `.gitignore` 里，生成器不在版本控制内；
+> 而 `widget_types/*.json` 是入库的。真正需追溯的历史看 git log 就好。
+
 ---
 
 ## 五、还能再快吗
