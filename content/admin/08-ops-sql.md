@@ -826,12 +826,26 @@ curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
   -d '{"period":"2026-11","devices":["<设备id>","<设备id>"]}' \
   http://127.0.0.1:8090/api/energy/billing/generate
 
-# 删单（可重出）
+# 删单（可重出）—— 只删指定设备
 curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"period":"2026-11","devices":["<设备id>"]}' \
   http://127.0.0.1:8090/api/energy/billing/delete
+
+# 清空整个账期 —— 必须显式 all:true
+curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"period":"2026-11","all":true}' \
+  http://127.0.0.1:8090/api/energy/billing/delete
 ```
+
+> ⚠ **不传 `devices` 必须带 `"all": true`**，否则返回
+> `400 未指定 devices 时会清空整个账期的账单。确认要这么做请加 "all": true`。
+> 这道门槛是故意的：删单不可撤销，而「拼错 id 数组 → 空数组 → 全量删」
+> 是最容易发生的误用。让「我要删整月」变成一句必须写出来的话。
+>
+> 实测 2026-11：`all:true` 一次删掉 19 张（`deleted=19`），
+> 库内 `asset` 与 `attribute_kv` 都清干净，无孤属性残留。
 
 「设备设成了不参与厂站能耗计算」也会让出账跳过它，原因写在 `items[].reason` 里。
 这是 2026-11-06 新增的排除 —— 与资产汇总、峰谷分析同一口径
