@@ -62,7 +62,15 @@ done
 # 光靠人手同步两处必然漂移。这里声明一次，脚本结尾自校验，
 # check-docs.py 也读这里去比对手册。
 # **改检查项时同步改这个数**（少改 → 结尾会报「项数与预期不符」）。
-EXPECTED_PASS=85
+# 通过项数的**下限**（不是精确值）。
+#
+# 原来这里是 EXPECTED_PASS=<精确数>，跑完要求 PASS 与之相等。
+# 但通过数本来就会随环境合理漂移，精确比对把正常差异报成了「脚本被改过」：
+#   · 没传客户账号 → 客户侧 8 项跳过（不计 PASS）
+#   · 本库没有虚拟表 / 没有拓扑图 / 本月还没抄表 → 又少几项
+#   · 传了客户账号 → 那些跳过项转成 PASS，数字又变大
+# 真正的质量门只有一条：**FAIL == 0**。下限只用来防「检查项被误删一大片」。
+MIN_PASS=55
 
 PASS=0 ; FAIL=0 ; FAILED_ITEMS=()
 
@@ -159,8 +167,29 @@ eq "电能二级 key" "${L2:-0}" "48" \
    '同上。低于 48 通常是缺 voltage_avg / current_avg 两个汇总项'
 has "相电压含平均项"  "$ELEC" '"voltage_avg"' '字典升级没跑到：确认后端版本，或重建租户'
 has "相电流含平均项"  "$ELEC" '"current_avg"' '同上'
-eq "能源品种数" "$(echo "$MP" | jget "print(len(d.get('kinds',[])))")" "4" \
+# 品种数要分两个口径，不能只数一个 4：
+#   · 不带参数（运营配置：品种指标 / 设备建档 / 厂牌型号）→ 全集，
+#     含 heat（热力）以及 env/cooling/air 三个「非用能品种」的一级类型。
+#     这些是主数据维护入口，被过滤掉就配不了二级类型（2026-11-01 客户指出）。
+#   · energyOnly=true（查询/报表部件）→ 只要用能品种 = 电/水/气/汽/热 = 5。
+#     env/cooling/air 必须被滤掉，否则下拉里出现「环境系统」，
+#     选中必然一片空（2026-11-04 客户指出）。
+#
+# 原来断言「= 4」是 2026-10 的口径（那时还没加「热力」）。
+MP_ENERGY=$(TAPI '/api/energy/metric-params?energyOnly=true')
+N_ALL=$(echo "$MP" | jget "print(len(d.get('kinds',[])))")
+N_ENERGY=$(echo "$MP_ENERGY" | jget "print(len(d.get('kinds',[])))")
+ENERGY_CODES=$(echo "$MP_ENERGY" | jget "print(','.join(sorted(k.get('code','') for k in (d.get('kinds') or []))))")
+ge "能源品种数（全集，运营配置用）" "${N_ALL:-0}" "5" \
    '字典缺品种：重建租户或一键修复'
+eq "用能品种数（energyOnly，查询/报表用）" "${N_ENERGY:-0}" "5" \
+   "期望 elec,gas,heat,steam,water 五个。实际：${ENERGY_CODES:-空}"
+if printf '%s' "$ENERGY_CODES" | grep -q 'env\|cooling\|air'; then
+  bad "energyOnly 仍返回非用能品种（${ENERGY_CODES}）" \
+      'env/cooling/air 必须被 energyOnly=true 滤掉：查 node.path("isEnergy") 判断'
+else
+  ok "energyOnly 正确滤掉 env/cooling/air"
+fi
 
 # ================================================================
 sec "C. 计算字段（告警 + 派生指标）"
@@ -235,50 +264,68 @@ ge "闲时能耗超标告警（历史累计）" "${IDLE_ALARM:-0}" "1" \
    '计算字段没被触发：确认 persistDaily 走的是 telemetrySubscriptionService（直写 DAO 不会触发）'
 
 # 客户费率：价格现在由客户自己维护，模板不再是必经来源。
-CUST_RATES=$(curl -s --noproxy '*' -m 20 "$BASE/api/energy/rate-policies" \
-  -H "X-Authorization: Bearer $CTOK" 2>/dev/null)
-if printf '%s' "$CUST_RATES" | grep -q '"customerRates"'; then
-  ok "客户费率接口返回 customerRates"
+#
+# ★ 客户侧检查都必须先有客户 token（2026-11-07 修）。
+#   空 CTOK 时 curl 发的是 `X-Authorization: Bearer ` （带空值），
+#   服务端不返回 401 而是 **302 重定向到登录页** —— 于是每项都被判成
+#   「缺字段 / 返回 302 / 校验被绕过」，看起来像后端有 bug，
+#   实际只是没传客户账号（--customer / --customer-pass）。
+#   实测：不带客户账号 → 四项全红；带上 → 四项全绿。
+#   注意夹在中间的「组织数 / 挂在组织下的场站」是纯 SQL，与 token 无关，
+#   不能被一起跳过 —— 所以按依赖拆成四段，各管各的。
+if [[ -z "$CTOK" ]]; then
+  printf '  \033[33m  - 跳过客户费率接口检查（未提供客户账号：加 --customer/--customer-pass）\033[0m\n'
 else
-  bad "客户费率接口缺少 customerRates 字段" \
-      '后端没重启到新版本：确认 EnergyRatePolicyController 里有 readCustomerRates'
-fi
+  CUST_RATES=$(curl -s --noproxy '*' -m 20 "$BASE/api/energy/rate-policies" \
+    -H "X-Authorization: Bearer $CTOK" 2>/dev/null)
+  if printf '%s' "$CUST_RATES" | grep -q '"customerRates"'; then
+    ok "客户费率接口返回 customerRates"
+  else
+    bad "客户费率接口缺少 customerRates 字段" \
+        '后端没重启到新版本：确认 EnergyRatePolicyController 里有 readCustomerRates'
+  fi
 
-N_RATES=$(printf '%s' "$CUST_RATES" | jget "
+  N_RATES=$(printf '%s' "$CUST_RATES" | jget "
 cr = d.get('customerRates') or {}
 print(len(cr))
 ")
-# 费率：**新客户未填价是正常状态**，不判失败。
-#
-# 平台免费、不向客户收费，费率是客户自己用来算成本的分析参数。
-# 客户刚入驻时没填，不能算缺陷 —— 之前这里要求 ≥1，会让「全新部署」的验收
-# 必然挂一项，运维反复怀疑是自己部署错了。
-#
-# 填了就要能读到（这是真检查）；没填就明说没填。
-if [[ "${N_RATES:-0}" -ge 1 ]]; then
-  ok "客户已填费率的品种数（${N_RATES}）"
-else
-  ok "客户尚未填费率（正常：新客户，客户可在「能源建档」里自行填写）"
+  # 费率：**新客户未填价是正常状态**，不判失败。
+  #
+  # 平台免费、不向客户收费，费率是客户自己用来算成本的分析参数。
+  # 客户刚入驻时没填，不能算缺陷 —— 之前这里要求 ≥1，会让「全新部署」的验收
+  # 必然挂一项，运维反复怀疑是自己部署错了。
+  #
+  # 填了就要能读到（这是真检查）；没填就明说没填。
+  if [[ "${N_RATES:-0}" -ge 1 ]]; then
+    ok "客户已填费率的品种数（${N_RATES}）"
+  else
+    ok "客户尚未填费率（正常：新客户，客户可在「能源建档」里自行填写）"
+  fi
 fi
 
 # 保存接口探活：故意发一个**不合法**的费率（单一制缺单价），
 # 期望 400 —— 既证明接口存在，又不会改到客户已有的价格。
 # 千万别用 {"rates":{}} 探活：那是合法的空覆盖，会把客户填的价清空。
-CODE=$(curl -s --noproxy '*' -m 15 -o /dev/null -w '%{http_code}' \
-  -X POST "$BASE/api/energy/customer-rate" \
-  -H "X-Authorization: Bearer $CTOK" -H 'Content-Type: application/json' \
-  -d '{"rates":{"__probe__":{"rateType":"flat"}}}')
-if [[ "$CODE" == "404" ]]; then
-  bad "客户费率保存接口不存在（404）" '后端是旧版：重新打包并重启 energy-server'
-elif [[ "$CODE" == "400" ]]; then
-  ok "客户费率保存接口可用（非法输入按预期拒绝 400）"
+if [[ -z "$CTOK" ]]; then
+  printf '  \033[33m  - 跳过客户费率保存探活（未提供客户账号）\033[0m\n'
 else
-  bad "客户费率保存接口异常（HTTP ${CODE}，期望 400）" \
-      '校验逻辑可能被绕过：检查 validateCustomerRate'
+  CODE=$(curl -s --noproxy '*' -m 15 -o /dev/null -w '%{http_code}' \
+    -X POST "$BASE/api/energy/customer-rate" \
+    -H "X-Authorization: Bearer $CTOK" -H 'Content-Type: application/json' \
+    -d '{"rates":{"__probe__":{"rateType":"flat"}}}')
+  if [[ "$CODE" == "404" ]]; then
+    bad "客户费率保存接口不存在（404）" '后端是旧版：重新打包并重启 energy-server'
+  elif [[ "$CODE" == "400" ]]; then
+    ok "客户费率保存接口可用（非法输入按预期拒绝 400）"
+  else
+    bad "客户费率保存接口异常（HTTP ${CODE}，期望 400）" \
+        '校验逻辑可能被绕过：检查 validateCustomerRate'
+  fi
 fi
 
 # 组织层：客户侧维护费率的立足点。
 # 没有组织，客户登录后进不去「组织 → 能源费率」，只能靠客户级兜底。
+# ★ 纯 SQL，与客户 token 无关 —— 不受上面的跳过影响。
 ORG_N=$(DASH_DB "SELECT count(*) FROM asset WHERE type='组织';" | tr -d ' ')
 ge "组织数" "${ORG_N:-0}" "1" \
    '客户侧没有组织 → 「能源费率」页签无处可挂：跑「平台自检 → 一键修复初始化」补建'
@@ -293,16 +340,20 @@ ge "挂在组织下的场站" "${ORG_SITE:-0}" "1" \
 # 探活：传一个**非法 UUID**，期望 400。
 # 不能用「不存在的组织 uuid」——那也返回 404（ITEM_NOT_FOUND），
 # 和「接口不存在」的 404 分不开，会误报。
-org_ok=$(curl -s --noproxy '*' -m 15 -o /dev/null -w '%{http_code}' \
-  -X POST "$BASE/api/energy/org-rate" \
-  -H "X-Authorization: Bearer $CTOK" -H 'Content-Type: application/json' \
-  -d '{"orgId":"not-a-uuid","energyRates":{}}')
-if [[ "$org_ok" == "400" ]]; then
-  ok "组织费率保存接口可用（非法 orgId 按预期拒绝 400）"
-elif [[ "$org_ok" == "404" ]]; then
-  bad "组织费率保存接口不存在（404）" '后端是旧版：重新打包并重启 energy-server'
+if [[ -z "$CTOK" ]]; then
+  printf '  \033[33m  - 跳过组织费率保存探活（未提供客户账号）\033[0m\n'
 else
-  bad "组织费率保存接口异常（HTTP ${org_ok}，期望 400）" '检查 saveOrgRate 的参数校验'
+  org_ok=$(curl -s --noproxy '*' -m 15 -o /dev/null -w '%{http_code}' \
+    -X POST "$BASE/api/energy/org-rate" \
+    -H "X-Authorization: Bearer $CTOK" -H 'Content-Type: application/json' \
+    -d '{"orgId":"not-a-uuid","energyRates":{}}')
+  if [[ "$org_ok" == "400" ]]; then
+    ok "组织费率保存接口可用（非法 orgId 按预期拒绝 400）"
+  elif [[ "$org_ok" == "404" ]]; then
+    bad "组织费率保存接口不存在（404）" '后端是旧版：重新打包并重启 energy-server'
+  else
+    bad "组织费率保存接口异常（HTTP ${org_ok}，期望 400）" '检查 saveOrgRate 的参数校验'
+  fi
 fi
 
 # 菜单孤儿：重装/repair-init 不能堆出**没人引用**的同名菜单。
@@ -338,8 +389,14 @@ fi
 # ================================================================
 sec "D. 看板模板"
 TPL_N=$(DASH_DB "SELECT count(*) FROM dashboard WHERE customer_id IS NULL;" | tr -d ' ')
-eq "看板模板数" "${TPL_N:-0}" "24" \
-   '模板没导全：重跑 docker-01-install.sh，或确认 deploy 目录 data/json/tenant/dashboards 是 24 个文件'\
+# 模板数从 24 涨到 30（新增 抄表/账单/AI 分析等 6 个看板）。
+# 断言改成「目录文件数 == 库内条数」，比硬编码数字更耐改动：
+# 少导一个就会对不上，也不会因为业务新增看板而误报。
+TPL_FILES=$(ls "$APP_HOME/data/json/tenant/dashboards"/*.json 2>/dev/null | wc -l | tr -d ' ')
+eq "看板模板数（库）" "${TPL_N:-0}" "${TPL_FILES:-0}" \
+   '模板没导全：重跑 docker-01-install.sh，或确认 deploy 目录 data/json/tenant/dashboards 与库内一致'
+ge "看板模板数（下限）" "${TPL_N:-0}" "24" \
+   '模板少了一大截：重跑 docker-01-install.sh，或确认 deploy 目录 data/json/tenant/dashboards'\
 
 TITLES=$(DASH_DB "SELECT title FROM dashboard WHERE customer_id IS NULL;" | tr -d '\r')
 has  "「峰谷时段」已改名" "$TITLES" '峰谷时段' \
@@ -741,26 +798,55 @@ if [[ -f .env ]]; then
   # 电表 Key 标准化节点：缺了不会报错 —— 上报照样 200，但原始代号
   # U/I/P/Ep 原样落库，报表按标准名取数就是空的（2026-10-23）。
   # 同时要求没有 Switch → Save 的直连（它会让转换节点被绕过）。
+  # ★ 判据改成「可达性」而不是硬编码直连数（2026-11-07）。
+  #
+  #   原来要求 Switch --[Post telemetry]--> 电表Key标准化 是**直连**，
+  #   期望 1,2,0。后来链路中间插了「设备属性 → 型号映射」（读设备/型号的
+  #   SERVER_SCOPE 属性，用于 sourceKey 映射），结构变成：
+  #       Switch → 设备属性 → 型号映射 → 电表Key标准化 → Save Timeseries
+  #   于是「直连」计数变成 1（只剩标准化→Save），断言必然红 ——
+  #   但功能是对的：Post telemetry 仍然经过标准化节点才落库。
+  #
+  #   现在直接从 Switch 的 Post telemetry 出口做图遍历，断言四件事：
+  #     ① 节点存在且类型是 TbTransformMsgNode
+  #     ② 标准化节点在 Post telemetry 可达集合里（没被绕过）
+  #     ③ Save Timeseries 也在可达集合里（链路通到落库）
+  #     ④ 标准化 --[Success]--> Save Timeseries 这条边存在
+  #     ⑤ 没有 Switch --[Post telemetry]--> Save 的直连（否则原始代号照样落库）
+  #   SQL 里 UNION（不是 UNION ALL）去重，递归会自动收敛。
   MK=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc "
-    WITH root AS (SELECT rule_chain_id FROM rule_node WHERE name='电表Key标准化' LIMIT 1)
-    SELECT (SELECT count(*) FROM rule_node WHERE name='电表Key标准化'
-              AND type='org.thingsboard.rule.engine.transform.TbTransformMsgNode')
-        || ',' ||
-           (SELECT count(*) FROM relation r
-              JOIN rule_node n1 ON n1.id=r.from_id JOIN rule_node n2 ON n2.id=r.to_id
-             WHERE r.relation_type_group='RULE_NODE' AND n1.rule_chain_id=(SELECT rule_chain_id FROM root)
-               AND ((n1.name='Message Type Switch' AND r.relation_type='Post telemetry' AND n2.name='电表Key标准化')
-                 OR (n1.name='电表Key标准化' AND r.relation_type='Success' AND n2.name='Save Timeseries')))
-        || ',' ||
-           (SELECT count(*) FROM relation r
-              JOIN rule_node n1 ON n1.id=r.from_id JOIN rule_node n2 ON n2.id=r.to_id
-             WHERE r.relation_type_group='RULE_NODE' AND n1.rule_chain_id=(SELECT rule_chain_id FROM root)
-               AND n1.name='Message Type Switch' AND n2.name='Save Timeseries'
-               AND r.relation_type='Post telemetry');" 2>/dev/null | tr -d ' ')
-  if [[ "${MK}" == "1,2,0" ]]; then
-    ok "电表 Key 标准化节点就绪（节点 1 · 连线 2 · 无直连）"
+    WITH RECURSIVE root AS (
+      SELECT rule_chain_id FROM rule_node WHERE name='电表Key标准化' LIMIT 1
+    ),
+    edges AS (
+      SELECT n1.name AS f, n2.name AS t, r.relation_type AS rt
+        FROM relation r
+        JOIN rule_node n1 ON n1.id=r.from_id
+        JOIN rule_node n2 ON n2.id=r.to_id
+       WHERE r.relation_type_group='RULE_NODE'
+         AND n1.rule_chain_id=(SELECT rule_chain_id FROM root)
+    ),
+    reach AS (
+      SELECT e.t AS node FROM edges e
+       WHERE e.f='Message Type Switch' AND e.rt='Post telemetry'
+      UNION
+      SELECT e.t FROM edges e JOIN reach ON e.f=reach.node
+    )
+    SELECT
+      (SELECT count(*) FROM rule_node WHERE name='电表Key标准化'
+         AND type='org.thingsboard.rule.engine.transform.TbTransformMsgNode')
+      || ',' ||
+      (SELECT count(*) FROM reach WHERE node='电表Key标准化')
+      || ',' ||
+      (SELECT count(*) FROM reach WHERE node='Save Timeseries')
+      || ',' ||
+      (SELECT count(*) FROM edges WHERE f='电表Key标准化' AND t='Save Timeseries' AND rt='Success')
+      || ',' ||
+      (SELECT count(*) FROM edges WHERE f='Message Type Switch' AND t='Save Timeseries' AND rt='Post telemetry');" 2>/dev/null | tr -d ' ')
+  if [[ "${MK}" == "1,1,1,1,0" ]]; then
+    ok "电表 Key 标准化节点就绪（在 Post telemetry 路径上且先于落库）"
   else
-    bad "电表 Key 标准化节点异常（节点/连线/直连 = ${MK:-空}，期望 1,2,0）" \
+    bad "电表 Key 标准化节点异常（节点/可达/落库可达/标准化→落库/直连 = ${MK:-空}，期望 1,1,1,1,0）" \
         "POST /api/energy/repair-init 自动补装；仍异常看手册 ③ 五之二"
   fi
 fi
@@ -770,19 +856,30 @@ fi
 # I-1. 缺参数必须返回 400，不能是 500。
 #      500 会让前端去查服务端日志、让监控把「调用方写错」计入 5xx 告警，
 #      真正的服务故障被噪声淹没（实测 2026-10-23：tou-analysis 缺 from 返回 500）。
-CODE=$(curl -s --noproxy '*' -m 30 -o /tmp/verify_badparam.json -w '%{http_code}' \
-       -H "X-Authorization: Bearer $CTOK" "$BASE/api/energy/tou-analysis" 2>/dev/null)
-ERRC=$(jget < /tmp/verify_badparam.json "print(d.get('errorCode'))" 2>/dev/null)
-if [[ "$CODE" == "400" && "$ERRC" == "31" ]]; then
-  ok "缺参数返回 400（BAD_REQUEST_PARAMS）"
+if [[ -z "$CTOK" ]]; then
+  printf '  \033[33m  - 跳过缺参数检查（未提供客户账号）\033[0m\n'
 else
-  bad "缺参数返回 ${CODE:-空} / errorCode=${ERRC:-空}，期望 400 / 31" \
-      "看 ThingsboardErrorResponseHandler.handle：参数类异常要先分流成 400"
+  CODE=$(curl -s --noproxy '*' -m 30 -o /tmp/verify_badparam.json -w '%{http_code}' \
+         -H "X-Authorization: Bearer $CTOK" "$BASE/api/energy/tou-analysis" 2>/dev/null)
+  ERRC=$(jget < /tmp/verify_badparam.json "print(d.get('errorCode'))" 2>/dev/null)
+  if [[ "$CODE" == "400" && "$ERRC" == "31" ]]; then
+    ok "缺参数返回 400（BAD_REQUEST_PARAMS）"
+  else
+    bad "缺参数返回 ${CODE:-空} / errorCode=${ERRC:-空}，期望 400 / 31" \
+        "看 ThingsboardErrorResponseHandler.handle：参数类异常要先分流成 400"
+  fi
 fi
 
 # I-2. 台账用量必须是「账期累计」，不是「最后一次抄表的增量」。
 #      一个月内多次抄表时，后者会把月用量算成 0（实测：实际 94.575 kWh → 台账 0.0000，
 #      账单金额跟着变 0）。合法值域：usage 为 null（无表底/倒走）或 >= lastUsage。
+#
+# ★ 依赖客户 token（见 C2 段说明）。空 CTOK 会拿到 302 的 HTML，
+#   解析出空 items → 误判成「口径异常」。
+if [[ -z "$CTOK" ]]; then
+  printf '  \033[33m  - 跳过台账口径检查（未提供客户账号）\033[0m\n'
+  LEDGER='{}'
+else
 LEDGER=$(CAPI '/api/energy/meter-reading/ledger')
 # 有账单时 usage 合法地来自账单（计费口径），此时不要求 periodOpen；
 # 没有账单时才必须能追溯到「期初/期末表底」。
@@ -815,6 +912,7 @@ else
   bad "台账用量口径异常（字段缺失或累计 < 本次增量）" \
       "看 EnergyMeterReadingController.ledger：应按「期末表底 − 期初表底」计费"
 fi
+fi  # end: 有客户 token 才查台账（LEDGER 预置 '{}'，无 token 时上面两项恒 skip）
 
 # I-3. 峰谷分析必须与「表底首末差」逐日对齐。
 #
@@ -934,6 +1032,9 @@ fi
 #
 #          台账主体来自 meter_reading_record，虚拟表没有抄表记录。
 #          不补这段时：账单有金额、台账看不到这台表，客户以为多收钱。
+if [[ -z "$CTOK" ]]; then
+  printf '  \033[33m  - 跳过虚拟表台账检查（未提供客户账号）\033[0m\n'
+else
 VLED=$(CAPI '/api/energy/meter-reading/ledger' | jget "
 vs = [x for x in (d.get('items') or []) if x.get('quality') == 'manual' or x.get('source') == 'manual']
 bad = [x.get('deviceName') for x in vs if x.get('usage') is None]
@@ -948,6 +1049,7 @@ elif [[ -z "${VL_BAD:-}" ]]; then
 else
   bad "虚拟表在台账里没有用量：${VL_BAD}" "已出账时台账应取 billUsage；未出账时读手工填报的月首值"
 fi
+fi  # end: 有客户 token 才查虚拟表台账
 
 # I-3c. 账单号必须含表码，否则同客户同品种的多块表会互相覆盖。
 #
@@ -1017,6 +1119,9 @@ fi
 #      先主动触发一次抄表再查，既验证了抄表链路，也验证了字段。
 CAPI_POST() { curl -s --noproxy '*' -m 90 -X POST -H "X-Authorization: Bearer $CTOK" \
                -H 'Content-Type: application/json' -d '{}' "$BASE$1"; }
+if [[ -z "$CTOK" ]]; then
+  printf '  \033[33m  - 跳过抄表记录字段检查（未提供客户账号）\033[0m\n'
+else
 CAPI_POST '/api/energy/meter-reading/run' >/dev/null 2>&1 || true
 RECS=$(CAPI '/api/energy/meter-reading/records?period='"$(date +%Y-%m)")
 HAS_FIELD=$(echo "$RECS" | jget "
@@ -1031,6 +1136,7 @@ else
   bad "抄表记录缺 fieldStatus 字段" \
       "看 EnergyMeterReadingController.records：SELECT 要带上 field_value/field_status/field_note"
 fi
+fi  # end: 有客户 token 才查抄表记录
 
 # I-5. 设备计量配置端点必须可用（meterLevel + 倍率）
 #
@@ -1074,15 +1180,19 @@ fi
 #
 #      平台不会在设备上报时自动把电量汇总到资产。客户自建场站后
 #      不重算，看板选场站就是空的。这个端点必须对客户开放且只影响自己。
-REBUILD=$(curl -s --noproxy '*' -m 120 -X POST \
-          -H "X-Authorization: Bearer $CTOK" -H 'Content-Type: application/json' \
-          -d '{"days":7}' "$BASE/api/energy/asset-totals/rebuild" 2>/dev/null)
-RB_OK=$(echo "$REBUILD" | jget "print('1' if d.get('ok') and 'assetsWritten' in d else '0')" 2>/dev/null)
-if [[ "$RB_OK" == "1" ]]; then
-  ok "客户可重算资产汇总（写入了 $(echo "$REBUILD" | jget "print(d.get('assetsWritten'))" 2>/dev/null) 个资产）"
+if [[ -z "$CTOK" ]]; then
+  printf '  \033[33m  - 跳过客户重算资产汇总（未提供客户账号）\033[0m\n'
 else
-  bad "客户无法重算资产汇总" \
-      "看 EnergyDemoDataController.rebuildAssetTotals：客户账号应限定在自己域内并返回 assetsWritten"
+  REBUILD=$(curl -s --noproxy '*' -m 120 -X POST \
+            -H "X-Authorization: Bearer $CTOK" -H 'Content-Type: application/json' \
+            -d '{"days":7}' "$BASE/api/energy/asset-totals/rebuild" 2>/dev/null)
+  RB_OK=$(echo "$REBUILD" | jget "print('1' if d.get('ok') and 'assetsWritten' in d else '0')" 2>/dev/null)
+  if [[ "$RB_OK" == "1" ]]; then
+    ok "客户可重算资产汇总（写入了 $(echo "$REBUILD" | jget "print(d.get('assetsWritten'))" 2>/dev/null) 个资产）"
+  else
+    bad "客户无法重算资产汇总" \
+        "看 EnergyDemoDataController.rebuildAssetTotals：客户账号应限定在自己域内并返回 assetsWritten"
+  fi
 fi
 
 # I-5d. 客户视角权限探针：客户打开页面时部件发的请求不能有 4xx
@@ -1094,7 +1204,12 @@ fi
 #       探针脚本 27-customer-surface-probe.py 以客户身份打 295 条请求，
 #       任何 401/403/5xx 都算缺陷。--strict 时有失败会退出码 2。
 PROBE="$APP_HOME/scripts/27-customer-surface-probe.py"
-if [[ -f "$PROBE" ]]; then
+# ★ 没有客户账号时不能跑（2026-11-07）：探针要拿客户 token 打 400+ 条请求，
+#   缺账号时它自己登录失败 → failed=999 → 这里被判成「客户视角有 999 条失败」，
+#   看起来像致命缺陷，实际只是没传 --customer/--customer-pass。
+if [[ -z "$CTOK" ]]; then
+  printf '  \033[33m  - 跳过客户视角探针（未提供客户账号：加 --customer/--customer-pass）\033[0m\n'
+elif [[ -f "$PROBE" ]]; then
   PROBE_OUT=$(python3 "$PROBE" --base "$BASE" \
       --tenant "$TENANT" --tenant-pass "$TENANT_PASS" \
       --customer "$CUST" --customer-pass "$CUST_PASS" \
@@ -1190,14 +1305,16 @@ if [[ "$FAIL" -gt 0 ]]; then
   exit 1
 fi
 echo "  这一版的功能点全部到位。"
-# 项数自校验：全部通过但项数对不上，说明脚本被改过而 EXPECTED_PASS 没跟着改。
-# 这种漂移会让手册里的「通过 N 项」变成假话，所以当成失败处理。
-if [[ "${PASS}" -ne "${EXPECTED_PASS}" ]]; then
+# 项数自校验：只查下限。
+#
+# 精确比对（PASS == EXPECTED_PASS）会把「没传客户账号 → 跳过若干项」
+# 这类正常环境差异报成脚本漂移，反而掩盖真问题（实测 2026-11-07）。
+if [[ "${PASS}" -lt "${MIN_PASS}" ]]; then
   echo
   # 变量必须写成 ${VAR}：后面紧跟中文时，bash 3.2（macOS 自带）
   # 会把中文字节当成变量名的一部分，报 "PASS，: unbound variable"。
-  echo "  ⚠ 项数与预期不符：实际 ${PASS} 项，预期 ${EXPECTED_PASS} 项"
-  echo "    检查项被增删过。请同步更新本脚本的 EXPECTED_PASS 与手册里的「通过 N 项」。"
+  echo "  ⚠ 通过项数过少：只有 ${PASS} 项，下限 ${MIN_PASS} 项"
+  echo "    像是检查项被误删了一大片。确认脚本没被裁剪。"
   echo "============================================================"
   exit 1
 fi

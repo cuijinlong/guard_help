@@ -1012,6 +1012,145 @@ cd ~/energy-app && docker compose --profile split restart energy-server
 > 清前清后各跑一次：`SELECT count(*) FROM ts_kv WHERE entity_id IN
 > (SELECT id FROM asset WHERE customer_id='<正式客户>')`。
 
+### 验收脚本报一堆客户侧失败（302 / 缺字段 / 台账异常）（2026-11-07 实测修完）
+
+**症状**：`08-verify-release.sh` 报 13 项失败，其中七八项看着像后端坏了：
+
+```
+✗ 客户费率接口缺少 customerRates 字段
+✗ 客户费率保存接口异常（HTTP 302，期望 400）
+✗ 组织费率保存接口异常（HTTP 302，期望 400）
+✗ 缺参数返回 302 / errorCode=空，期望 400 / 31
+✗ 台账用量口径异常（字段缺失或累计 < 本次增量）
+✗ 台账漏掉虚拟表（出账 2 台，台账 0 台）
+✗ 抄表记录缺 fieldStatus 字段
+✗ 客户无法重算资产汇总
+✗ 客户视角有  条请求失败（首条：）
+```
+
+**根因：没传客户账号，与后端无关。**
+
+空 `$CTOK` 时 curl 发的是 `X-Authorization: Bearer `（**带空值**）。
+服务端对这种头的反应不是 401，而是 **302 重定向到登录页** —— 于是：
+
+| 脚本看到 | 实际发生 |
+| --- | --- |
+| 302（期望 400） | 被重定向到登录页 |
+| 缺 `customerRates` 字段 | 响应体是登录页 HTML |
+| 台账 0 行 → 口径异常 | 同上，解析出空 items |
+| 探针「N 条失败」 | 探针登录失败，`failed=999` |
+
+**一条命令定生死**（同一项，带与不带客户账号各跑一次）：
+
+```bash
+CTOK=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"demo@126.com","password":"密码"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+
+# 不带（脚本原来的行为）→ 302
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  "$BASE/api/energy/tou-analysis" -H "X-Authorization: Bearer "
+# 带 → 400 / errorCode=31（符合期望）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  "$BASE/api/energy/tou-analysis" -H "X-Authorization: Bearer $CTOK"
+```
+
+**已修（脚本层）**：所有依赖客户 token 的检查都加了 guard ——
+没账号时打一行 `- 跳过…（未提供客户账号：加 --customer/--customer-pass）`，
+**不再报红**。涉及：客户费率 3 项、缺参数、台账 2 项、抄表 fieldStatus、
+客户重算资产汇总、客户视角探针。
+
+> ⚠ 夹在中间的「组织数 / 挂在组织下的场站」是**纯 SQL**，与 token 无关，
+> 不能被一起跳过 —— 所以那一段拆成了四个小块，各管各的。
+
+**另外三处期望值也过时了（已改）**
+
+| 项 | 原期望 | 实际 | 为何过时 |
+| --- | --- | --- | --- |
+| 能源品种数 | 4 | 全集 8 / 用能 5 | 2026-11-01 加了「热力」；env/cooling/air 是一级设备类型，不是用能品种 |
+| 看板模板数 | 24 | 30 | 新增了 6 个看板 |
+| 电表 Key 标准化 | 节点/连线/直连 = 1,2,0 | 1,1,0 | 链路中间插了「设备属性 → 型号映射」，直连数自然变少 |
+
+品种数现在分两个口径断言（这才是业务真相）：
+
+```bash
+/api/energy/metric-params                  # 运营配置：全集 ≥ 5（含 env/cooling/air）
+/api/energy/metric-params?energyOnly=true  # 查询/报表：必须恰好 5 个（电水气汽热）
+```
+
+电表 Key 标准化改成**可达性**判据（图遍历），断言：节点存在 · 在
+`Post telemetry` 可达集合里 · `Save Timeseries` 也可达 ·
+`标准化 --[Success]--> Save` 存在 · 无 `Switch --> Save` 直连。
+比硬编码连线数耐改：以后往链路里再插节点不会误报。
+
+**项数自校验也改了**：原来要求 `PASS == EXPECTED_PASS`（精确），
+但通过数本来就会随环境漂移（没客户账号少 9 项、本库没虚拟表又少一项），
+精确比对把正常差异报成「脚本被改过」。现在只查下限 `MIN_PASS=55`，
+**真正的门是 `FAIL == 0`**。
+
+#### 唯一一项真问题：6 台设备缺 `energyCategory`
+
+上面九项都是假失败，但有一项是真的（SQL 直查，不经 token）：
+
+```
+✗ 计量设备都有能源分项属性：实际 6，期望 0
+```
+
+缺的 6 台：
+
+```
+PowerMeter-DDSU666        （21-rtu-onboard.py 建的真实单相表）
+PowerMeter-3P-SIM / 1P-SIM / WaterMeter-SIM / GasMeter-SIM / SteamMeter-SIM
+                          （30-rtu-env-init.py 建的模拟表）
+```
+
+**根因**：两条建表路径都没写这个属性。
+`EnergyBootstrapInstaller#resolveEnergyCategory` 会写（演示设备靠它），
+但这两个**部署脚本**自己 `POST /api/device` 时只写了 `siteId` / `simulated` /
+`energyTypeCode`，漏了 `energyCategory`。
+
+后果：AI 三页（负载预测「按分项」、用能建议「按分项」、用能质量分项口径）
+按这个属性聚合设备 —— 空值会被归到「其他」，客户看到的就是
+分项下拉 disabled、按分项分析 0 台设备。**不报错**。
+
+**已修（两处）**：
+
+1. `30-rtu-env-init.py`：`SIM_DEVICES` 每项加 `category`，
+   `ensure_device` 写进 `additionalInfo`。口径与后端一致：
+   电表按场站主表记 `total`，水/气/汽按品种；
+   热力/环境/智能空开不是「分项」，留空。
+2. `21-rtu-onboard.py`：DDSU666 写 `energyCategory=total`，
+   并把 `need` 判断带上它（否则已存在的设备不会补）。
+
+**顺手修的一个更阴的 bug**：这两个脚本更新已有设备时，
+`additionalInfo` 是**整块覆盖** —— 会把运行时写入的
+`energyTypeCode` / `simulated` / `lastConnectedGateway` 抹掉。
+`energyTypeCode` 一丢，部件就判不出品种，那台表**从所有报表里消失且不报错**。
+改成先 `dict(old_ai)` 合并再 `update`。
+
+实测验证（临时删掉 DDSU666 的 energyCategory 再跑脚本）：
+
+```
+修复前：{siteId, simulated, energyTypeCode, lastConnectedGateway}
+修复后：{siteId, simulated, energyTypeCode, lastConnectedGateway, rtuDemo, energyCategory:"total"}
+         ↑ energyTypeCode 保留 = merge 生效（若覆盖就会丢）
+```
+
+存量数据用 `24-device-categories.py --fix` 补（幂等，只补空值）：
+
+```bash
+python3 scripts/24-device-categories.py --tenant <邮箱> --tenant-pass '<密码>' --check
+python3 scripts/24-device-categories.py --tenant <邮箱> --tenant-pass '<密码>' --fix
+# 期望：已就绪 22，缺失 0，取值不符 0
+```
+
+**修后结果**
+
+| 跑法 | 结果 |
+| --- | --- |
+| 不带客户账号 | 65 项通过 / 0 失败 / 9 项跳过 |
+| 带客户账号 | **90 项通过 / 0 失败** |
+
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
 **症状**：看板框架、筛选条、KPI 卡片都在，但数字全 0，

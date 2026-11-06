@@ -171,6 +171,13 @@ def ensure_device(base, token, name, profile_id, customer_id, site_id, existing,
     ai = {"siteId": site_id, "rtuDemo": True}
     if is_gateway:
         ai["gateway"] = True
+    # ★ energyCategory（2026-11-07）：AI 三页「按分项」靠它聚合设备。
+    #   本脚本原来只写 siteId/rtuDemo，电表因此缺分项归属 —— 验收项
+    #   「计量设备都有能源分项属性」会把它算进缺失（实测 1 台）。
+    #   DDSU666 是办公园区那块单相总表，按 total（总用电）记；
+    #   口径与 EnergyBootstrapInstaller#resolveEnergyCategory 的兜底一致。
+    if name == METER_NAME:
+        ai["energyCategory"] = "total"
     body = {
         "name": name,
         "label": name,
@@ -206,10 +213,20 @@ def ensure_device(base, token, name, profile_id, customer_id, site_id, existing,
         need = True
     if bool(old_ai.get("gateway")) != bool(is_gateway):
         need = True
+    if name == METER_NAME and old_ai.get("energyCategory") != "total":
+        need = True
     if need:
         body["id"] = {"entityType": "DEVICE", "id": did}
         body["version"] = cur.get("version")
         body["createdTime"] = cur.get("createdTime")
+        # ★ 修属性必须**合并**旧值，不能整块覆盖（2026-11-07）。
+        #   设备上还有运行时写入的键（energyTypeCode / simulated /
+        #   lastConnectedGateway），它们是部件判品种、识别模拟设备的依据。
+        #   用本次的新 ai 直接覆盖，会把 energyTypeCode 抹掉 ——
+        #   那台表随后被判成「识别不出品种」从所有报表里剔除，且不报错。
+        merged = dict(old_ai)
+        merged.update(ai)
+        body["additionalInfo"] = merged
         api(base, "/api/device", token, method="POST", body=body)
         notes.append("已修复")
     return did, " · ".join(notes) if notes else "已存在"

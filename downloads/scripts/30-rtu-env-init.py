@@ -215,7 +215,7 @@ SIM_DEVICES = [
     {
         'name': 'PowerMeter-3P-SIM', 'label': '三相电表', 'meterLevel': 1, 'site': 'three', 'gw': 'three',
         'profile': '电能表', 'model': 'DTSD341', 'brand': '威胜',
-        'type1': 'elec', 'type2': 'normal', 'l1': 'elec_meter',
+        'type1': 'elec', 'category': 'total', 'type2': 'normal', 'l1': 'elec_meter',
         'wiring': '3P4W',
         'note': '模拟三相电表（3P4W）：电压电流潮流 + 电能质量全场景',
         'points': _pq_points(),
@@ -224,7 +224,7 @@ SIM_DEVICES = [
         'name': 'PowerMeter-1P-SIM', 'label': '单相电表', 'meterLevel': 2,
         'site': 'single', 'gw': 'single',
         'profile': '单相电能表', 'model': 'DDSU666', 'brand': '正泰',
-        'type1': 'elec', 'type2': 'normal', 'l1': 'elec_meter',
+        'type1': 'elec', 'category': 'total', 'type2': 'normal', 'l1': 'elec_meter',
         'wiring': '1P2W',
         'note': '模拟单相电表（1P2W）：真实 DDSU666 只报表底，'
                 '这台保证单相园区有可展示的电量曲线',
@@ -242,7 +242,7 @@ SIM_DEVICES = [
     {
         'name': 'WaterMeter-SIM', 'label': '水表', 'meterLevel': 2, 'site': 'single', 'gw': 'single',
         'profile': '水表', 'model': 'LXSY-20', 'brand': '宁波水表',
-        'type1': 'water', 'type2': 'normal', 'l1': 'water_meter',
+        'type1': 'water', 'category': 'water_utility', 'type2': 'normal', 'l1': 'water_meter',
         'wiring': '',
         'note': '模拟水表：瞬时流量 + 累积读数',
         'points': [mp('F', 'power', '瞬时流量', 'm³/h'),
@@ -252,7 +252,7 @@ SIM_DEVICES = [
     {
         'name': 'GasMeter-SIM', 'label': '燃气表', 'meterLevel': 2, 'site': 'single', 'gw': 'single',
         'profile': '燃气表', 'model': 'G2.5', 'brand': '秦川',
-        'type1': 'gas', 'type2': 'normal', 'l1': 'gas_meter',
+        'type1': 'gas', 'category': 'gas', 'type2': 'normal', 'l1': 'gas_meter',
         'wiring': '',
         'note': '模拟燃气表：瞬时流量 + 累积读数 + 压力',
         'points': [mp('F', 'power', '瞬时流量', 'm³/h'),
@@ -262,7 +262,7 @@ SIM_DEVICES = [
     {
         'name': 'SteamMeter-SIM', 'label': '蒸汽表', 'meterLevel': 2, 'site': 'three', 'gw': 'three',
         'profile': '蒸汽表', 'model': 'LUGB', 'brand': '横河',
-        'type1': 'steam', 'type2': 'normal', 'l1': 'steam_meter',
+        'type1': 'steam', 'category': 'steam', 'type2': 'normal', 'l1': 'steam_meter',
         'wiring': '',
         'note': '模拟涡街蒸汽表：流量 + 累积 + 温度压力',
         'points': [mp('F', 'power', '瞬时流量', 't/h'),
@@ -963,6 +963,17 @@ def ensure_device(api, spec, site, customer_id, gw_id, log):
     #   设备就会被当作「识别不出品种」剔除。
     ai = {'siteId': site['id']['id'], 'simulated': True,
           'energyTypeCode': spec['type1']}
+    # ★ energyCategory（2026-11-07）：
+    #   AI 三页（负载预测「按分项」、用能建议「按分项」、用能质量分项口径）
+    #   全靠 additionalInfo.energyCategory 聚合设备；空值会被归到「其他」，
+    #   客户看到的就是「分项下拉 disabled、按分项分析 0 台设备」。
+    #   后端 EnergyBootstrapInstaller#resolveEnergyCategory 对演示设备会写，
+    #   但本脚本自建 SIM 设备时漏了 —— 实测 6 台缺（水/气/汽/3 台电表），
+    #   验收项「计量设备都有能源分项属性」因此一直红。
+    #   口径与该函数一致：电表按场站主表记 total，水/气/汽按品种，
+    #   热力/环境/智能空开不是「分项」，留空。
+    if spec.get('category'):
+        ai['energyCategory'] = spec['category']
 
     if dev is None:
         api.post('/api/device', {
@@ -977,9 +988,15 @@ def ensure_device(api, spec, site, customer_id, gw_id, log):
         log('  + 设备「%s」已建' % name)
     else:
         log('  · 设备「%s」已存在' % name)
+        # ★ 合并旧 additionalInfo，不要整块覆盖（2026-11-07）。
+        #   运行时还会写 energyTypeCode / simulated / lastConnectedGateway，
+        #   覆盖会把它们抹掉 —— energyTypeCode 丢了，部件就判不出品种，
+        #   那台表从所有报表里消失且不报错。
+        merged = dict(dev.get('additionalInfo') or {})
+        merged.update(ai)
         upd = {'id': dev['id'], 'name': name,
                'label': spec.get('label') or name, 'type': spec['profile'],
-               'additionalInfo': ai}
+               'additionalInfo': merged}
         if dev.get('customerId'):
             upd['customerId'] = dev['customerId']
         api.post('/api/device', upd)

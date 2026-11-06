@@ -229,8 +229,17 @@ cd ~/energy-app && docker compose --profile split --profile cassandra \
 # ── 3. 验证（至少这四条）
 bash scripts/ts-mirror.sh                                    # Cassandra 后端必跑：镜像遥测到 PG
 python3 scripts/27-customer-surface-probe.py ... --strict    # 客户视角无 4xx + 语义断言通过
-bash scripts/08-verify-release.sh ...                        # 75 项
+bash scripts/08-verify-release.sh ... \
+  --customer demo@126.com --customer-pass '密码'             # 0 失败（项数随环境变，见下）
 bash scripts/06-verify-e2e.sh ...                            # 53 项
+
+# ★ 08 脚本必须传客户账号（2026-11-07 修）：
+#   不传时客户侧 9 项检查会 skip（会把它们当成「未提供客户账号」），
+#   而不是报红。以前不传会得到一串假的「接口缺字段 / 返回 302」——
+#   那是空 token 被服务端 302 重定向到登录页造成的。
+#   实测：不传 65 项通过，传了 90 项通过，两边都应 0 失败。
+#   通过项数会因「有没有虚拟表 / 有没有拓扑 / 本月抄没抄表」浮动，
+#   所以脚本只查下限（MIN_PASS）；**真正的门是 FAIL == 0**。
 
 # ── 3b. 改了看板/部件 → 浏览器实测（探针只打接口，看不到渲染）
 #        用客户账号打开「能耗概览」，确认四张卡有数字、日历有热力
