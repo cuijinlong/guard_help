@@ -591,6 +591,75 @@ document.querySelectorAll('.eqab-casc-col').length;   // 2 → 3
 > ⚠️ 测 hover 必须派发 **`mouseenter`**，不能派发 `mouseover` ——
 > `mouseenter` 不冒泡，Angular 绑的是它。派发 `mouseover` 永远不触发。
 
+### 能耗概览第一排太高 / 上面留一大块空白（2026-11-07 实测修复）
+
+**症状**：宽屏（1920 / 2560）上，第一排「用能品种」那条只有 34px 的下拉，
+整行却占了 59~86px —— 内容顶在上面一片空白里，看着像没对齐。
+客户原话：「把第一排高度调成正正好好，不要因为这一行太高导致上面留白」。
+
+**根因**：TB 栅格是**正方形格子**。列宽随屏宽变化，`sizeY=1` 的行高跟着等比放大，
+而 `analysis_bar` 的内容固定 34px。实测（同一台机器改窗口宽度）：
+
+| 窗口宽 | 格子高 | 内容上留白 |
+| --- | --- | --- |
+| 1280 | 32.5px | -0.75px（内容已溢出格子） |
+| 1440 | 39.2px | 2.6px |
+| 1600 | 45.8px | 5.9px |
+| 1920 | 59.2px | 12.6px |
+| 2560 | 85.8px | 25.9px |
+
+**修法**：写看板级 `configuration.settings.dashboardCss`（TB 原生支持，
+`dashboard-page.component.ts` 的 `updateDashboardCss()` 会前缀化后插进页面，
+只作用于这一个看板）：
+
+```css
+.tb-dashboard-page gridster { padding-top: 4px !important; }
+gridster-item:has(.widget-type-system-energy_management-analysis_bar) { max-height: 46px; }
+```
+
+**为什么不是 `height: 46px`**：1280 宽时格子只有 32.5px，写死 height 会把它压到
+下一排上（实测重叠 3px）。`max-height` 在窄屏不生效，只压宽屏。
+
+**为什么不能只改部件 `templateCss`**：行高由 `gridster-item` 决定，而它在部件
+**外面**，部件样式的作用域够不到。
+
+**一键脚本**（幂等；重装或看板被重建后要重跑，因为「能耗概览」是安装流程在库里
+生成的，仓库 `data/json/tenant/dashboards/` 下没有它，同步脚本不会覆盖它）：
+
+```bash
+python3 scripts/37-tune-overview-row.py            # 预演，只打印会改哪些
+python3 scripts/37-tune-overview-row.py --apply    # 执行
+```
+
+凭据按 `--tenant/--tenant-pass` → `DEPLOY-CREDENTIALS.txt` → `.env` 的
+`TB_API_USERNAME/TB_API_PASSWORD` 依次取。
+
+> ⚠️ `.env` 里那对若是模板默认值（`tenant@thingsboard.org` / `tenant`），
+> 登录会 401 —— 脚本会明确提示改用 `--tenant/--tenant-pass`。
+> 本机真实租户管理员是 `tenant@126.com`，不是 `.env` 里那个。
+
+**判据**（浏览器控制台，1920 宽）：
+
+```js
+const item = document.querySelector('gridster-item');
+const ff = item.querySelector('.eqab-root mat-form-field');
+Math.round(item.getBoundingClientRect().height);                                // 46
+Math.round(ff.getBoundingClientRect().top - item.getBoundingClientRect().top);  // 6
+```
+
+改后实测五档宽度全部不重叠，上留白统一 6px：
+
+| 窗口宽 | 改后行高 | 内容上留白 | 与下一排 |
+| --- | --- | --- | --- |
+| 1280 | 32.5px | -0.75px | 不重叠（max-height 未触发） |
+| 1440 | 39.2px | 2.6px | 不重叠 |
+| 1600 | 45.8px | 5.9px | 不重叠 |
+| 1920 | 46px | 6px | 间距 23px |
+| 2560 | 46px | 6px | 间距 50px |
+
+> 只压上面是刻意的。2560 宽下方会留 50px，但客户要的是「有点间距就好，不要太过」，
+> 上下都夹死反而更难看。
+
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
 **症状**：看板框架、筛选条、KPI 卡片都在，但数字全 0，
@@ -1432,6 +1501,123 @@ cp -R guard-server/src/main/data/sql ~/energy-app/data/sql
 | 分项能耗选电能是空的 | 水/气/汽/热分项不写 `energy_total`，切品种才出数 |
 | 告警中心切场站是一条都没有 | 告警挂在设备上，场站筛选走关系链 |
 | 单相表没有 B/C 相数据 | 1P2W 物理上就没有，不是丢数 |
+
+---
+
+### 设备有数、但概览页/分项对比是空的（2026-11-06 实测）
+
+**两个原因会同时出现，先分清是哪个。**
+
+#### 原因一：资产汇总还没轮到（最常见）
+
+页面读的是**资产**上的 `energy_total` / `energy_day`，
+而你写的是**设备**。中间隔着一层定时汇总 `AssetTotalsScheduler`，
+默认**每小时**跑一轮：
+
+```
+15:10  服务启动
+15:15  第一轮汇总 —— 设备还没数据，算出来是空
+15:40  你启动模拟器，设备数据开始写
+16:15  下一轮汇总才会把它算进资产   ← 要等到这个点
+```
+
+**确认是不是这个**（比较两侧的最后更新时间）：
+
+```bash
+cd ~/energy-app
+PW=$(grep -E '^POSTGRES_PASSWORD=' .env | cut -d= -f2)
+docker exec -e PGPASSWORD="$PW" energy-postgres psql -U postgres -d thingsboard -c "
+-- 设备侧（应该有最新点）
+SELECT 'DEVICE' src, d.name, k.key,
+  to_char(to_timestamp(max(kv.ts)/1000),'MM-DD HH24:MI') last_ts
+FROM ts_kv kv JOIN key_dictionary k ON k.key_id=kv.key JOIN device d ON d.id=kv.entity_id
+WHERE k.key='energy_reading' GROUP BY d.name,k.key ORDER BY max(kv.ts) DESC LIMIT 3;
+
+-- 资产侧（如果是空的/停在几天前，就是汇总没跑）
+SELECT 'ASSET' src, a.name, k.key,
+  to_char(to_timestamp(max(kv.ts)/1000),'MM-DD HH24:MI') last_ts
+FROM ts_kv kv JOIN key_dictionary k ON k.key_id=kv.key JOIN asset a ON a.id=kv.entity_id
+WHERE k.key='energy_day' GROUP BY a.name,k.key ORDER BY max(kv.ts) DESC LIMIT 3;"
+```
+
+设备侧 `11-06 23:45`、资产侧停在 `11-05 09:51` → 就是这个原因。
+
+**立刻修复（不用等一小时）**：
+
+```bash
+TOKEN=$(curl -s --noproxy '*' -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+curl -s --noproxy '*' -X POST \
+  -H "X-Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8090/api/energy/asset-totals/rebuild
+# 期望：{"ok":true,"assetsWritten":33,"days":60,...}
+```
+
+**避免下次再等**：把间隔调短（`~/energy-app/.env`）：
+
+```properties
+# 默认 3600000（1 小时）→ 改成 5 分钟
+ENERGY_ASSET_TOTALS_REFRESH_INTERVAL_MS=300000
+```
+
+> ⚠ **只改 `.env` 不够，还要看 `docker-compose.yml` 是否传递了它。**
+>
+> Docker Compose 的 `.env` 只用来**变量替换**，不会自动把变量塞进容器。
+> 必须在 `energy-server` 的 `environment` 下显式写一行：
+>
+> ```yaml
+> environment:
+>   ENERGY_ASSET_TOTALS_REFRESH_INTERVAL_MS: "${ENERGY_ASSET_TOTALS_REFRESH_INTERVAL_MS:-3600000}"
+> ```
+>
+> 漏了这行，改 `.env` **不会报错也不会生效** —— 最难查的一类。
+> 本版 `docker-compose.yml` 已经带上了。
+>
+> 确认真的进容器了：
+>
+> ```bash
+> docker inspect energy-server --format '{{range .Config.Env}}{{println .}}{{end}}' \
+>   | grep ASSET_TOTALS
+> # 期望看到 ENERGY_ASSET_TOTALS_REFRESH_INTERVAL_MS=300000
+> ```
+>
+> 改完必须 `docker compose --profile split up -d` 重建容器 ——
+> `restart` 不会重读 environment。
+
+#### 原因二：数据时间跨度太短，图上只有一个桶
+
+刚启动模拟器 5 分钟就去看「11-06 ~ 11-06」一整天的图，
+按小时聚合只会有 1 根柱子，看起来就像没数据。
+
+**确认**：
+
+```bash
+# 今天资产侧的数据时间跨度
+PW=$(grep -E '^POSTGRES_PASSWORD=' .env | cut -d= -f2)
+docker exec -e PGPASSWORD="$PW" energy-postgres psql -U postgres -d thingsboard -tAc "
+SELECT to_char(to_timestamp(min(kv.ts)/1000),'HH24:MI') || ' → ' ||
+       to_char(to_timestamp(max(kv.ts)/1000),'HH24:MI') || '  (' || count(*) || ' 点)'
+FROM ts_kv kv JOIN key_dictionary k ON k.key_id=kv.key JOIN asset a ON a.id=kv.entity_id
+WHERE a.name='三相园区·演示厂区A' AND k.key='energy_day'
+  AND kv.ts >= (extract(epoch from date_trunc('day', now()))*1000)"
+# 输出 `23:40 → 23:45 (20 点)` → 只有 5 分钟，图自然很空
+```
+
+**修**：用脚本自带的回填，一次补出整月曲线：
+
+```bash
+# ① 回填最近 30 天设备历史（每小时一个点）
+python3 ~/energy-app/scripts/31-rtu-simulate.py --backfill-days 30 --once
+
+# ② 回填的是设备级，资产级要再汇总一次（命令同上面 rebuild）
+```
+
+> **时区也会让「今天」的边界看起来不对**。容器默认 UTC 时，
+> 「今日」从北京时间早上 8 点算起，凌晨那段会被漏掉。
+> 确认方法见[④ 数据模型 · 时区](/admin/data-model#时区全栈必须是北京时间影响账单口径)。
 
 ---
 
