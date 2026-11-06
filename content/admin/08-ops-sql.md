@@ -824,18 +824,61 @@ print('total',d['total'],'skipped',d['skipped']);
 ⑥ 各档用量分别 × 单价，各档金额先取两位小数再相加 = 电度电费
 ```
 
-**③ 这一条会让每月少算第一小时**。实测单相园-1#进线总表 2026-11：
+**③ 这一条会让每月少算第一小时，且【所有表都受影响】**
+
+不是个别表、不是随机误差。演示厂区A 2026-11 实测：**29 台有表底的表里
+28 台都被跳过首小时**（唯一例外 PowerMeter-DDSU666 是 11-04 才接入，
+账期首小时本来就没数据）。
 
 ```
 账期 11-01 00:00 ~ 12-01 00:00
 桶：00:30=7789.77  01:30=7792.09  02:30=7794.33 …
-后端丢掉 00:30 → 从 01:30 起算 → 漏掉 00:00→01:00 这一段 2.32 kWh
-账单 338.49 vs 含首小时的 340.81（0.7%）
+后端丢掉 00:30 → 从 01:30 起算 → 漏掉 00:00→01:00 这一段
 ```
 
-这是**已知偏差**，不是随机误差：对每台表、每个月都等于「账期第一个小时用量」。
-要修得改后端（读 `[from-1h, to]`，用 from 之前的最后一个读数做基线），
-会改变已出账金额，需要客户确认后再动。
+**漏多少（2026-11 实测，按读取数差）**：
+
+| 表 | 账期用量 | 首小时漏 | 比例 |
+| --- | --- | --- | --- |
+| 三相园-1#进线总表 | 14,550.6 kWh | 57.01 kWh | 0.39% |
+| 三相园-车间动力总表 | 13,360.7 kWh | 49.52 kWh | 0.37% |
+| 单相园-1#进线总表 | 338.49 kWh | 2.32 kWh | 0.69% |
+| PowerMeter-3P-SIM | —— | 41.39 kWh | —— |
+| 三相园-车床组 | —— | 38.54 kWh | —— |
+
+规律：**比例稳定在 0.3%–0.7%**，方向永远是「少算」，金额上
+每台表每月几毛到几十元（三相园-1# 约 47 元）。
+
+> ⚠ 各分项表与进线表是父子关系，**不要把这些漏量相加** ——
+> 进线总表的读数已含分项表，相加会重复计量（见铁律 D3）。
+
+**自己环境受影响多大，一条 SQL 看全**（账期 2026-11）：
+
+```sql
+SET TIME ZONE 'Asia/Shanghai';
+WITH win AS (SELECT 1793462400000::bigint AS s, 1796054400000::bigint AS e),
+k AS (SELECT key_id FROM key_dictionary WHERE key='energy_reading'),
+h AS (
+  SELECT kv.entity_id AS dev,
+         (EXTRACT(EPOCH FROM date_trunc('hour', to_timestamp(kv.ts/1000)))*1000 + 1800000)::bigint AS bts,
+         max(kv.dbl_v) AS rd
+  FROM k JOIN ts_kv kv ON kv.key = k.key_id CROSS JOIN win
+  WHERE kv.ts >= win.s AND kv.ts < win.e
+  GROUP BY 1,2
+),
+s AS (SELECT dev, rd, row_number() OVER (PARTITION BY dev ORDER BY bts) AS rn FROM h)
+SELECT dd.name AS 表计, round((max(rd)-min(rd))::numeric,3) AS 首小时漏量
+FROM s JOIN device dd ON dd.id = s.dev
+WHERE s.rn <= 2
+GROUP BY dd.name HAVING max(rd)-min(rd) <> 0
+ORDER BY abs(max(rd)-min(rd)) DESC;
+```
+
+判据：返回行数 ≈ 账期内在线的有表底表数 → 说明全都在漏；
+返回 0 行说明这批表的账期首小时本来就没数据（新接入的表）。
+
+这是**已知偏差**。要修得改后端（读 `[from-1h, to]`，用 from 之前的最后一个读数做基线），
+**会改变已出账金额**，需要客户确认后再动。当前状态：**未修，客户决策中**。
 
 **独立复算（与上面的口径逐字对应）**：
 
