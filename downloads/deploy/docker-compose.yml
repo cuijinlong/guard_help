@@ -31,6 +31,20 @@ x-logging: &default-logging
     max-file: "5"
 
 x-db-env: &db-env
+  # ── 时区：全栈统一北京时间 ──
+  #
+  # 不设的后果（实测 2026-11-06）：
+  #   · 容器默认 UTC，日志比北京时间少 8 小时，排查时间线容易看错；
+  #   · **峰谷时段整体错位 8 小时** —— 尖/峰/平/谷按 UTC 小时划分，
+  #     账单金额直接算错（这是业务口径问题，不只是显示问题）；
+  #   · 「今日」从 UTC 00:00 开始 = 北京时间早上 8 点，
+  #     energy_day 当天累计会跳过凌晨那段。
+  #
+  # 遥测本身的 ts 是 epoch 毫秒（绝对时间），不受时区影响；
+  # 受影响的是「日期/小时边界」的计算 —— 这正是要改的。
+  #
+  # 想用其他时区：在 .env 里写 TZ=Asia/Tokyo 即可覆盖。
+  TZ: ${TZ:-Asia/Shanghai}
   SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-thingsboard}
   SPRING_DATASOURCE_USERNAME: ${DB_USER:-postgres}
   SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
@@ -73,6 +87,11 @@ services:
     stop_grace_period: 60s
     restart: unless-stopped
     environment:
+      # 时区（全栈统一北京时间，详见顶部 x-db-env 注释）。
+      # Postgres 存的是 timestamptz / epoch，本身不依赖时区；
+      # 但 now()、date_trunc('day') 这类 SQL 函数按会话时区算，
+      # 不设的话「今天」会是 UTC 口径，跟应用层的日期对不上。
+      TZ: ${TZ:-Asia/Shanghai}
       POSTGRES_DB: ${DB_NAME:-thingsboard}
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
@@ -83,6 +102,17 @@ services:
       - max_connections=200
       - -c
       - shared_buffers=256MB
+      # 会话时区。
+      #
+      # ⚠ 只给 TZ 环境变量不够：TZ 只在**数据库集群首次初始化**时被
+      # 写进 postgresql.conf，已经有数据卷的机器重启多少次都不会变
+      # （实测 2026-11-06：容器 date 已是 CST，但 now() 仍返回 UTC）。
+      # -c timezone=... 是启动参数，每次都生效，是唯一可靠的方式。
+      #
+      # 影响范围：now()、date_trunc('day')、
+      # ts 到日期/小时边界的换算。存量数据是 epoch 毫秒，不受影响。
+      - -c
+      - timezone=${TZ:-Asia/Shanghai}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -118,6 +148,8 @@ services:
     stop_grace_period: 180s
     restart: unless-stopped
     environment:
+      # 时区（全栈统一北京时间）。
+      TZ: ${TZ:-Asia/Shanghai}
       # 单节点部署：把自己当种子。多节点时列全部节点 "c1,c2,c3"。
       CASSANDRA_CLUSTER_NAME: ${CASSANDRA_CLUSTER_NAME:-Thingsboard Cluster}
       CASSANDRA_SEEDS: ${CASSANDRA_SEEDS:-cassandra}
@@ -212,6 +244,17 @@ services:
       # 以后要跟进官方新版网关页时，临时改回 true 启动一次，再重新打一遍中文补丁。
       TB_GATEWAY_DASHBOARD_SYNC_ENABLED: "false"
       JAVA_TOOL_OPTIONS: "-Xms512m -Xmx${SERVER_HEAP:-2g}"
+      # 资产汇总间隔（AssetTotalsScheduler）。
+      #
+      # 看板读的是**资产**上的 energy_total，由这个定时任务从设备数据汇总上去。
+      # 默认 1 小时 → 新接的表要等最多 1 小时才会出现在概览页，
+      # 表现为「设备页有数、概览页 / 分项对比是空」（实测 2026-11-06）。
+      # 演示 / 现场调试建议改 300000（5 分钟）。
+      #
+      # 注意：.env 里的变量**不会自动进容器**，必须在 compose 里显式传递 ——
+      # 漏了这行，改 .env 就不会生效，且不会报错。
+      ENERGY_ASSET_TOTALS_REFRESH_INTERVAL_MS: "${ENERGY_ASSET_TOTALS_REFRESH_INTERVAL_MS:-3600000}"
+      ENERGY_ASSET_TOTALS_REFRESH_ENABLED: "${ENERGY_ASSET_TOTALS_REFRESH_ENABLED:-true}"
     volumes:
       - ${APP_HOME}/guard-server-4.4.0.jar:/opt/energy/app.jar:ro
       - ${APP_HOME}/data:/opt/energy/data:ro
@@ -274,6 +317,9 @@ services:
       energy-server:
         condition: service_started
     environment:
+      # 时区（全栈统一北京时间）。镜像里 Dockerfile.prod 已设 TZ，
+      # 这里显式再写一遍：保证以后 Dockerfile 改了也不会掉回 UTC。
+      TZ: ${TZ:-Asia/Shanghai}
       # 容器内互相访问用服务名；这里的 127.0.0.1 会是容器自己，必须是服务名
       TB_BASE_URL: http://energy-server:8090
       TB_USERNAME: ${TB_API_USERNAME:-tenant@thingsboard.org}
@@ -301,6 +347,10 @@ services:
     image: nginx:1.27-alpine
     container_name: energy-gateway
     restart: unless-stopped
+    environment:
+      # 时区（全栈统一北京时间）。影响 access log 的时间戳，
+      # 跟应用日志对时间时不用再心算 -8 小时。
+      TZ: ${TZ:-Asia/Shanghai}
     depends_on:
       - energy-server
       - ngxai-backend
@@ -327,6 +377,8 @@ services:
     container_name: energy-allinone
     restart: unless-stopped
     environment:
+      # 时区（全栈统一北京时间）。
+      TZ: ${TZ:-Asia/Shanghai}
       DB_NAME: ${DB_NAME:-thingsboard}
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}

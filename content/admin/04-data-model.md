@@ -186,6 +186,112 @@ curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
 > 设备自己的遥测**一个点都不会删**。关掉「参与」只是不进汇总，
 > 想看这台表的历史曲线，在查询设置里照样勾得到它。
 
+#### 时区：全栈必须是北京时间（影响账单口径）
+
+容器默认是 UTC，不设的话峰谷时段会**整体错位 8 小时** —— 尖/峰/平/谷
+按 UTC 小时划分，账单金额直接算错。这不仅是显示问题。
+
+`docker-compose.yml` 已给全部 7 个服务注入 `TZ: ${TZ:-Asia/Shanghai}`：
+
+| 服务 | 为什么需要 |
+| --- | --- |
+| `energy-server` | 日志时间戳、峰谷时段划分、`energy_day` 日边界 |
+| `postgres` | `now()` / `date_trunc('day')` 的「今天」 |
+| `gateway` | nginx access log 时间戳 |
+| `cassandra` / `install` / `ngxai-backend` / `allinone` | 保持一致，避免排查时心算时差 |
+
+**`postgres` 光给 `TZ` 环境变量不够**（实测 2026-11-06）：
+`TZ` 只在数据库集群**首次初始化**时写进 `postgresql.conf`，
+已经有数据卷的机器重启多少次都不会变。所以 compose 里额外传了启动参数：
+
+```yaml
+command:
+  - postgres
+  - -c
+  - timezone=${TZ:-Asia/Shanghai}   # 每次都生效
+```
+
+**验证（三条都要对）**：
+
+```bash
+# ① 容器时间
+docker exec energy-server date        # 期望带 CST，且与宿主机 `date` 一致
+
+# ② 数据库会话时区（最容易漏的一条）
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc \
+  "SELECT now(), current_setting('TimeZone')"
+# 期望：...+08 | Asia/Shanghai
+
+# ③ 应用日志
+docker logs energy-server 2>&1 | tail -3 | cut -c1-60
+# 期望时间与宿主机一致
+```
+
+**换其他时区**：在 `~/energy-app/.env` 里加 `TZ=Asia/Tokyo`，
+然后 `docker compose --profile split up -d`（`restart` 不会重读 environment，
+必须 `up -d` 重建容器）。
+
+#### 宿主机本身要不要改
+
+**关键认识：容器时区与宿主机时区是两件独立的事。**
+容器里的 `TZ` 是自己设的，不跟随宿主机 —— 所以即使宿主机是 UTC，
+只要 compose 里写了 `TZ`，容器照样是北京时间。
+
+但宿主机时区错了会让你**看日志时对不上时间**（容器说 23:50，宿主机说 15:50），
+排查时极易误判。建议一并改对。
+
+**macOS（你本机）**
+
+```bash
+# 查看（不用 sudo）
+date                          # 期望尾部是 CST，且小时数与北京时间一致
+ls -l /etc/localtime          # 期望 -> .../zoneinfo/Asia/Shanghai
+```
+
+典型正确输出：
+
+```
+2026年11月 6日 星期五 23时50分39秒 CST
+/etc/localtime -> /var/db/timezone/zoneinfo/Asia/Shanghai
+```
+
+**已经是这样就不用改。** 如果不对（显示 UTC 或其他时区）：
+
+```bash
+sudo systemsetup -settimezone Asia/Shanghai
+# 若提示 “You need administrator access”，前面必须加 sudo
+```
+
+图形界面等效操作：系统设置 → 通用 → 日期与时间 → 时区。
+
+**Linux 服务器（部署机）**
+
+```bash
+date
+timedatectl status | grep -E "Time zone|Local time"
+```
+
+不对就改：
+
+```bash
+sudo timedatectl set-timezone Asia/Shanghai
+# 没 systemd 的老系统：
+sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+```
+
+> **NTP 也是必要条件**：时区对了但系统时间漂移，遥测的 `ts` 会写错，
+> 表现为曲线错位或抄表差分算出奇怪值。确认一下：
+>
+> ```bash
+> timedatectl status | grep -i "synchronized"   # Linux，期望 yes
+> ```
+>
+> macOS 默认开自动对时，一般不用管。
+
+> **存量数据不受影响**：遥测的 `ts` 是 epoch 毫秒（绝对时间），
+> 改时区不会让已有的点搬家。变的只是「日期/小时边界」怎么切。
+> 但已生成的**账单**是按旧口径算的 —— 改时区后建议对受影响月份重算一次。
+
 #### 分组维度的四个树根（用能分项 / 用能区域 / 空间位置 / 能耗类型）
 
 「查询维度 → 按分组维度」下拉里的选项来自**四个资产库**，靠 `asset.type` 区分：
