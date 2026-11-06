@@ -742,6 +742,177 @@ FROM b GROUP BY 1,2,3 HAVING count(*) > 1;
 2. 相等，再看差额是否正好等于 `基本合计` —— 是则属口径正常，不是 bug；
 3. 都不是，查分时单价与时段方案（见 §7 档案）。
 
+#### 某台表没有账单 —— 是「还没出账」，不是「算错了」
+
+**典型现象**：客户在「用能账单」里只勾几台表，结果列表里只出现一台，
+其余几台什么都不显示（连「0 元」都没有）。
+
+**根因：账单是一份快照，不是实时算的。** 出账（`POST /api/energy/billing/generate`）
+写一次 `energy_bill` 资产，之后**不会自动重算** —— 设备后来才有表底数据，
+也还是没它的账单，直到重新出账。
+
+**测一下有没有漏出账**（该账期有表底、但库里没账单的设备）：
+
+```sql
+SET TIME ZONE 'Asia/Shanghai';
+WITH p AS (SELECT '2026-11'::text AS period),
+win AS (
+  SELECT EXTRACT(EPOCH FROM (to_date(period||'-01','YYYY-MM-DD')::timestamp AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM ((to_date(period||'-01','YYYY-MM-DD') + INTERVAL '1 month')::timestamp AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+  FROM p
+),
+billed AS (
+  SELECT max(CASE WHEN kd.key='deviceId' THEN kv.str_v END)::uuid AS dev
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id=a.id AND kv.attribute_type=2
+  JOIN key_dictionary kd ON kd.key_id=kv.attribute_key
+  WHERE a.type='energy_bill'
+    AND a.id IN (SELECT kv2.entity_id FROM attribute_kv kv2
+                 JOIN key_dictionary kd2 ON kd2.key_id=kv2.attribute_key
+                 WHERE kd2.key='period' AND kv2.str_v=(SELECT period FROM p))
+  GROUP BY a.id
+),
+pts AS (
+  SELECT kv.entity_id AS dev, count(*) AS 表底点数,
+         min(kv.ts) AS 最早, max(kv.ts) AS 最晚
+  FROM key_dictionary kd JOIN ts_kv kv ON kv.key=kd.key_id CROSS JOIN win
+  WHERE kd.key='energy_reading' AND kv.ts>=win.s AND kv.ts<win.e
+  GROUP BY kv.entity_id
+)
+SELECT d.label AS 设备, d.type AS 类型, pts.表底点数,
+       to_char(to_timestamp(pts.最早/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 最早,
+       to_char(to_timestamp(pts.最晚/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 最晚
+FROM pts JOIN device d ON d.id = pts.dev
+WHERE pts.表底点数 >= 2 AND pts.dev NOT IN (SELECT dev FROM billed WHERE dev IS NOT NULL)
+ORDER BY pts.表底点数 DESC;
+```
+
+**判据**：结果非空就是「有数据但没出账」，而不是「算成了 0」。
+实测 2026-11：13 台（DDSU666 5102 点、三相/单相电表各 483 点、新风机组各 85 点…）
+都在这张列表里 —— 它们的表底是 11-04 之后才补进来的，而账单是 11-04 00:33 出的。
+
+**「是不是还没出账」最快判据**：调一次 `dryRun`（只算不写），它会逐台返回
+`usable` 与跳过原因：
+
+```bash
+curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"period":"2026-11","dryRun":true}' \
+  http://127.0.0.1:8090/api/energy/billing/generate \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);
+print('total',d['total'],'skipped',d['skipped']);
+[print(i.get('deviceName'),i.get('usable'),i.get('reason')) for i in d['items'] if not i.get('usable')]"
+```
+
+只有两种 `usable=false` 是正常的：
+
+- `未配置「X」的电价` —— 该品种没有绑定费率模板（新风/热水泵是 env，本来就不计价）
+- `本账期读数不足两点` —— 设备未上报
+
+其余一律是真漏出账，重新生成即可（幂等，只更新不新增）。
+
+#### 分时拆解的数字怎么复算（账期首小时会被跳过）
+
+**统计口径**（`EnergyBillingService#readUsage`，2026-11-06 逐行核过）：
+
+```
+① 读 energy_reading（表底累计读数），按【小时 MAX】聚合
+② TB 的聚合桶返回的 ts 是【桶中点】—— 整点时段的桶给 xx:30，⚠ 不是整点
+③ 过滤 ts <= 账期起点 + 1h → 【丢掉账期第一个小时】
+④ 相邻两点差分 × 倍率 = 该小时用量
+⑤ 差分归入【后一个点】所在的 TOU 时段（峰/平/谷/深/尖峰）
+⑥ 各档用量分别 × 单价，各档金额先取两位小数再相加 = 电度电费
+```
+
+**③ 这一条会让每月少算第一小时**。实测单相园-1#进线总表 2026-11：
+
+```
+账期 11-01 00:00 ~ 12-01 00:00
+桶：00:30=7789.77  01:30=7792.09  02:30=7794.33 …
+后端丢掉 00:30 → 从 01:30 起算 → 漏掉 00:00→01:00 这一段 2.32 kWh
+账单 338.49 vs 含首小时的 340.81（0.7%）
+```
+
+这是**已知偏差**，不是随机误差：对每台表、每个月都等于「账期第一个小时用量」。
+要修得改后端（读 `[from-1h, to]`，用 from 之前的最后一个读数做基线），
+会改变已出账金额，需要客户确认后再动。
+
+**独立复算（与上面的口径逐字对应）**：
+
+```sql
+SET TIME ZONE 'Asia/Shanghai';
+WITH p AS (SELECT '2026-11'::text AS period),
+win AS (
+  SELECT EXTRACT(EPOCH FROM (to_date(period||'-01','YYYY-MM-DD')::timestamp AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM ((to_date(period||'-01','YYYY-MM-DD') + INTERVAL '1 month')::timestamp AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+  FROM p
+),
+raw AS (
+  SELECT a.id AS bill_id, kd.key, kv.str_v, kv.dbl_v
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+  JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+  WHERE a.type='energy_bill'
+    AND kd.key IN ('period','deviceId','deviceName','usage','usageSource','hourlyPoints')
+),
+bills AS (
+  SELECT bill_id,
+         max(CASE WHEN key='deviceId'   THEN str_v END) AS dev_id,
+         max(CASE WHEN key='deviceName' THEN str_v END) AS 计量点,
+         max(CASE WHEN key='usageSource' THEN str_v END) AS 来源,
+         max(CASE WHEN key='usage'      THEN str_v END)::numeric AS 账单用量,
+         max(CASE WHEN key='hourlyPoints' THEN dbl_v END)::int   AS 账单点数
+  FROM raw
+  WHERE bill_id IN (SELECT bill_id FROM raw WHERE key='period' AND str_v=(SELECT period FROM p))
+  GROUP BY bill_id
+),
+h AS (
+  -- 桶 ts = 桶起始 + 30min，与 TB 聚合桶中点一致
+  SELECT kv.entity_id AS dev,
+         (EXTRACT(EPOCH FROM date_trunc('hour', to_timestamp(kv.ts/1000)))*1000 + 1800000)::bigint AS ts,
+         max(kv.dbl_v) AS reading
+  FROM key_dictionary kd JOIN ts_kv kv ON kv.key=kd.key_id CROSS JOIN win
+  WHERE kd.key='energy_reading' AND kv.ts>=win.s AND kv.ts<win.e
+  GROUP BY 1,2
+),
+seq AS (
+  SELECT h.dev, h.ts, h.reading,
+         lag(h.reading) OVER (PARTITION BY h.dev ORDER BY h.ts) AS prev
+  FROM h CROSS JOIN win WHERE h.ts > win.s + 3600000
+),
+calc AS (
+  SELECT dev, round(sum(reading - prev)::numeric,4) AS 重算用量, count(*) AS 重算点数
+  FROM seq WHERE prev IS NOT NULL GROUP BY dev
+)
+SELECT b.计量点, b.来源, b.账单用量, c.重算用量,
+       round((b.账单用量 - coalesce(c.重算用量,0))::numeric,4) AS 差异,
+       b.账单点数, c.重算点数,
+       CASE WHEN b.来源 <> 'telemetry' THEN '（手工/非遥测）'
+            WHEN abs(b.账单用量 - coalesce(c.重算用量,0)) < 0.01 THEN '✓'
+            ELSE '✗' END AS 判定
+FROM bills b LEFT JOIN calc c ON c.dev = b.dev_id::uuid
+WHERE b.来源 = 'telemetry'
+ORDER BY 判定 DESC, b.计量点;
+```
+
+**判据**：全部 `✓`，`差异` 均为 `0.0000`；
+`账单点数 - 重算点数 = 1`（差的就是被丢掉的首小时）。
+实测 2026-11：17 张遥测账单全部 ✓。
+
+**分时电费复算**（各档金额先取两位再相加，不是先加再取两位）：
+
+```
+电度电费 = round(tip用量×1.35,2) + round(peak用量×1.15,2)
+         + round(flat用量×0.72,2) + round(valley用量×0.38,2)
+         + round(deep用量×0.25,2)
+```
+
+实测单相园-1#进线总表：`0×1.35 + 123.46×1.15 + 134.52×0.72 + 42.41×0.38 + 38.10×0.25`
+= `0 + 141.98 + 96.85 + 16.12 + 9.53` = **264.48** ✓（若先加再取两位会得 264.47，差 1 分）。
+
+> **单价不一定取上面这五个数**：以账单 `details` 里回写的 `prices` 为准。
+> 水/气/汽走单一单价（`flat`），实测水 4.5 元/m³、燃气 3.6 元/m³、蒸汽 260 元/t。
+
 #### 已知坑
 
 | 现象 | 根因 | 判据 |
