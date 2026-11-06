@@ -811,6 +811,68 @@ print('total',d['total'],'skipped',d['skipped']);
 
 其余一律是真漏出账，重新生成即可（幂等，只更新不新增）。
 
+#### 重新出账 / 删单重出（界面、接口、应急 SQL）
+
+**客户自己在界面上就能做**（2026-11-06 起）：用能账单 → 账单明细 →
+勾选表计 → 点「生成账单」/「删除账单」。范围跟着左侧勾选走，
+没勾只会提示「请先勾选」，不会全量重刷。见用户手册「我的账单」。
+
+**运维批量做**（范围 = 不传 `devices`，或传具体 id 数组）：
+
+```bash
+# 出账（幂等：已有单只更新，不新增）
+curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"period":"2026-11","devices":["<设备id>","<设备id>"]}' \
+  http://127.0.0.1:8090/api/energy/billing/generate
+
+# 删单（可重出）
+curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"period":"2026-11","devices":["<设备id>"]}' \
+  http://127.0.0.1:8090/api/energy/billing/delete
+```
+
+「设备设成了不参与厂站能耗计算」也会让出账跳过它，原因写在 `items[].reason` 里。
+这是 2026-11-06 新增的排除 —— 与资产汇总、峰谷分析同一口径
+（见数据模型手册「是否参与厂站能耗计算」）。
+
+**删除的保护**：`status = paid`（已收款）的单一律拒绝，返回 `refused` 计数。
+这是凭证完整性，不是权限问题；真要冲销请先作废（`void`）保留痕迹。
+
+**界面删不动、接口也 500 时的应急 SQL**（最后手段，会把审计痕迹一起删掉）：
+
+```sql
+-- 先看清楚要删哪几张（务必先跑这段确认）
+SET TIME ZONE 'Asia/Shanghai';
+SELECT a.id, a.name,
+       max(CASE WHEN kd.key='deviceName' THEN kv.str_v END) AS 设备,
+       max(CASE WHEN kd.key='amount' THEN coalesce(kv.dbl_v, kv.str_v::numeric) END) AS 金额,
+       max(CASE WHEN kd.key='status' THEN kv.str_v END) AS 状态
+FROM asset a
+JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+WHERE a.type = 'energy_bill' AND a.name LIKE 'BILL-%-2026-11-%'
+GROUP BY a.id, a.name
+ORDER BY 3;
+```
+
+确认无误后按 id 删（**先属性、再资产**，顺序反了会留孤属性行）：
+
+```sql
+-- 把 '00000000-0000-0000-0000-000000000000' 换成上面查出来的 a.id
+DELETE FROM attribute_kv WHERE entity_id = '00000000-0000-0000-0000-000000000000';
+DELETE FROM asset WHERE id = '00000000-0000-0000-0000-000000000000';
+```
+
+> 不用写 `AND entity_type = 'ASSET'` —— **`attribute_kv` 没有这一列**
+> （实测列只有 `entity_id / attribute_type / attribute_key / *_v / last_update_ts / version`）。
+> 写了会直接报 `column "entity_type" does not exist`。
+> `asset_location` 这张表在 4.4 里也不存在。
+
+> ⚠ 直接改库不会清 TB 的实体缓存，界面可能还要一会儿才刷新；
+> 能走接口就走接口。而且 SQL 删是**物理删除**，没有撤销。
+
 #### 分时拆解的数字怎么复算（账期首小时会被跳过）
 
 **统计口径**（`EnergyBillingService#readUsage`，2026-11-06 逐行核过）：

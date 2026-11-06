@@ -146,6 +146,75 @@
 
 修复：`bash scripts/30-rtu-env-init.py`（第 ⑩ 步会补齐并清理多余旧边）。
 
+### 是否参与厂站能耗计算（`participateEnergyCalc`）
+
+设备详情里那个「参与 / 不参与」下拉，表达的是
+**「这台表的数据留着，但不进任何合计」**——转供、临时用电、
+与厂内重复计量的备用表，都是典型场景。
+
+| 项 | 值 |
+| --- | --- |
+| 属性名 | `participateEnergyCalc` |
+| 存在哪 | `attribute_kv`，`attribute_type = 2`（SERVER_SCOPE） |
+| 类型 | 布尔 |
+| 默认 | **参与**（缺失 / 空串 / 认不出的值一律当参与） |
+| 界面位置 | 设备详情 → 「是否参与厂站能耗计算」 |
+
+**为什么默认是「参与」而不是「不参与」**：这个字段 2026-10-28 才加，
+存量设备全都没有它。默认不参与，升级当天所有看板会变成一片 0 ——
+那是把「没配上」当成了「客户明确不要」。判据统一在
+`MeteringMath.participates()`，只认**显式为假**。
+
+**表单里它是二选一显示的**：二级类型是「未知 / 普通表 / 并网表」才出现这个下拉；
+「用户关口表」出现的是「额定容量」。见 `device-panel.component.html` 里
+`showParticipate` / `showRatedCapacity` 的说明。
+
+#### 改完之后为什么数字没变
+
+场站 / 分项 / 区域 / 能耗概览读的是**资产上的 `energy_total`**，
+不是设备遥测。这个值由 `AssetTotalsScheduler` 每小时重算一次
+（`energy.asset-totals.refresh.enabled`，默认开，`matchIfMissing = true`）。
+
+所以关掉一台表的「参与」，**要等下一次汇总**，看板合计才会少掉它。
+不想等就手工触发：
+
+```bash
+curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8090/api/energy/asset-totals/rebuild
+```
+
+> 设备自己的遥测**一个点都不会删**。关掉「参与」只是不进汇总，
+> 想看这台表的历史曲线，在查询设置里照样勾得到它。
+
+#### 各处的判断口径（2026-11-06 全仓排查，逐处实测）
+
+| 位置 | 判断 | 怎么判 |
+| --- | --- | --- |
+| 设备档案表单 | 写入 | `participateEnergyCalc`（布尔） |
+| 资产预汇总 `rebuildAssetTotals` | **是** | 显式 false → 不进任何合计 |
+| 峰谷分析 `EnergyAnalysisController` | **是** | 工作线程内判，排除并计入 `excludedMeters` |
+| 表计清单 `EnergyMeterReadingController` | **是**（下发） | 返回 `participate` 字段给前端 |
+| 部件 `power_load`（功率因数与负荷需量） | **是** | 过滤 `participate === false`，不进负荷统计 |
+| 部件 `tou_summary`（峰谷平统计） | **是** | 不进峰谷合计 |
+| 部件 `ranking_list`（排名） | **是** | 从排名里剔除 |
+| 查询设置的设备树 | **只对虚拟表** | `settings.participatingVirtual` 打开时，虚拟表按它过滤；**实时设备不过滤** |
+| 分析条件部件 `analysis_bar` | 不适用 | 它只下发时间窗 / 指标，不筛设备 —— 设备范围由查询设置负责 |
+| 能耗概览（`overview_stats` / `calendar_heatmap`） | **间接** | 读资产 `energy_total`，而预汇总已排除 |
+| 分项 / 区域图表（`asset_stats_chart` / `distribution_chart`） | **间接** | 同上，读资产树 + 预汇总 |
+| **用能账单出账** | **是**（2026-11-06 新增） | 显式 false → 跳过，原因写进 `items[].reason` |
+| **空闲能耗 `IdleEnergyService`** | **否**（已知缺口） | 按场站取设备，不判这个开关 |
+| **负荷预测 `EnergyForecastController`** | **否**（已知缺口） | 按设备 id 直读遥测 |
+
+**两条要记住的**：
+
+1. **查询设置的树不过滤实时设备**。客户在树里仍能看到并勾选
+   「不参与」的表，勾了之后右侧图表会出数（那是这台表自己的数据），
+   但合计/账单里不会有它 —— **这是设计，不是 bug**：
+   客户要能查这台表的历史，只是不参与汇总。
+2. 上面标「已知缺口」的两处**尚未接这个开关**。如果要让空闲能耗 /
+   负荷预测也遵守它，得改后端（当前口径是「按场站 / 按设备 id 全取」）。
+   改之前，客户在设备档案里关掉「参与」，这两块**不会跟着变**。
+
 ---
 
 ## 三、公共字典（租户级主数据）
