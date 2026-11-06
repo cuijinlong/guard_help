@@ -828,6 +828,66 @@ document.querySelectorAll('.widget-type-system-energy_management-query_panel .eq
 > 但首装这条从来没调 —— 以后新增“建客户”入口，记得把 repair-init 一并接上，
 > 或直接依赖 `02-onboard.sh` 的残留检查报错。
 
+#### 同类潜伏 bug：`filter.entityList[0].id` 取错形态（2026-11-07 统一修正）
+
+排查上面那个 404 时发现，另有 5 个部件的实体解析函数里写着：
+
+```js
+// ✗ 对字符串取属性
+id = filter.entityList[0].id;
+type = filter.entityList[0].entityType || 'ASSET';
+```
+
+**而 TB 原生 `EntityListFilter` 的 `entityList` 是 `List<String>`** ——
+元素就是 id 字符串，不是对象。所以上面两行对字符串取属性，
+`id` 恒为 `undefined`、`type` 恒为 `'ASSET'`。
+
+**为什么一直没暴露**：这 5 个部件当时的看板数据源都是 `singleEntity`
+或 `entityType`，不走这个分支；一旦有人给它们配 `entityList` 数据源，
+会“静默拿不到根”（卡片空着、不报错，比 404 更难查）。
+
+**还有一个更隐蔽的连带风险**：其中 3 个部件原先的兜底是
+`cb(id ? {...} : null)` —— **不挡占位符**。也就是说，如果只改取值不挡占位，
+占位符会被当成真实 id 拿去请求，把“静默失败”变成用户最烦的 404 红条。
+
+**统一后的写法**（5 个部件同构）：
+
+```js
+else if (filter && filter.type === 'entityList' && filter.entityList && filter.entityList.length) {
+  // 两种形态都认：List<String> 与 [{id, entityType}]
+  var e0 = filter.entityList[0];
+  id = (typeof e0 === 'string') ? e0 : (e0 && e0.id);
+  type = (e0 && e0.entityType) || 'ASSET';
+}
+```
+
+占位符过滤统一成两个口径（现有代码不动，只补缺的）：
+
+| 部件 | 占位符过滤 | 说明 |
+| --- | --- | --- |
+| `overview_stats` / `calendar_heatmap` | `usable()` | 原有，含「不等于品种 id」判断 |
+| `realtime_kpi` / `realtime_trend` / `distribution_chart` | `pickable()` | 新增，只挡 `00000000-0000-0000-0000-` 前缀 |
+
+**判据**（改完 5 个部件后，这几页必须仍出数）
+
+| 看板 | 部件 | 期望 |
+| --- | --- | --- |
+| 能耗概览（客户） | `overview_stats` | 今日/本月/今年电量有数字 |
+| 能耗概览（客户） | `calendar_heatmap` | 日历有热力值（如 276.0 / 274.7） |
+| 能耗概览（客户） | `distribution_chart` | 共 5 项分项占比 |
+| 实时能耗（客户/模板） | `realtime_kpi` | 当前总功率 / 今日电量 / 最大需量 |
+| 实时能耗（客户/模板） | `realtime_trend` | 功率曲线 + 时间轴 |
+| 分项/区域能耗（客户+模板） | `distribution_chart` | 分项 1 项 / 区域 2 项 |
+
+> **租户模板「能耗概览」的 `overview_stats` / `calendar_heatmap` 显示
+> 「请为本部件绑定一个数据源实体」是正常的** —— 模板的场站别名是占位符 `…05a1`，
+> 本来就没有真实场站。已做改动前后对照实测：两版文案完全一致，不是回归。
+> 客户副本因为已绑定真实场站，正常出数。
+
+> **以后排查口诀**：部件“静默空白/加载中”先看数据源是哪种过滤类型 ——
+> `entityList` 的元素是**字符串**，`singleEntity` 才是对象 `{id, entityType}`。
+> 两者混写就是上面这个 bug。
+
 ### 看板显示「数据源未解析到设备」/「当前 0 台计量点」（2026-11-04 实测）
 
 **症状**：看板框架、筛选条、KPI 卡片都在，但数字全 0，
