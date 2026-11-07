@@ -118,7 +118,20 @@ cd <你的仓库目录>
 bash guard-server/pack.sh
 ```
 
-等 12 分钟左右。它会依次做：构建前端 → 打包后端 → 检查 jar 里有没有前端。
+等 12 分钟左右。它会依次做：**同步远端 → 构建前端 → 打包后端 → 检查 jar 里有没有前端**。
+
+> **两台机器开发**（2026-11-07 起）：第 1 步会自动 `git fetch + pull`，
+> 并把另一台推上来的部件/看板改动直接应用到运行环境。
+> 离线或不想拉：`--no-sync`。详见后面「三个会让你翻车的坑」的坑 1.2。
+>
+> **想一条命令到重启**：
+>
+> ```bash
+> bash guard-server/pack.sh --deploy
+> ```
+>
+> 打完拷 jar 到 `~/energy-app/`、重启 `energy-server` 并等到 healthy（实测 1–2 分钟）。
+> 部署目录不在 `~/energy-app`：`--app-home /path/to/app`。
 
 **看到这个才算成功**：
 
@@ -143,6 +156,8 @@ bash guard-server/pack.sh
 | `jar 内无 UI` | 前端没打进去。去掉 `--skip-ui` 重跑 |
 | 报「需要 JDK 25」 | 回第 1 步 |
 | 要连跑第二次 | 只改了 Java：`bash guard-server/pack.sh --skip-ui`（省 4 分钟） |
+| `--skip-ui` 报「前端产物与源码不一致」 | 确实改了前端：去掉 `--skip-ui`；只改 Java 想复用：加 `UI_ALLOW_STALE=1` |
+| `--deploy` 报「找不到 docker-compose.yml」 | `--app-home` 指向错的目录，或这台机器没装部署环境 |
 
 > 已经打过 jar、这次没改后端代码？**跳过这一步**，直接去第 3 步。
 
@@ -1121,10 +1136,67 @@ bash scripts/08-verify-release.sh
 `ui-ngx/target/` 在 `.gitignore` 里，**前端产物不进版本控制**。
 pull 之后不跑 `pack.sh`，浏览器里就是上一次构建的界面。
 
-**判据**：`ls -la ui-ngx/target/generated-resources/public/index.html` 的时间
-必须**晚于**最后一次改 `ui-ngx/src` 的时间。
+**已经不用你记了**（2026-11-07 起）：`pack.sh` 第 1 步就是 `git fetch + pull` 并应用
+部件/看板改动，第 5 步构建前端。直接跑：
 
-**修**：跑 `bash guard-server/pack.sh`。
+```bash
+bash guard-server/pack.sh            # 同步 → 前端 → 后端
+bash guard-server/pack.sh --deploy   # 再加：拷 jar + 重启并等 healthy
+```
+
+**想知道产物新不新**：
+
+```bash
+node tools/check-ui-freshness.mjs    # 0 新鲜 / 1 过期 / 2 无产物
+```
+
+> **别看 mtime**。git 检出会把文件时间刷成「现在」，刚 pull 完但源码没变时，
+> mtime 判据会报假警报；真正该报的「改了源码忘了重建」反而不一定报。
+> 工具用 **ui-ngx 子树 hash**（`git rev-parse HEAD:ui-ngx`），只随内容变。
+
+**⚙ `--skip-ui` 会被拦住**：产物与源码不一致时 `pack.sh` 直接报错退出，
+不会默默把旧前端打进 jar。确实要复用（只改了 Java）：
+`UI_ALLOW_STALE=1 bash guard-server/pack.sh --skip-ui`。
+
+### 坑 1.2：两台机器开发，各自的产物是独立的
+
+两台机器用 git 同步源码，但**下面这三样 git 同步不了**：
+
+| 东西 | 在哪 | git 同步吗 |
+| --- | --- | --- |
+| 部件描述符 | 数据库 `widget_type.descriptor` | ❌ 仓库只存副本 |
+| 看板配置 | 数据库 `dashboard.configuration` | ❌ 仓库只存模板 |
+| 前端产物 | `ui-ngx/target/generated-resources/public` | ❌ 被 `target/` 忽略 |
+
+于是：
+
+```
+机器 A：改部件/前端 → 构建 → push
+机器 B：pull（源码新了）→ 打包 → jar 里是旧前端 + 库里是旧部件
+```
+
+**症状**：代码明明更新了，页面还是老样子；构建日志一切正常。
+
+**现在一条命令自动处理**（`pack.sh` 第 1 步调 `tools/sync-from-git.mjs --apply`）：
+
+1. `git fetch` + `pull --ff-only`
+2. 把变动的**部件 / 看板 / spsspro 直接应用到运行环境**（秒级）
+3. Java / 前端交给后面的构建步骤，不另外啰嗦
+
+不阻断打包的情况（各打一行告警就继续）：
+**离线**、**分支无上游**、**本地有未提交改动拉不动**（打断手里的活比装旧代码更糟）。
+
+**只想看远端有没有新东西**（不拉、不推库）：
+
+```bash
+node tools/sync-from-git.mjs --check   # 0 最新 / 2 有更新（会列出该跑什么）
+```
+
+**前提**：两台机器都要把改动 **push 到同一个远端分支**，并各自设好上游：
+
+```bash
+git push -u origin master
+```
 
 ### 坑 1.5：反复 `pack.sh` 会把多套前端叠进同一个 jar（新机器才暴露）
 
@@ -1254,6 +1326,27 @@ L2/L3/L4 全 ✓
 
 ## 两台电脑同时改同一个仓库
 
+**日常只需要这一条命令**（已实测跑通，9 分 43 秒）：
+
+```bash
+bash guard-server/pack.sh --deploy
+```
+
+它依次做：`git fetch + pull --ff-only` → 把变动的**部件/看板**直接推入库
+（秒级）→ 构建前端 → 打包后端 → 拷 jar 到 `~/energy-app` → 重启并等 healthy。
+**不用手跑 31/32/26/36 任何脚本。**
+
+| 场景 | 命令 | 耗时 |
+| --- | --- | --- |
+| 日常更新（含 Java / 前端改动） | `bash guard-server/pack.sh --deploy` | ~10 分钟 |
+| 只同步部件/看板（不改 Java/前端） | `node tools/sync-from-git.mjs` | 秒级 |
+| 只改了 Java | `bash guard-server/pack.sh --skip-ui --deploy` | ~5 分钟 |
+| 先看远端有没有新东西 | `node tools/sync-from-git.mjs --check` | 秒级 |
+| 只看三段链路一致不一致 | `node tools/verify-deploy.mjs` | ~10 秒 |
+
+> `--skip-ui` 需要前端产物有构建印记（`pack.sh` 构建时会写）。
+> 产物来源不可考时它直接拒绝——这是故意的，防止把旧前端打进 jar。
+
 `git pull --rebase --autostash` 会把未提交改动临时 stash 起来，
 **冲突时静默留在 `stash@{0}`**，工作区看起来「变回旧版」。
 
@@ -1269,7 +1362,92 @@ git stash show -p stash@{0} | head -40
 3. `32-check-deploy-sync.sh` 是否全绿（坑 2）
 4. 最后才怀疑 git：`git reflog` / `git stash list` / `git fsck --lost-found`
 
-详见[⑨ 排障](/admin/troubleshoot)。
+### ★ 母版模板被本机运行态污染（2026-11-07 实测）
+
+两台机器开发最容易出的一类错：**把本机数据库里的真实 id 提交进母版模板**。
+
+模板（`guard-server/src/main/data/json/tenant/dashboards/*.json`）里的
+实体引用**必须是占位符**（`00000000-0000-0000-0000-00000000xxxx`），
+复制给客户时由 `substitutePlaceholders` 换成客户自己的实体。
+写死真实 id 会：
+
+- 换一台机器部署 → 指向不存在的实体 → 部件 404、整页空
+- 新建客户复制模板 → 直接指向**别的客户**的实体
+- 真实 id 一旦被删（清演示数据）→ 模板永久坏死
+
+实测本机发现 2 个：`audit_report.json`（盘查报告）与 `sankey_flow.json`（能源流向）
+的「场站」别名指向 `c49164e0-…`（本机「总部·演示厂区A」组织），
+引入提交 `7cb4c4d1`。
+
+**一分钟查完全库模板**（应该一条都不输出）：
+
+```bash
+cd <仓库>
+python3 - <<'PY'
+import json, glob, os, re
+D = 'guard-server/src/main/data/json/tenant/dashboards'
+PAT = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+PH  = re.compile(r'^00000000-0000-0000-0000-00000000[0-9a-f]{4}$')
+bad = []
+def walk(o, path):
+    if isinstance(o, dict):
+        for k, v in o.items(): walk(v, path + '.' + k)
+    elif isinstance(o, list):
+        for i, v in enumerate(o): walk(v, path + '[%d]' % i)
+    elif isinstance(o, str):
+        if '.entityAliases.' in path and (path.endswith('.singleEntity.id')
+                or '.entityList[' in path):
+            if PAT.match(o) and not PH.match(o): bad.append((path, o))
+for p in sorted(glob.glob(D + '/*.json')):
+    d = json.load(open(p, encoding='utf-8'))
+    c = d.get('configuration') or d
+    if isinstance(c, str): c = json.loads(c)
+    walk(c, os.path.basename(p))
+for b in bad: print('  ✗', b[0], b[1])
+print('  ✓ 全部是占位符' if not bad else '  ↑ 上面这些要改成占位符')
+PY
+```
+
+占位符对照（`EnergyBootstrapInstaller` 的常量）：
+
+| 后缀 | 含义 | 谁用 |
+| --- | --- | --- |
+| `…05a1` | 第一个场站（单相园区） | 单场站看板 |
+| `…05a2` | 客户组织（全部场站） | 综合能耗 / 能耗洞察 / 能源流向 / 电能质量 / 盘查报告 |
+| `…11b7` | 能源参数字典（租户级） | 保持占位，**故意不替换** |
+| `…17e0` | 用电分项根 | 分项类看板 |
+| `…d101`~`d104` | 四个维度根 | 「按分组维度」 |
+
+> **为什么 `…11b7` / `…e1ec` 不替换**：它们指向**租户级**资产，
+> 客户直接读会 403。部件取品种走 `/api/energy/metric-params`，
+> 不依赖这两个实体。（详见 ⑨ 排障）
+
+**顺手会发现的另一类：模板在源码里根本不存在**
+
+实测 `energy_overview.json` 的 title 是「综合能耗」，与 `composite_energy.json` 撞名；
+而真正的「能耗概览」（客户菜单首页落地页，8 个部件）**只在库里**——
+它是 `nenghaobao/tools/apply-energy-overview.mjs` 生成的，不入 git。
+后果：
+
+- `26-sync-dashboard-templates.py` 按 title 匹配 → 源码那份会把
+  「综合能耗」模板覆盖成 8 部件版（串台）
+- 全新部署后首页看板从哪里来，源码里查不到
+
+已从库导出完整母版写回源码（title/name = 能耗概览）。
+
+**三方比对口诀**（发现「某页与另一台机器不一样」时先做这个）：
+
+```bash
+node tools/verify-deploy.mjs        # 源码 / 库 / 部署物料 三段链路
+```
+
+它会把「库中缺失 / 内容不同 / 部署物料缺失」分开报。
+出现偏差时按这个顺序定方向：
+
+1. 先看 git 历史确认源码是新的还是旧的（`git log -1 -- <文件>`）
+2. 再 `diff` 库与部署物料：如果两者相同而源码不同，**源码才是真相**
+   （说明运行态被改过）；如果部署物料单独不同，是物料漂移（跑 `32 --fix`）
+3. **绝不要**用旧源码覆盖新库 —— 那会把另一台机器刚加的功能抹掉
 
 ## 推送手册被拒（`! [rejected] main -> main (fetch first)`）
 
