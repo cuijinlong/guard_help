@@ -223,11 +223,11 @@ bash ~/energy-app/scripts/dev-fast-build.sh --deploy
 # ── 2b. 改了 pom / 资源 / 签名 → 全量
 cd guard-server && mvn package -DskipTests -o
 cp target/guard-server-4.4.0.jar ~/energy-app/
-cd ~/energy-app && docker compose --profile split --profile cassandra \
-  restart energy-server      # ⚠ 默认后端是 Cassandra，漏了 profile 会起不来
+cd ~/energy-app && docker compose --profile split restart energy-server
+  # 默认遥测后端是 sql，不需要 --profile cassandra（Cassandra 为预留能力，未启用）
 
 # ── 3. 验证（至少这四条）
-bash scripts/ts-mirror.sh                                    # Cassandra 后端必跑：镜像遥测到 PG
+bash scripts/ts-mirror.sh                                    # 仅 Cassandra 后端需要（当前 sql，可跳过）
 python3 scripts/27-customer-surface-probe.py ... --strict    # 客户视角无 4xx + 语义断言通过
 bash scripts/08-verify-release.sh ... \
   --customer demo@126.com --customer-pass '密码'             # 0 失败（项数随环境变，见下）

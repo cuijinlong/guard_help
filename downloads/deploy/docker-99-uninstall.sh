@@ -19,7 +19,7 @@
 #   bash docker-99-uninstall.sh --purge --yes --images=none     一个都不删（默认）
 #
 # 为什么默认保留：
-#   ngx-ai 后端镜像要 pip 装依赖 + 编译 Stan，重建约 5-10 分钟；
+#   spsspro 后端镜像要 pip 装科学计算栈，重建约 10-15 分钟；
 #   all-in-one 镜像更大。第二次部署时保留它们能省大量时间。
 #   公共镜像（postgres/nginx/temurin）可能被其他项目复用，更不该默认删。
 #
@@ -88,13 +88,13 @@ fi
 echo
 warn "即将彻底删除以下内容，不可恢复："
 echo "   · 本项目全部容器"
-echo "   · 数据卷 energy-pgdata / energy-ngxai-data / energy-allinone-data"
+echo "   · 数据卷 energy-pgdata / energy-spsspro-data / energy-allinone-data"
   [[ -n "$CASS_PROFILE" ]] && echo "   · 数据卷 energy-cassandra-data（检测到用过 Cassandra）"
 echo "   · 网络 energy_default"
 echo "   · 目录 ${APP_HOME}（jar、data、日志、前端产物）"
 case "$IMAGES" in
   none) echo "   · 镜像：保留（下次部署可省 5-10 分钟）" ;;
-  app)  echo "   · 镜像：删除自建镜像 energy/ngxai-backend、energy/allinone" ;;
+  app)  echo "   · 镜像：删除自建镜像 energy/spsspro-backend、energy/allinone" ;;
   all)  echo "   · 镜像：删除自建镜像 + postgres:16-alpine、nginx:1.27-alpine、eclipse-temurin:25-jre" ;;
 esac
 
@@ -139,7 +139,7 @@ fi
 log "删除容器、网络、卷"
 $COMPOSE $PROFILE_ARGS down -v --remove-orphans 2>/dev/null || $COMPOSE down -v --remove-orphans 2>/dev/null || true
 # down -v 对未在 compose 声明的外部卷不生效，按名字兜底
-docker volume rm -f energy-pgdata energy-ngxai-data energy-allinone-data energy-cassandra-data >/dev/null 2>&1 || true
+docker volume rm -f energy-pgdata energy-spsspro-data energy-allinone-data energy-cassandra-data >/dev/null 2>&1 || true
 docker network rm energy_default >/dev/null 2>&1 || true
 docker ps -aq --filter "name=energy-" | xargs -r docker rm -f >/dev/null 2>&1 || true
 
@@ -156,7 +156,7 @@ if [[ "$IMAGES" != "none" ]]; then
   log "清理镜像（模式：${IMAGES}）"
 
   # 自建镜像：删失败通常是还有容器在用，跳过即可，不打断流程
-  for img in "${AI_IMAGE:-energy/ngxai-backend:4.4.0}" "${ALLINONE_IMAGE:-energy/allinone:4.4.0}"; do
+  for img in "${SPSSPRO_IMAGE:-energy/spsspro-backend:4.4.0}" "${ALLINONE_IMAGE:-energy/allinone:4.4.0}"; do
     if docker image inspect "$img" >/dev/null 2>&1; then
       if docker rmi "$img" >/dev/null 2>&1; then ok "已删除 $img"
       else warn "$img 仍被其他容器使用，已跳过"; fi

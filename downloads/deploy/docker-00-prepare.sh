@@ -223,57 +223,66 @@ docker-*.sh
 .dockerignore
 IGNEOF
 
-# ---------------- 2b. ngx-ai（前端产物 + 后端源码） ----------------
-# 不能跳过：compose 的 gateway 依赖 ngxai-backend，缺目录会让 up 直接失败。
-# 反复重装时真正省时间的是复用前端产物 —— vite build 要 1 分钟，
-# 源码没动就没必要重跑。--rebuild-web 可强制重建。
-AI_ROOT="$ROOT/ngx-ai"
-if [[ -d "$AI_ROOT/backend" && -d "$AI_ROOT/frontend" ]]; then
-  log "打包 ngx-ai"
+# ---------------- 2c. spsspro（数据探索 / 用能质量分析） ----------------
+# 后端源码进镜像，前端产物由 nginx 托管。
+#
+# 两个必须注意的点：
+#   ① vite 的 outDir 是 ../backend/frontend_dist，不是 frontend/dist
+#      （直接读产物目录，别猜）。
+#   ② base 由 vite.config.js 根据 NODE_ENV 自动取 /spsspro/，
+#      不读 VITE_BASE 环境变量 —— 所以这里显式传 NODE_ENV=production。
+SP_ROOT="$ROOT/spsspro"
+if [[ -d "$SP_ROOT/backend" && -d "$SP_ROOT/frontend" ]]; then
+  log "打包 spsspro"
 
-  # 后端源码：排除宿主虚拟环境与数据，Linux 容器里不能用 macOS 的 .venv
-  mkdir -p "$STAGE/ngxai-backend"
-  ( cd "$AI_ROOT/backend" && tar -cf - \
-      --exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' \
-      --exclude='.pytest_cache' --exclude='data' --exclude='.env' \
-      --exclude='.DS_Store' . ) | ( cd "$STAGE/ngxai-backend" && tar -xf - )
-  cp "$HERE/ngxai/Dockerfile.backend" "$STAGE/ngxai-backend/Dockerfile.prod"
-  ok "后端源码：$(du -sh "$STAGE/ngxai-backend" | cut -f1)"
+  mkdir -p "$STAGE/spsspro-backend"
+  ( cd "$SP_ROOT/backend" && tar -cf - \
+      --exclude='.venv' --exclude='.venv-*' --exclude='__pycache__' --exclude='*.pyc' \
+      --exclude='ProgramData' --exclude='tests' --exclude='frontend_dist' \
+      --exclude='out' --exclude='build' --exclude='dist' --exclude='*.spec' \
+      --exclude='.env' --exclude='.DS_Store' . ) \
+    | ( cd "$STAGE/spsspro-backend" && tar -xf - )
+  # Dockerfile 随源码一起过去了，不用另置模板
+test -f "$STAGE/spsspro-backend/Dockerfile" \
+    || die "spsspro-backend 缺 Dockerfile（应在 spsspro/backend/Dockerfile）"
+  ok "后端源码：$(du -sh "$STAGE/spsspro-backend" | cut -f1)"
 
-  # 前端构建产物：base 用 /ngxai/，由 nginx 直接托管，不跑 node 容器
+  SPSSPRO_DIST="$SP_ROOT/backend/frontend_dist"
   NEED_BUILD="true"
-  if [[ "$REBUILD_WEB" != "true" && -f "$AI_ROOT/frontend/dist/index.html" ]]; then
-    # 产物必须是 /ngxai/ 前缀，且不比源码旧，才可复用
-    if grep -q '/ngxai/assets/' "$AI_ROOT/frontend/dist/index.html" \
-       && [[ -z "$(find "$AI_ROOT/frontend/src" "$AI_ROOT/frontend/index.html" \
-                    "$AI_ROOT/frontend/vite.config.ts" \
-                    -newer "$AI_ROOT/frontend/dist/index.html" 2>/dev/null | head -1)" ]]; then
+  if [[ "$REBUILD_WEB" != "true" && -f "$SPSSPRO_DIST/index.html" ]]; then
+    # 产物必须是 /spsspro/ 前缀，且不比源码新，才可复用。
+    # 前缀检查不能省：base 取错了，页面能打开但资源全 404、满屏白。
+    if grep -q '/spsspro/assets/' "$SPSSPRO_DIST/index.html" \
+       && [[ -z "$(find "$SP_ROOT/frontend/src" "$SP_ROOT/frontend/index.html" \
+                    "$SP_ROOT/frontend/vite.config.js" \
+                    "$SP_ROOT/frontend/.env.production" \
+                    -newer "$SPSSPRO_DIST/index.html" 2>/dev/null | head -1)" ]]; then
       NEED_BUILD="false"
     fi
   fi
 
   if [[ "$NEED_BUILD" == "true" ]]; then
-    log "构建前端（base=/ngxai/，约 1 分钟）"
-    if [[ -d "$AI_ROOT/frontend/node_modules" ]]; then
-      ( cd "$AI_ROOT/frontend" && VITE_BASE=/ngxai/ npx vite build >/tmp/ngxai-build.log 2>&1 ) \
-        || { tail -20 /tmp/ngxai-build.log; die "前端构建失败"; }
+    log "构建 spsspro 前端（base=/spsspro/，约 30 秒）"
+    if [[ -d "$SP_ROOT/frontend/node_modules" ]]; then
+      ( cd "$SP_ROOT/frontend" && NODE_ENV=production npm run build >/tmp/spsspro-build.log 2>&1 ) \
+        || { tail -20 /tmp/spsspro-build.log; die "spsspro 前端构建失败"; }
     else
-      docker run --rm -v "$AI_ROOT/frontend:/app" -w /app -e VITE_BASE=/ngxai/ \
-        node:22-slim sh -c 'corepack enable >/dev/null 2>&1; pnpm install --frozen-lockfile && pnpm exec vite build' \
-        >/tmp/ngxai-build.log 2>&1 \
-        || { tail -20 /tmp/ngxai-build.log; die "前端构建失败（容器方式）"; }
+      die "spsspro 前端依赖未装，先执行：cd $SP_ROOT/frontend && npm install"
     fi
   else
-    ok "前端产物未过期，复用（--rebuild-web 可强制重建）"
+    ok "spsspro 前端产物未过期，复用（--rebuild-web 可强制重建）"
   fi
 
-  rm -rf "$STAGE/ngxai-dist"
-  cp -R "$AI_ROOT/frontend/dist" "$STAGE/ngxai-dist"
-  grep -q '/ngxai/assets/' "$STAGE/ngxai-dist/index.html" \
-    || die "前端产物路径不对：index.html 里没有 /ngxai/assets/"
-  ok "前端产物：$(du -sh "$STAGE/ngxai-dist" | cut -f1)（base=/ngxai/）"
+  rm -rf "$STAGE/spsspro-dist"
+  cp -R "$SPSSPRO_DIST" "$STAGE/spsspro-dist"
+  grep -q '/spsspro/assets/' "$STAGE/spsspro-dist/index.html" \
+    || die "spsspro 前端产物路径不对：index.html 里没有 /spsspro/assets/"
+  ok "前端产物：$(du -sh "$STAGE/spsspro-dist" | cut -f1)（base=/spsspro/）"
 else
-  die "找不到 ngx-ai 源码（$AI_ROOT/backend 或 frontend），无法打包完整部署包"
+  # 不 die：部署包里其它功能（能耗、看板、抄表）不依赖它。
+  # 但要建空目录，否则 gateway 的 bind mount 会挂空、/spsspro/ 打不开。
+  warn "找不到 spsspro 源码（$SP_ROOT），数据分析页将不可用"
+  mkdir -p "$STAGE/spsspro-dist"
 fi
 
 # ---------------- 3. 生成 .env ----------------
@@ -383,7 +392,7 @@ HTTP_PORT=$ENV_HTTP_PORT
 # Java 直连口（跳过 nginx），仅供排查：
 #   HTTP_PORT 通、直连不通  → gateway 问题
 #   两个都不通              → energy-server 问题
-# ⚠ 不要把前端入口切到这里：它会绕开 /ngxai 反代、gzip、SPA 回退
+# ⚠ 不要把前端入口切到这里：它会绕开 /spsspro 反代、gzip、SPA 回退
 SERVER_DIRECT_PORT=$ENV_SERVER_DIRECT_PORT
 DB_NAME=thingsboard
 DB_USER=postgres
@@ -397,12 +406,14 @@ SERVER_HEAP=2g
 SERVER_HEAP_MB=2048
 # dev = 只有控制台日志；pro = 生产，日志按天落盘到 \${APP_HOME}/logs/
 SPRING_PROFILE=dev
-AI_IMAGE=energy/ngxai-backend:4.4.0
 ALLINONE_IMAGE=energy/allinone:4.4.0
 TB_API_USERNAME=tenant@thingsboard.org
 TB_API_PASSWORD=tenant
-# 遥测存储后端：sql（遥测与实体同存 Postgres）| cassandra（独立时序库，需 ~2GB 常驻）
-# 改这个值不迁移存量数据；空库部署随便切。详见手册「Cassandra」一节。
+# 遥测存储后端：sql（遥测与实体同存 Postgres 的 ts_kv）| cassandra（独立时序库）
+#
+# ★★ 固定 sql，Cassandra 是**预留能力、当前不启用**（2026-11-07 定案）。
+#     改这个值不迁移存量数据，且会让多个业务接口 500 —— 详见下方原因。
+#     系统稳定、数据量上千万行之后再评估，现在别动。
 #
 # ★ 默认 **sql**（2026-11-03 改，之前是「内存≥10GB 就用 cassandra」）：
 #
@@ -418,9 +429,11 @@ TB_API_PASSWORD=tenant
 #   旧逻辑保留的另一半理由仍然成立（8GB 机器 Cassandra 会把 VM 挤爆）：
 #   数据量在千万行 / 20GB 以内，Postgres 存遥测完全够用。
 #
-#   真要 Cassandra（千万行以上、写入压力大）：
+#   将来真要 Cassandra（千万行以上、写入压力大）：
 #     DATABASE_TS_TYPE=cassandra bash docker-00-prepare.sh
-#   此时业务侧针对 ts_kv 的查询会自动降级走 timeseriesService（能用，但慢）。
+#   业务侧针对 ts_kv 的查询有 TelemetryBackend 做降级（走 timeseriesService，
+#   能用但慢），但必须先实测峰谷分析 / 抄表 / 账单 / 电能质量四条链路
+#   都能出正确结果 —— 光看接口不报错不够，要核对数值。
 DATABASE_TS_TYPE=$DATABASE_TS_TYPE
 # 最新值后端：建议留 sql（查询快、与实体同库）
 DATABASE_TS_LATEST_TYPE=$DATABASE_TS_LATEST_TYPE

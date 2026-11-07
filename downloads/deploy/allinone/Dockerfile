@@ -1,6 +1,6 @@
 # 能源管理平台 · 单容器（all-in-one）镜像
 #
-# 一个容器里跑齐：PostgreSQL 16 + guard-server(Java 25) + ngx-ai(Python) + Nginx
+# 一个容器里跑齐：PostgreSQL 16 + guard-server(Java 25) + Nginx
 # 适合：单机试用、边缘设备、不想维护多容器编排的场合。
 #
 # 与分容器模式的取舍：
@@ -9,11 +9,17 @@
 #   分容器  —— 各组件独立重启/扩容，镜像复用好；但需要 compose 编排。
 #
 # 基础镜像选 python:3.10-slim-bookworm 而不是 temurin：
-#   开发环境的 Python 是 3.10，Prophet/cmdstanpy 在这套依赖上验证过；
-#   Debian bookworm 的 apt 生态同时能装 nginx / PostgreSQL / JDK。
+#   Debian bookworm 的 apt 生态能同时装 nginx / PostgreSQL / JDK。
 #   JDK 25 通过 Adoptium 官方 apt 源安装，版本与分容器模式一致。
 #
-# 构建上下文 = 部署目录（含 jar / data / ngxai-dist / ngxai-backend）。
+# ★ 单容器模式**不含数据分析后端（spsspro）**。
+#   它的科学计算栈（numpy/scipy/sklearn/catboost/shap）会让镜像再涨 1GB+，
+#   而单容器本来就是为了省内存的场景 —— 塞进去等于把这个模式的优点抹掉。
+#   需要数据探索 / 电能质量分析时用分容器模式（DEPLOY_MODE=split）。
+#   这里仍会 COPY spsspro 的前端产物，页面能打开并给出「后端未部署」的明确提示，
+#   而不是一个白屏。
+#
+# 构建上下文 = 部署目录（含 jar / data / spsspro-dist）。
 # 由 docker-00-prepare.sh 生成，不要手工构造。
 
 FROM python:3.10-slim-bookworm
@@ -60,33 +66,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -s "$(dirname "$(dirname "$JAVA_BIN")")" /opt/java/openjdk \
     && /opt/java/openjdk/bin/java -version
 
-# ------------------------------------------------------------------ ngx-ai 后端
-WORKDIR /app
-COPY ngxai-backend/requirements.txt ./
-RUN python -m venv /opt/venv \
-    && /opt/venv/bin/pip install --upgrade pip \
-    && /opt/venv/bin/pip install -r requirements.txt \
-    # 构建期编译一次 Stan 模型，避免首次预测多等 40 秒
-    && /opt/venv/bin/python -c "from prophet import Prophet; print('stan model cached')"
-
-COPY ngxai-backend/ ./
-RUN mkdir -p /app/data
-
 # ------------------------------------------------------------------ 应用资源
 # guard-server jar 与 install 数据目录
 COPY guard-server-4.4.0.jar /opt/energy/guard-server-4.4.0.jar
 COPY data/ /opt/energy/data/
 
-# 前端静态产物（base=/ngxai/）
-RUN rm -rf /usr/share/nginx/html/ngxai \
-    && mkdir -p /usr/share/nginx/html/ngxai
-COPY ngxai-dist/ /usr/share/nginx/html/ngxai/
+# 前端静态产物（base=/spsspro/）
+RUN rm -rf /usr/share/nginx/html/spsspro \
+    && mkdir -p /usr/share/nginx/html/spsspro
+COPY spsspro-dist/ /usr/share/nginx/html/spsspro/
 
 # 网关配置：把 upstream 指到 127.0.0.1（同容器）
 COPY nginx/energy.conf /etc/nginx/conf.d/default.conf
 RUN rm -f /etc/nginx/sites-enabled/default \
     && sed -i 's/server energy-server:8090;/server 127.0.0.1:8090;/' /etc/nginx/conf.d/default.conf \
-    && sed -i 's/server ngxai-backend:18801;/server 127.0.0.1:18801;/' /etc/nginx/conf.d/default.conf
+    # spsspro 后端不在本镜像里（见文件头）。把 upstream 指到本机是为了让
+    # nginx 能**启动** —— upstream 里的域名解析不到会直接报
+    # "host not found in upstream" 并拒绝启动，整个容器起不来。
+    # 指到 127.0.0.1 后：页面能开，/spssproapi/ 返回 502（后端确实没部署）。
+    && sed -i 's/server spsspro-backend:9000;/server 127.0.0.1:9000;/' /etc/nginx/conf.d/default.conf
 
 # 替换主配置而不是放 conf.d：Debian 默认主配置里已有 [supervisord] 段，
 # 再 include 一个同名段 supervisord 会直接报 "section already exists" 起不来。

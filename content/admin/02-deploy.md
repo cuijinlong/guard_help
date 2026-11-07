@@ -260,6 +260,378 @@ bash docker-02-start.sh --admin-email you@example.com --admin-pass '你的密码
 
 ---
 
+## 第 5b 步　数据分析子应用（spsspro）
+
+平台自带一个独立的分析子应用，用于「模拟电表遥测 → 选区设备建数据集 →
+发现用能质量线索 → 训练模型 → 出报告」的完整闭环。它跟 ngx-ai 一样，
+是 gateway 后面的一个平级服务，**不用单独装、不用单独配**。
+
+### 在哪
+
+```
+http://<平台IP>:8090/spsspro/
+```
+
+从平台左侧导航的「数据分析」进去也行。
+
+### 三个必须知道的事实
+
+**① 数据是模拟的，不是现场真实数据**
+
+底部健康接口明确返回 `has_real_data: false`。模拟器按物理模型生成
+三相电压/电流/功率/谐波等 46 个指标，并在其中**故意埋了 5 类用能质量问题**
+（谐波超标、三相不平衡、功率因数低、电压偏差、负荷异常）。
+用途是：在没有真实表计的时候，把"从数据发现问题"的完整流程跑通、
+把分析方法和报告模板定下来。**给客户演示时必须说明这一点。**
+
+**② 数据独立存一个卷，不跟 ThingsBoard 混**
+
+```
+energy-spsspro-data  →  容器内 /data
+                        ├── JJTDDatasets/        上传的数据集
+                        ├── JJTDTempDatasets/    临时数据集
+                        ├── metadata.duckdb      数据集元数据
+                        └── models/              训练产物
+```
+
+删容器、升级镜像都**不会**丢；只有 `docker compose down -v` 才会删。
+
+**③ 第一次启动慢**
+
+镜像要装 numpy/scipy/scikit-learn/catboost/shap/statsmodels/matplotlib，
+体积约 1.3GB，首次构建实测 **13 分钟左右**（其中 pip 下载 llvmlite 一个包就占 6 分钟）。
+之后只要 `requirements.txt` 没改，重建走层缓存，几十秒。
+
+### 验证它真的能用
+
+```bash
+# 后端活着（绕过 nginx）
+docker exec energy-spsspro-backend curl -fsS http://127.0.0.1:9000/health
+# 期望：{"status":"ok"}
+
+# 经 gateway（这才是客户实际走的路径）
+curl -s --noproxy '*' http://127.0.0.1:8090/spssproapi/explore/health
+# 期望：{"success":true,...,"has_real_data":false}
+
+# 前端页面
+curl -s --noproxy '*' -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/spsspro/
+# 期望：200
+```
+
+### 不对怎么查
+
+| 现象 | 原因 | 怎么办 |
+| --- | --- | --- |
+| `/spsspro/` 返回 **500** | 前端产物没挂上（目录不存在） | `ls ~/energy-app/spsspro-dist/index.html`；没有就重跑 `docker-00-prepare.sh` 再 `docker compose up -d --force-recreate --no-deps gateway` |
+| `/spsspro/` 返回 **404** | 同上，或 gateway 未重建 | 同上 |
+| 页面能开但**一片白屏** | 构建时 base 不是 `/spsspro/` | `grep -o 'src="[^"]*"' ~/energy-app/spsspro-dist/index.html`，应该带 `/spsspro/assets/` |
+| `/spssproapi/...` 返回 **404** | 请求被转给了 Java 服务 | 确认访问的是 `/spssproapi/` 而不是 `/api/` |
+| 接口 **超时 / 504** | 算法真的在跑（shap 很慢） | nginx 已设 600s；换个窗口看 `docker logs -f energy-spsspro-backend` |
+| 容器一直 **unhealthy** | 依赖没装完或启动报错 | `docker logs energy-spsspro-backend --tail 50` |
+
+> **不要**把 8090 的 `/spsspro/` 改成直连后端 9000 —— 直连会丢掉
+> nginx 的 SPA 回退（刷新深链接直接 404）、gzip 和 WebSocket 升级。
+
+#### 改了 Python 代码怎么生效（**不用重新 build**）
+
+后端业务代码是通过 compose 的 `volumes` **挂进容器**的，镜像只装 pip 依赖。
+所以改完 `.py` 只需要 3 秒：
+
+```bash
+cd <仓库目录>/spsspro/deploy && ./sync.sh --backend     # 仓库 → ~/energy-app，秒级
+cd ~/energy-app && docker compose --profile split restart spsspro-backend
+```
+
+**不要** `docker compose build`（5~8 分钟）—— 只有改了 `requirements.txt`
+（新增第三方包）才需要：
+
+```bash
+cd ~/energy-app && docker compose --profile split up -d --build spsspro-backend
+```
+
+两条排错要点：
+
+- **新增的 `.py` 必须放进已挂载的目录**（`energyflow/` `routers/` `dvadmin/`
+  `config/` `tcp/`）。挂到别处容器里读不到，且不报错。
+- **不要挂单个文件**（`main.py` 除外）。单文件 bind mount 在容器内写文件时
+  inode 会断，容器读到的还是旧内容 —— 表现就是「改了没生效」。
+
+### 电能质量分析：从建表到出报告
+
+这一节是完整的一条链路，照做就能得到一份「哪台表该先改、主要问题是什么」的报告。
+
+#### ① 建 6 台三相质量示范表
+
+> **这一步不是自动的。** 部署脚本（`01-install.sh` / `02-onboard.sh`）**不会**
+> 建这 6 台表 —— 只有手工跑 `43-seed-quality-meters.mjs` 才有。
+> 新环境照下面两条命令做一次即可（脚本幂等，重跑不会重复建）。
+
+```bash
+cd <仓库目录>
+node nenghaobao/energy-config/43-seed-quality-meters.mjs          # 先看会建什么（dry-run）
+node nenghaobao/energy-config/43-seed-quality-meters.mjs run      # 执行
+node nenghaobao/energy-config/43-seed-quality-meters.mjs verify   # 自检属性是否齐全
+```
+
+**只建档案不写数据**，遥测由第 ② 步的模拟器上报。
+
+> 脚本必须写齐 5 个平台标准属性：`type1`（电能）、`type2`（表计类型）、
+> `meterLevel`（2 分项）、`wiring`（3P4W）、`additionalInfo.siteId`（质量示范站）。
+> **少任何一个，数据探索的设备树里就看不到这台表** ——
+> 表现是「品种空 / 层级 0 / 无场站」，而脚本本身不报错。
+
+6 台表各对应一类典型问题，属性里带 `qualityProfile`：
+
+| 表 | 画像 | 特征 |
+| --- | --- | --- |
+| 三相质量-01 正常 | `normal` | 对照组，各项在国标限值内 |
+| 三相质量-02 谐波超标 | `harmonic` | 电流 THD 26~38%（限值 8%） |
+| 三相质量-03 三相不平衡 | `unbalance` | 电流不平衡约 50%（工程口径 ≤10%） |
+| 三相质量-04 功率因数低 | `low_pf` | cosφ 0.64~0.72（考核值 0.90） |
+| 三相质量-05 重载过载 | `overload` | 日间负载率峰值约 105% |
+| 三相质量-06 电压偏差 | `voltage` | 相电压约 201V，偏差 -8.4%（限值 ±7%） |
+
+#### ② 灌数据（模拟上报）
+
+```bash
+cd spsspro/tools/meter-sim
+python3 sim.py list                      # 确认 6 台表和画像
+python3 sim.py backfill --days 7         # 回填 7 天（5 分钟粒度，约 10 秒）
+python3 sim.py check --days 1            # 抽查物理自洽性
+```
+
+上报走的是**设备的 ACCESS_TOKEN 接口**，和现场 RTU / 网关同一条链路 ——
+不是直接写数据库。所以设备在线状态、最后活跃时间都会跟着更新。
+
+> **为什么要 5 分钟粒度**：用能质量看的是波形特征，1 小时均值会把谐波尖峰、
+> 不平衡抖动全部抹平。现场电能质量仪表的标准记录间隔就是 3~15 分钟。
+
+```bash
+python3 sim.py stream --interval 300     # 常驻实时上报（演示用，Ctrl+C 停）
+```
+
+#### ③ 在页面上做分析（三步向导）
+
+菜单入口 **「分析向导」**（`/spsspro/wizard`）。整条路径是三步，和 TB 的
+模型创建流程一致：**先说查什么 → 再定义对象 → 最后调参并启动**。
+
+> 页面里**没有场站下拉框** —— 场站只认右上角那一个。从客户账号菜单进来时
+> 默认取第一个有表的场站；右上角切了，页面 800ms 内自动换树并清空已选设备。
+> 一个页面两个场站源，迟早会出现「树上是 A 园区、数据是 B 园区」。
+
+**第一步：你想检测什么 / 想预测什么**
+
+两类模型，回答两个不同的问题，不能混：
+
+| 类型 | 回答的问题 | 引擎 |
+| --- | --- | --- |
+| 检测模型 | 过去到现在，哪里出了问题？ | 国标判据 + 隔离森林 + AHP/TOPSIS |
+| 预测模型 | 接下来会发生什么？ | 季节性基线 + 趋势，walk-forward 回测 |
+
+检测场景 4 个：电能质量诊断、用能异常排查、容量与负荷匹配、计量数据可信度。
+
+预测按四种策略分（与 TB 预测控件同名，客户不用重新学）：
+
+- **预报** · 未来轨迹 —— 预测明天每台设备的负荷曲线
+- **短视 · 达到阈值所需时间** —— 负荷何时会超过变压器容量
+- **期末总计** —— 到月底该场站将消耗多少电能
+- **击中目标** —— 本月用电能否控制在目标值以内
+
+**第二步：输入配置（目标实体 + 遥测字段）**
+
+- 目标实体：设备树，可按关口/普通表、相制筛选；默认只列**三相四线**表
+- 遥测字段：**按场景预置**。检测类可多选（必需项取消会被拦下）；
+  预测类只能选一个主指标 —— 多指标各建一个模型，不能混在一个预测里
+- 时间范围：7 / 14 / 30 / 60 天 + 重采样粒度
+
+**第三步：审查与构建**
+
+左边审查配置并列出「这份数据能支撑哪些判据」（缺哪项、依据哪条国标），
+中间按实际工况微调检测参数（每项都写了改了会怎样），右边选运行方式：
+
+- **仅运行一次** → 立即出结果
+- **保存为定时任务** → 每隔 N 分钟 / 每天定时自动跑
+
+点「启动分析」后一次跑完：取数 → 建数据集 → 检测/预测 → 统计分析 → 归因 → 报告。
+
+**结果区看到什么**
+
+- 检测：整改优先级排序（TOPSIS 健康度 + 主要问题实测/限值）、线索清单、
+  **跨设备统计验证**（最差那台 vs 其余：Mann-Whitney/Welch + 效应量 + p 值）、
+  相关线索（最强的一对，附「相关不等于因果」）
+- 预测：每台一张卡，含结论、动作建议、关键数字、**回测误差与可用性判定**
+  （误差 >15% 会明说「只能看趋势，不能拿具体数字做决策」）
+
+#### ③a 三层分工（2026-11-07 定案）
+
+```
+仪表板部件（TB dashboard）   ← 业务界面，与告警/设备管理同一套做法
+     │  /api/energy/model/*
+guard-server（业务层）       ← 权限 / 场站 / 设备范围 / 问题台账
+     │  device_ids + intent + params
+spsspro（模型层）            ← 取数 → 判据 → 预测 → 统计 → 归因 → 建议
+```
+
+| 层 | 负责 | 不负责 |
+| --- | --- | --- |
+| 部件 | 展示、交互、场站切换 | 选设备、算指标 |
+| Java | 权限、场站范围、设备清单、问题台账、定时任务入口 | 判据、算法、统计检验 |
+| Python | 取数、判据检测、预测、统计、归因、建议 | 判断用户能不能看 |
+
+> **为什么设备清单必须由 Java 传**：spsspro 用固定服务账号连平台，
+> 能看到全部租户的设备。让它自己选设备，等于把「看哪些数据」的决定权
+> 交给一个不知道用户是谁的服务。
+>
+> **为什么 Java 不重写算法**：判据表、AHP 权重、统计检验全在 Python。
+> 搬一份等于两套代码要同步维护，而且 Java 侧没有建模能力，只是透传。
+
+**Java 侧接口**
+
+```
+GET  /api/energy/model/topics?siteId=      专题清单 + 服务可用性
+GET  /api/energy/model/topics/{id}/run     跑专题（同步，8~15 秒）
+GET  /api/energy/model/meters?siteId=      设备清单（只显示，不计算）
+GET  /api/energy/model/findings/overview   积压总览（待处理数/设备排行/复现率）
+GET  /api/energy/model/findings            问题明细
+POST /api/energy/model/findings/resolve    标记已处理（按 fingerprint）
+GET  /api/energy/model/findings/by-site    场站维度对比
+```
+
+#### ③a2 问题台账：模型结论落成业务数据
+
+**为什么必须落库**：模型返回的 `clues` 是一次运行的**瞬时结论**。不落库就查不出
+「这台表连续三周报谐波超标」、算不出「本月发现多少问题、处理了几个」、
+也无法判断「哪些问题反复出现」。运维换人后全靠口头交接。
+
+表 `energy_analysis_finding`（业务库，随 PG 备份）：
+
+```
+tenant_id / customer_id / site_id / device_id / device_name
+intent / metric / kind / severity / title / judgment / standard
+fingerprint / evidence(JSON) / run_at / run_id / resolved_at
+```
+
+**问题指纹** = `设备 | 问题族 | 判据类型`，不含具体数值：
+
+- 数值从 37.6% 变 37.8% **不算**新问题
+- 一台表电压偏差三相都超 → **一个问题**（族 `voltage_dev` 自动合并），不是三个
+- 电流不平衡与电压不平衡 → 两个问题（判据不同、整改动作不同）
+
+> **问题族在哪定**：`spsspro/energyflow/discover.py` 的 `METRIC_FAMILY`，
+> 模型层在每条线索里返回 `family` 字段，业务层直接用。
+> Java 侧不要复制这份映射 —— 两边各写一份会出现「分析页说 7 个问题、台账说 4 个」。
+
+**统计整合看到什么**
+
+| 指标 | 含义 |
+| --- | --- |
+| 未处理问题数 | 按 fingerprint 去重，**不因运行次数翻倍** |
+| 按设备排行 | 哪几台表问题最多（客户最想看的） |
+| 按问题类型 | 主要是哪类问题（谐波 / 不平衡 / 功率因数…） |
+| 复现率 | 出现 ≥3 次的「老问题」—— 说明整改没落地 |
+
+**定时任务的结果怎么进台账**：`FindingSyncService` 每 5 分钟拉 spsspro 的
+运行历史（`/jobs/{id}/runs`，带完整结果），按 `run_id` 去重后写入。
+任务建的时候会在 spsspro 的 job 里写 `meta.tenant_id`（模型层原样存回，
+不解析）—— 没有租户归属的记录落库后任何查询都查不到，等于制造垃圾数据。
+
+#### ③a3 业务入口：菜单直接开到专题
+
+三个专题共用一块看板「用能分析」，菜单靠 query 参数区分（2026-11-07）：
+
+```
+/dashboards/<用能分析看板id>?topic=load-forecast     负载预测
+/dashboards/<用能分析看板id>?topic=power-quality     用能质量
+/dashboards/<用能分析看板id>?topic=energy-advice      用能建议
+```
+
+| 菜单项 | 配置 |
+| --- | --- |
+| 负载预测 | `linkType=DASHBOARD` + `dashboardId`（老的独立看板，仍可用） |
+| 用能建议 | `linkType=URL` + 上面带 `topic=energy-advice` 的地址，`openInNewTab=false` |
+| 用能质量 | `linkType=URL` + 上面带 `topic=power-quality` 的地址，`openInNewTab=false` |
+| 问题台账 | `linkType=DASHBOARD` + 问题台账看板 id |
+
+> **`openInNewTab` 必须是 false**。以前这两个项是 `true`，所以每点一次就
+> 弹一个新标签页，里面是 ngxai 的旧表单页 —— 客户报的就是这个。
+>
+> **菜单改完必须重启 `energy-server`**：`custom_menu` 有内存缓存，
+> 直接 `UPDATE` 库后接口还会返回旧值（实测：重启前 `/api/customMenu`
+> 仍返回 `/ngxai/biz/advice`，重启后变成新地址）。
+>
+> 菜单重建逻辑在 `EnergyMenuInstaller`，幂等判据是 `needsLegacyLinkUpgrade()` + `LEGACY_MENU_URLS`。
+> 把旧 url 加进这个集合，存量客户启动时会自动重建菜单；
+> 不要靠「菜单名改了没」这类代理判据（见 E45）。
+
+#### ③b 定时任务：让分析持续跑
+
+入口 **「分析任务」**（`/spsspro/jobs`）。三步向导第三步选「保存为定时任务」即可创建。
+
+页面显示：调度器状态、启用数量、下次运行时间；每个任务一行，带
+**上次结论摘要**与 **「结论有变化」标记**。
+
+> **为什么要有「有变化」这个标记**：每天推一模一样的 5 条问题，
+> 客户第三天就不看了。系统比对相邻两次的**结论指纹**（设备+指标+类型+严重度），
+> 只有真的变了（新增/消失/严重度升级）才标记。数值从 37.6% 变 37.8% 不算变化。
+
+- **立即运行**：同步执行并出结果，不用等下一次
+- **暂停/启用**：开关即改 `enabled`，下次时间自动重算
+- **详情**：配置 + 最近一次完整结果 + 历史记录（含每次是定时还是手动触发）
+
+任务与历史存在 `/data/jobs.db`（SQLite，和 `spsspro-data` 卷一起备份）。
+容器重启后任务定义不丢，到点继续跑。
+
+> **调度器没跑起来会长什么样**：任务页顶部显示「调度器未运行」。
+> 其余功能不受影响，只是不再自动执行 —— 这类静默失效必须能一眼看出来。
+
+排查：
+
+| 现象 | 原因 | 怎么办 |
+| --- | --- | --- |
+| 「调度器未运行」 | `/data` 不可写，SQLite 建库失败 | `docker logs energy-spsspro-backend \| grep 任务库` |
+| 任务到点没执行 | 容器时钟/时区不对 | `docker exec energy-spsspro-backend date`，应显示北京时间 |
+| 一直「尚无历史」 | `next_run_at` 是未来 | 详情里看下次时间；或点「立即运行」验证链路 |
+| 上次状态「失败」 | 设备没数据 / 平台接口超时 | 详情看错误原文；失败也会推进下次时间，不会每 10 秒重试刷爆接口 |
+
+#### ④ 归因结果怎么看
+
+报告第五章的排序表：
+
+```
+#   设备              健康度   主要问题            实测     限值
+1   三相质量-02 谐波超标   41.8%   电流谐波总畸变率    35.29    8.00
+2   三相质量-03 三相不平衡  56.4%   电流不平衡度        53.56   10.00
+...
+6   三相质量-01 正常      93.8%   全部达标            —        —
+```
+
+- **健康度** = TOPSIS 相对贴近度，100% 表示各项都理想。
+  它**不是一个分数**，不要拿它跨项目比较。
+- **主要问题**只从**真的超标**的指标里选（严重度 ≥1），
+  不会因为某个指标权重高就把它当主因。
+- **占总扣分** 说明该问题在这台设备的所有问题里占多大比重。
+
+> **方法边界（必须如实告诉客户）**：
+> ① 权重来自专家判断（安全影响 > 经济影响 + 有无国标硬限值），
+>    不是从数据里学出来的。换一套判断矩阵排序会变 —— 所以报告里把权重也列出来，接受质疑。
+> ② 整改方向是**排查路径**，不是施工方案。同一个谐波超标，可能是变频器、
+>    UPS 或 LED 驱动，必须现场实测才能定论。
+> ③ 判断矩阵通过一致性检验（CR<0.1）才会被采用；不通过会退化为等权并在报告里标明。
+
+#### ⑤ 常见问题
+
+| 现象 | 原因 | 怎么办 |
+| --- | --- | --- |
+| `sim.py list` 说没有符合条件的表 | 没跑 43 脚本，或设备缺 `wiring=3P4W`（相制按 wiring 判，不回退到名字） | 重跑 `43-seed-quality-meters.mjs run`，再 `verify` 看属性 |
+| 设备树里看不到这 6 台表 | 缺 `type1`/`type2`/`meterLevel`/`additionalInfo.siteId` 之一 | `43-seed-quality-meters.mjs verify` 逐个查；树上的空态提示会说是「没挂表」还是「被筛选掉了」 |
+| 生成数据集报「没有遥测」 | 没灌数据，或时间范围太短 | `python3 sim.py backfill --days 7` |
+| 页面顶部显示「模拟数据」 | spsspro 连不上平台，退回了内置模型 | 检查容器内 `TB_BASE`（应为 `http://energy-server:8090`，不是 127.0.0.1） |
+| 数据集 ID 提示「不存在或已过期」 | 后端重启会清空内存会话 | 重新生成数据集（数据没丢，在库里） |
+| 归因里某台表「全部达标」但线索里有它 | 线索是单指标判据，归因要求该指标严重度 ≥1 | 两者口径不同，以线索为准去复核 |
+
+
+---
+
 ## 第 6 步　建租户
 
 **为什么单独一步**：平台没有默认租户，系统管理员不能直接建客户（会 403）。
@@ -698,7 +1070,7 @@ bash docker-02-start.sh --allinone --admin-email ... --admin-pass ...
 | --- | --- |
 | 库表 | 150 上下（`SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`） |
 | 系统部件（install 后 DB 行数） | 740 上下 |
-| 交付的部件文件 | 586 个 |
+| 交付的部件文件 | 588 个 |
 | 客户看板模板 | 30 个 |
 | 建表 SQL | 8 个 |
 | 能源参数字典 | 1 个资产，标准 key **137** 个（电能 122） |

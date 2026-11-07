@@ -109,31 +109,60 @@ def main():
     ap.add_argument('--all', action='store_true', help='含租户级看板（默认只改客户级）')
     args = ap.parse_args()
 
-    seen = set()
     changed = 0
+    titles = set()
+    # ★ 去重只用于「打印一次」，**不能跳过写入**（2026-11-07 修）。
+    #
+    #   原实现是 `if title in seen: continue`。而 load() 按 ORDER BY title, id 取行，
+    #   加 --all 时同一 title 至少有「租户级模板」和「客户副本」两行 ——
+    #   只有先出现的那行被改，另一行被 seen 挡掉。
+    #   实测后果：跑完 --all 后客户副本是 true、模板仍是 false，
+    #   租户登录看「能耗概览」右上角就是没有场站开关（客户原话
+    #   「之前是有的，改回来」）。
     for title, did, conf in load(include_tenant=args.all):
-        if title in seen or title in EXCLUDE_TITLES:
+        if title in EXCLUDE_TITLES:
             continue
-        seen.add(title)
+        first_of_title = title not in titles
+        titles.add(title)
         cur = conf.get('settings') or {}
-        need = {k: v for k, v in REQUIRED.items() if cur.get(k) != v}
+        # ★ 只修**显式 false**，不补 None（2026-11-07 修，与 REQUIRED 上方注释对齐）。
+        #
+        #   原写法是 `cur.get(k) != v`，None != True → 也会补成 True。
+        #   --all 时就会把「客户能源档案」「峰谷时段」这类**租户专用运营页**
+        #   也塞上场站开关 —— 它们配的是跨客户的厂商/型号/费率主数据，
+        #   挂一个「当前场站」只会让客户以为列表被筛过（与 home.component.ts
+        #   对租户一律隐藏顶栏的理由完全相同）。
+        #   只修 false 还有一个好处：不动「本来就没设」的页面，不制造版本噪音。
+        need = {k: v for k, v in REQUIRED.items()
+                if cur.get(k) is False and v is True}
+        also_missing = [k for k, v in REQUIRED.items()
+                        if k not in cur and v is True]
         # toolbarAlwaysOpen 只修显式的 false（None = TB 默认常显，补 True 是噪音）
         if cur.get('toolbarAlwaysOpen') is False:
             need['toolbarAlwaysOpen'] = True
         if not need:
-            print(f'  跳过  {title:16s} 已符合')
+            if first_of_title:
+                if also_missing:
+                    print(f'  跳过  {title:16s} 未设置该键（默认折叠，不主动补）')
+                else:
+                    print(f'  跳过  {title:16s} 已符合')
             continue
         bits = [f'{k}: {cur.get(k)!r} → {v!r}' for k, v in need.items()]
-        print(f'  {"改动" if args.apply else "待改"}  {title:16s} ' + '; '.join(bits))
+        # 必须逐行列出来：同一标题的模板与客户副本可能是**不同**的值
+        # （实测「能耗概览」客户副本 true、模板 false）。
+        # 只打第一行会让人以为「已符合」，而真正要改的那份被藏在下面。
+        print(f'  {"改动" if args.apply else "待改"}  {title:16s} [{did[:8]}] ' + '; '.join(bits))
         if args.apply:
             conf.setdefault('settings', {})
             conf['settings'].update(REQUIRED)
+            if need.get('toolbarAlwaysOpen'):
+                conf['settings']['toolbarAlwaysOpen'] = True
             push(did, conf)
         changed += 1
 
     print()
     verb = '已改' if args.apply else '将改'
-    print(f'{verb} {changed} 个看板（共 {len(seen)} 个去重标题）')
+    print(f'{verb} {changed} 个看板（共 {len(titles)} 个标题）')
     if not args.apply and changed:
         print('加 --apply 才会真的写库')
 

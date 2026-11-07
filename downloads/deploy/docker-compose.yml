@@ -3,8 +3,8 @@
 # 架构（全部在同一个 compose 网络里）：
 #
 #   浏览器 ──▶ gateway (nginx :80) ──┬──▶ energy-server (Java, 8090)
-#                                    ├──▶ ngxai-backend (Python, 18801)
-#                                    └──▶ /ngxai/ 静态文件（前端构建产物）
+#                                    ├──▶ spsspro-backend (Python, 9000)
+#                                    └──▶ /spsspro/ 静态文件（前端构建产物）
 #
 # 对外只暴露 gateway 一个端口。数据库与应用服务都不直接对外。
 #
@@ -19,7 +19,7 @@
 # 设计取舍：
 #   · 不构建自定义 Java/nginx 镜像 —— 官方镜像 + 挂载 jar / 配置 / 静态文件。
 #     镜像层里不落业务文件，卸载时删目录就干净了。
-#   · ngxai-backend 必须构建镜像：pip 依赖（含 Prophet 编译 Stan）无法挂载复用。
+#   · spsspro-backend 必须构建镜像：pip 依赖（numpy/scipy/sklearn/catboost/shap）无法挂载复用。
 #   · install 放在独立 profile，正常 up 不会误跑。
 
 name: energy
@@ -51,17 +51,26 @@ x-db-env: &db-env
   # 实体元数据恒在 Postgres（不可改）。
   DATABASE_ENTITIES_TYPE: sql
   # 遥测存哪：
-  #   cassandra （默认）遥测存 Cassandra，Postgres 只存实体与最新值
-  #   sql                遥测也存 Postgres 的 ts_kv，按月分区
-  # 改这个值等于换存储后端：**存量数据不会自动迁移**，
-  # 见手册「Cassandra」一节，务必先迁移再切换。
+  #   sql        （默认）遥测存 Postgres 的 ts_kv 表
+  #   cassandra  遥测存 Cassandra，Postgres 只存实体与最新值
   #
-  # 为什么默认 Cassandra：遥测是时序写入，点数随设备数 × 指标数 × 时间
-  # 线性增长，Postgres 的 ts_kv 在千万级之后索引维护成本明显上升。
-  # Cassandra 按 (entity_id, key, ts) 分区，写入随节点线性扩容。
-  # 小规模部署（几十万点）用 sql 也完全够 —— 改成 sql 即可，
-  # 此时 docker-01/02 脚本会自动跳过 Cassandra 容器，不白吃内存。
-  DATABASE_TS_TYPE: ${DATABASE_TS_TYPE:-cassandra}
+  # ★ 默认值是 sql，不是 cassandra（2026-11-07 修正）。
+  #
+  #   这里原来写的是 `:-cassandra`，与安装脚本 docker-00-prepare.sh 里
+  #   `DATABASE_TS_TYPE:-sql` 的决策矛盾。后果很隐蔽：
+  #   .env 里恰好写了 sql 时没事，一旦 .env 丢失 / 新环境没生成 .env /
+  #   有人直接 docker compose up，compose 就按 cassandra 启动，
+  #   去连一个在独立 profile 里、根本没起来的 cassandra:9042 ——
+  #   表现为服务起来后遥测读写全部超时，而日志里只会说连不上数据库。
+  #
+  #   为什么业务上必须是 sql：平台自研的峰谷分析、抄表、账单、闲时能耗、
+  #   电能质量都直接查 ts_kv 表（见 EnergyAnalysisController:548 等）。
+  #   Cassandra 部署下 Postgres 没有 ts_kv 表，这些接口会 relation does not exist。
+  #   详见提交 eaafb051「遥测后端适配」。
+  #
+  #   将来要切 Cassandra：不能只改这个变量，必须先把上述 ts_kv 直查
+  #   全部改走 timeseriesService，否则功能会成片 500。见手册「Cassandra」一节。
+  DATABASE_TS_TYPE: ${DATABASE_TS_TYPE:-sql}
   # 最新值（设备详情页、看板的实时数字）单独选存储。
   # 小规模建议留 sql：查询快、与实体同库、少一次跨库往返。
   # 只有 Cassandra 集群规模较大时才考虑也放 Cassandra。
@@ -125,15 +134,20 @@ services:
     logging: *default-logging
 
   # ────────────────────────────────────────────────────────────────
-  # Cassandra：默认遥测存储（DATABASE_TS_TYPE=cassandra 时必需）。
+  # Cassandra：**预留能力，当前不启用**（2026-11-07 定案）。
   #
-  # 这个服务在独立的 "cassandra" profile 下，不在 split 里 ——
-  # 这样把 DATABASE_TS_TYPE 改成 sql 之后，它不会被顺带启动、白吃 2GB 内存。
-  # 启动脚本（docker-01/02）读 .env 自动决定要不要带 --profile cassandra。
+  # 遥测现在走 Postgres 的 ts_kv（DATABASE_TS_TYPE=sql），这是有意的：
+  # 峰谷分析 / 抄表 / 账单 / 闲时能耗 / 电能质量都直查 ts_kv，
+  # 换 Cassandra 这些功能会成片 500。要启用得先做业务适配，
+  # 不是改个环境变量的事 —— 详见 DATABASE_TS_TYPE 上方注释。
   #
-  # 手工启动时需要显式带 profile：
-  #   docker compose --profile split --profile cassandra up -d
-  # 或用管理脚本：scripts/11-cassandra.sh status|init|enable|disable
+  # 保留这段定义是为了将来系统稳定、数据量上千万行之后再启用，
+  # 免得重写。它跑在独立的 "cassandra" profile 里：
+  #   · 默认 up 不会启动，不占内存
+  #   · 只有显式 `--profile cassandra` 才会拉起来
+  #   · 镜像 cassandra:4.1（335MB）已在本机删除，启用时自动重新拉取
+  #
+  # 将来启用的完整步骤见手册「Cassandra」一节；现在别带这个 profile。
   #
   # 首次启动 2~5 分钟（JVM + 建系统表），健康检查就绪前不要跑 install ——
   # 否则安装程序会报 InvalidKeyspaceException: Invalid keyspace thingsboard。
@@ -276,7 +290,7 @@ services:
     #   HTTP 链路问题，用 8091 绕过 nginx 试一次即可排除网关因素。
     #
     #   ⚠ 8091 只是**排查用**，不要把前端入口切到它：
-    #     它绕过 nginx，会丢掉 /ngxai 反向代理、gzip、SPA 回退等配置。
+    #     它绕过 nginx，会丢掉 /spsspro 反向代理、gzip、SPA 回退等配置。
     expose:
       - "8090"
     ports:
@@ -300,46 +314,95 @@ services:
       start_period: 120s
     logging: *default-logging
 
-  ngxai-backend:
+  # ────────────────────────────────────────────── spsspro 数据分析
+  #
+  # 与 energy-server 平级：独立镜像、独立数据卷、经同一个 gateway 对外。
+  # 访问路径：/spsspro/（前端静态）→ /spssproapi/（本服务）
+  #
+  # 为什么不复用 energy-server 的镜像：
+  #   spsspro 是 Python 科学计算栈（numpy/scipy/sklearn/catboost/shap/
+  #   statsmodels/matplotlib），和 Java 服务的依赖零重叠，
+  #   塞进同一个镜像只会让两边都变大且升级互相阻塞。
+  spsspro-backend:
     profiles: ["split"]
-    # 首次 up 会自动构建；镜像已存在且源码未变时秒过（有层缓存）
     build:
-      context: ${APP_HOME}/ngxai-backend
-      dockerfile: Dockerfile.prod
-    image: ${AI_IMAGE:-energy/ngxai-backend:4.4.0}
-    container_name: energy-ngxai-backend
-    # uvicorn 要时间优雅退出
-    stop_grace_period: 30s
+      context: ${APP_HOME}/spsspro-backend
+      dockerfile: Dockerfile
+    image: ${SPSSPRO_IMAGE:-energy/spsspro-backend:4.4.0}
+    container_name: energy-spsspro-backend
+    # uvicorn 与在跑的算法任务要时间收尾（训练可能正在跑）
+    stop_grace_period: 45s
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-      energy-server:
-        condition: service_started
     environment:
-      # 时区（全栈统一北京时间）。镜像里 Dockerfile.prod 已设 TZ，
-      # 这里显式再写一遍：保证以后 Dockerfile 改了也不会掉回 UTC。
-      TZ: ${TZ:-Asia/Shanghai}
-      # 容器内互相访问用服务名；这里的 127.0.0.1 会是容器自己，必须是服务名
-      TB_BASE_URL: http://energy-server:8090
-      TB_USERNAME: ${TB_API_USERNAME:-tenant@thingsboard.org}
-      TB_PASSWORD: ${TB_API_PASSWORD:-tenant}
-      TB_MAX_CONCURRENCY: "16"
-      PG_ENABLED: "1"
-      PG_DSN: postgresql://${DB_USER:-postgres}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-thingsboard}
-      SQLITE_PATH: /app/data/ngxai.db
-      # 同源访问（都经 gateway），CORS 实际不触发；保留内网地址便于直连调试
-      CORS_ORIGINS: http://localhost:${HTTP_PORT:-8090},http://127.0.0.1:${HTTP_PORT:-8090}
+      TZ: Asia/Shanghai
+      # ── 平台地址（容器内必须用服务名）──────────────────────────
+      # 127.0.0.1 在容器里指向容器自己，不是宿主，更不是 energy-server。
+      # 实测（2026-11-07）：默认值会让数据源静默退回内置模拟数据 ——
+      # 页面照样能打开、能出图、能出报告，但分析的不是平台里的真实遥测。
+      # 这种「看起来完全正常」的失效最危险，所以 /spssproapi/explore/health
+      # 必须返回 has_real_data=true，验收脚本 03-verify.sh 里有这条断言。
+      TB_BASE: http://energy-server:8090
+      TB_USER: ${TB_API_USERNAME:-tenant@thingsboard.org}
+      TB_PASS: ${TB_API_PASSWORD:-tenant}
+      # platform（默认，连上就用真实遥测）/ simulated（强制模拟）
+      SPSSPRO_DATA_SOURCE: ${SPSSPRO_DATA_SOURCE:-platform}
+      # ── 数据目录 ──────────────────────────────────────────────
+      # config/algorithm_config.py 里这些字段的默认值指向开发机的
+      # macOS 绝对路径（/Users/.../ProgramData），容器里不存在。
+      #
+      # 这里靠 pydantic 的 env_nested_delimiter="__" 覆盖嵌套字段 ——
+      # 双下划线是嵌套分隔符：PROFILE_DATASET__DATA_DIR → dataset.data_dir。
+      # 不带双下划线写成 PROFILE_DATA_DIR 是**无效**的，且不会报错，
+      # 只会表现为「上传数据集失败 / 目录不存在」。
+      PROFILE_DATASET__DATA_DIR: /data/JJTDDatasets
+      PROFILE_DATASET__TEMP_DATA_DIR: /data/JJTDTempDatasets
+      PROFILE_DATASET__METADATA_DB: /data/datasets_metadata.csv
+      PROFILE_DATASET__CATEGORY_DB: /data/datasets_category.csv
+      PROFILE_DATASET__DUCKDB_PATH: /data/metadata.duckdb
+      PROFILE_MODEL_DIR: /data/models
+      # ── LLM 问答（可选）──────────────────────────────────────
+      # 不填也能启动，只是「AI 问答」页用不了；其余算法分析不受影响。
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DOUBAO_API_KEY: ${DOUBAO_API_KEY:-}
     volumes:
-      - ngxai-data:/app/data
+      # 命名卷：上传的数据集、metadata.duckdb、训练产物、报告都在这里。
+      # 不挂卷的话重建容器就全丢 —— 而这恰好是客户最不能丢的东西。
+      # ── 业务代码：bind mount，不烧进镜像 ──────────────────────
+      # 镜像只负责 pip 依赖（numpy/scipy/sklearn/shap 这些装一次几分钟）。
+      # 代码挂出来以后，改 Python 只需要：
+      #     docker compose --profile split restart spsspro-backend     （约 3 秒）
+      # 而不是 docker compose build（5~8 分钟）。
+      #
+      # ★ 为什么不用 uvicorn --reload 自动热载
+      #   reload 会 fork 一个 watcher 进程守着文件树。在 macOS + Docker
+      #   Desktop 的 virtiofs 上，目录事件经常丢失（改完不触发重载），
+      #   反而要手动 touch 才生效 —— 看起来像"改了没生效"，很难排查。
+      #   显式 restart 是确定性的：3 秒，且日志里能看到完整的重启边界。
+      #
+      # ★ 必须只挂目录，不能挂单个 .py
+      #   单文件 bind mount 在容器里重建文件时会断裂（inode 变了），
+      #   表现为改完代码容器里还是旧内容，且不报任何错。
+      - ${APP_HOME}/spsspro-backend/energyflow:/app/energyflow:ro
+      - ${APP_HOME}/spsspro-backend/routers:/app/routers:ro
+      - ${APP_HOME}/spsspro-backend/dvadmin:/app/dvadmin:ro
+      - ${APP_HOME}/spsspro-backend/config:/app/config:ro
+      - ${APP_HOME}/spsspro-backend/tcp:/app/tcp:ro
+      - ${APP_HOME}/spsspro-backend/main.py:/app/main.py:ro
+      - spsspro-data:/data
+    # 不映射宿主端口：统一从 gateway 的 /spssproapi/ 进。
+    # 要单独排查后端是否活着（绕过 nginx）：
+    #   docker compose exec spsspro-backend curl -fsS http://127.0.0.1:9000/health
     expose:
-      - "18801"
+      - "9000"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18801/ngxapi/health"]
-      interval: 15s
+      # /health 是 main.py 里唯一的无条件端点，不碰数据库、不碰文件系统
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 20s
       timeout: 5s
       retries: 20
-      start_period: 120s
+      # 首次构建要装 catboost/shap 这些大包，启动后再给 60 秒
+      start_period: 60s
     logging: *default-logging
 
   gateway:
@@ -353,12 +416,12 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
     depends_on:
       - energy-server
-      - ngxai-backend
+      - spsspro-backend
     ports:
       - "${HTTP_PORT:-8090}:80"
     volumes:
       - ${APP_HOME}/nginx/energy.conf:/etc/nginx/conf.d/default.conf:ro
-      - ${APP_HOME}/ngxai-dist:/usr/share/nginx/html/ngxai:ro
+      - ${APP_HOME}/spsspro-dist:/usr/share/nginx/html/spsspro:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null || exit 1"]
       interval: 15s
@@ -410,7 +473,7 @@ volumes:
     name: energy-pgdata
   cassandra-data:
     name: energy-cassandra-data
-  ngxai-data:
-    name: energy-ngxai-data
+  spsspro-data:
+    name: energy-spsspro-data
   allinone-data:
     name: energy-allinone-data

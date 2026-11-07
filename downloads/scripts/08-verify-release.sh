@@ -569,7 +569,7 @@ print(1 if n else 0)" 2>/dev/null || echo 0)
   # 站内路由（/sites、/self-check…）不在这里逐个查：SPA 对未知路径也返回
   # index.html，HTTP 状态区分不出来；真正的证据是构建产物里有对应组件，
   # 那由 G 段的 tb-self-check / tb-energy-dict 等特征串断言覆盖。
-  # /ngxai/ 是 nginx 直接托管的独立子应用，这里单独查它的入口。
+  # /spsspro/ 是 nginx 直接托管的独立子应用，这里单独查它的入口。
   F3=$(python3 - "$BASE" "$CTOK" "$CM" <<'PYEOF'
 import json, sys, urllib.request, urllib.error
 base, tok, cm = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -580,8 +580,8 @@ def walk(items):
         links.append(i)
         walk(i.get('children')); walk(i.get('pages'))
 walk(cfg.get('items'))
-bad_dash, ngxai, known = [], [], ('/sites','/device-management','/device-group',
-                                  '/device-topology','/self-check','/alarm-center','/param-report')
+bad_dash, spp, known = [], [], ('/sites','/device-management','/device-group',
+                                '/device-topology','/self-check','/alarm-center','/param-report')
 unknown = []
 for i in links:
     lt = i.get('linkType'); name = i.get('name') or ''
@@ -597,19 +597,19 @@ for i in links:
             bad_dash.append(f'{name}({did[:8]}:{type(e).__name__})')
     elif lt == 'URL':
         u = (i.get('url') or '').strip()
-        if u.startswith('/ngxai'):
-            ngxai.append(u)
+        if u.startswith('/spsspro'):
+            spp.append(u)
         elif u.startswith('/') and u not in known:
             unknown.append(f'{name}({u})')
-bad_ngxai = []
-for _ in set(ngxai):
+bad_spp = []
+for _ in set(spp):
     try:
-        urllib.request.urlopen(f'{base}/ngxai/', timeout=15)
+        urllib.request.urlopen(f'{base}/spsspro/', timeout=15)
     except Exception as e:
-        bad_ngxai.append(f'/ngxai({type(e).__name__})')
-print(len(links), len(bad_dash), len(bad_ngxai))
+        bad_spp.append(f'/spsspro({type(e).__name__})')
+print(len(links), len(bad_dash), len(bad_spp))
 print(' '.join(bad_dash))
-print(' '.join(bad_ngxai))
+print(' '.join(bad_spp))
 print(' '.join(unknown))
 PYEOF
 )
@@ -623,8 +623,8 @@ PYEOF
      '客户菜单只剩几项：跑一键修复初始化重装菜单（预期 15 个看板 + 若干站内路由）'
   eq "菜单里的看板全部可打开（失效 ${F3_DASH:-0} 个）" "${F3_DASH:-1}" "0" \
      "菜单指向已删除/未分配的看板，点进去会静默弹回能耗概览。失效：${F3_BAD}。跑一键修复初始化重绑菜单"
-  eq "菜单里的 /ngxai 子应用入口可达（失效 ${F3_NGX:-0} 个）" "${F3_NGX:-1}" "0" \
-     "ngxai 静态产物没部署到 nginx（${F3_BADNG}）：检查 ${APP_HOME:-.}/ngxai-dist 挂载"
+  eq "菜单里的 /spsspro 子应用入口可达（失效 ${F3_NGX:-0} 个）" "${F3_NGX:-1}" "0" \
+     "spsspro 静态产物没部署到 nginx（${F3_BADNG}）：检查 ${APP_HOME:-.}/spsspro-dist 挂载"
   if [[ -n "$F3_UNK" ]]; then
     echo "      ↳ 提示：这些站内路由不在已知清单，请确认前端已注册：$F3_UNK" >&2
   fi

@@ -53,6 +53,8 @@ POST /api/noauth/activate?activateToken=...   → 真正设密码并置 active
 | 点某菜单被「弹回」能耗概览 | 菜单指向的看板 id 不存在 | 查菜单 `config` 里的 dashboardId |
 | 菜单里还是旧名字（如「设备运维」） | 菜单配置未更新 | 改 `custom_menu.config` JSON，**改完必须重启后端**（有缓存，不重启不生效） |
 | 菜单名字对，但点进去是**旧界面** | 该功能同时有部件版和 Angular 站内路由，菜单指着旧的 | 把 `linkType` 从 `URL` 改成 `DASHBOARD` + 填 `dashboardId` + `hideDashboardToolbar: false`，详见下文「页面看起来还是旧版」 |
+| 点菜单**没反应**，地址栏停在 /home 不动 | 菜单 `url` 里带 `?a=b`，但前端把整串当路由路径（`?` 被编码成 `%3F`） | 2026-11-07 已修（`menu.models.ts` 的 `splitInAppUrl`）。旧前端需重新构建，临时可用不带 query 的地址 |
+| 业务菜单还在跳 `/ngxai/...` 子应用 | 菜单项还是 `linkType=URL` + `openInNewTab=true` 的老配置 | 改成看板入口：`/dashboards/<看板id>?topic=<专题id>`，见下文「业务页面不跳 ngxai」 |
 | 客户能读写别的客户的场站结构 | 接口只校验租户，没校验 customer | 后端问题，不是配置 |
 
 ### 客户菜单怎么绑
@@ -68,6 +70,42 @@ POST /api/customer
 
 **菜单是复制不是引用**：每个客户一份 `custom_menu` 记录，
 改模板不影响已开户的客户。这也是销户要删菜单的原因。
+
+### 业务页面不跳 ngxai（2026-11-07 定案）
+
+**客户原话**：「为什么我上面说的那几个功能平台还在跳 ngxai 的页面？」
+
+根因：那三个菜单项配的是 `linkType=URL` + `openInNewTab=true`，地址指向
+`/ngxai/biz/advice`、`/ngxai/biz/quality` —— 那是模型平台自己的表单页，
+样式与平台其它报表不是一套，而且每点一次开一个新标签页。
+
+**现在怎么配**（三层分工：spsspro 只算模型 → guard-server 出业务口径 → 仪表板出界面）：
+
+```json
+{
+  "name": "用能建议",
+  "menuItemType": "LINK",
+  "linkType": "URL",
+  "url": "/dashboards/bc953120-da57-11f1-a3d1-1192e109281d?topic=energy-advice",
+  "openInNewTab": false,
+  "visible": true
+}
+```
+
+三个专题的 id：`load-forecast`（负载预测）、`power-quality`（用能质量）、
+`energy-advice`（用能建议）。专题部件 `onInit` 时读地址栏的 `topic`，
+选中对应专题并**自动跑一次**（客户从菜单点进来是奔结论去的，不该再点一次按钮）。
+
+> **为什么用 query 而不是各建一块看板**：三个专题共用同一套查询条与结果区，
+> 拆三块会有三份配置漂移，改一处忘两处。
+>
+> **代价**：`topic` 这个 query 必须能被前端正确拆出来。旧的 `inAppMenuPath()`
+> 把带 `?` 的 url 整串塞进路由 path，`?` 被编码成 `%3F` —— 点了没反应，
+> 地址栏停在 `/home`。已在 `menu.models.ts` 里改成 `splitInAppUrl()` 拆分，
+> 这条修复对所有带 query 的站内菜单项都生效。
+
+**ngxai 里该保留什么**：只保留模型平台自己的入口（租户菜单「AI 分析」→ `/ngxai/`，
+模型训练与自定义预测）。**业务语义不进 Python**（AGENTS.md A7）。
 
 ---
 
@@ -1012,6 +1050,120 @@ cd ~/energy-app && docker compose --profile split restart energy-server
 > 清前清后各跑一次：`SELECT count(*) FROM ts_kv WHERE entity_id IN
 > (SELECT id FROM asset WHERE customer_id='<正式客户>')`。
 
+### 右上角没有场站选择了（客户：「之前是有的」）（2026-11-07 修完）
+
+**症状**：打开「能耗概览」（客户首页落地页），看板右上角没有「场站」选择器，
+只有「能耗概览 ▾」和下载图标。其它看板（分项能耗 / 实时能耗…）却都有。
+
+**先分清两个不同的场站选择器** —— 它们由完全不同的条件控制：
+
+| 来源 | 控制条件 | 谁能看到 |
+| --- | --- | --- |
+| **顶栏**（home）`tb-station-select` | 硬编码：`TENANT_ADMIN` / `SYS_ADMIN` 一律不显示 | **只有客户用户** |
+| **看板工具栏**（dashboard-page） | `settings.showStationSelect === true` | 所有人（含租户） |
+
+代码：`home.component.ts` 的 `showStationSelect` computed（角色 + 路由）
+与 `dashboard-page.component.ts` 的 `displayStationSelect()`（严格 `=== true`）。
+
+**根因：`能耗概览` 模板的 `showStationSelect` 是 `false`，而客户副本是 `true`。**
+
+```sql
+SELECT title, configuration::jsonb->'settings'->>'showStationSelect',
+       CASE WHEN customer_id IS NULL THEN '模板' ELSE '客户副本' END
+FROM dashboard WHERE title='能耗概览';
+-- 修前：模板 false / 客户 true
+-- 修后：模板 true  / 客户 true
+```
+
+所以客户账号一直能看到（看的是副本），租户账号打开模板就没开关 ——
+这才能解释「之前是有的」（之前用客户账号看过）。
+
+**全库对比才是判据**（只查一个看板会以为只有它错）：
+
+```sql
+SELECT title,
+  coalesce(configuration::jsonb->'settings'->>'showStationSelect','(未设)') AS tpl,
+  (SELECT coalesce(configuration::jsonb->'settings'->>'showStationSelect','(未设)')
+     FROM dashboard d2 WHERE d2.title=d1.title AND d2.customer_id IS NOT NULL LIMIT 1) AS cust
+FROM dashboard d1 WHERE customer_id IS NULL ORDER BY title;
+```
+
+实测 30 个模板里只有 3 个不一致：
+
+| 看板 | 模板 | 客户 | 结论 |
+| --- | --- | --- | --- |
+| 能耗概览 | false | true | **该修**（首页落地页） |
+| 电能质量数据集 | false | true | **该修** |
+| 组织与场站 | false | false | 保持关闭（那页本身就是管理场站的） |
+| 客户能源档案 / 峰谷时段 | (未设) | — | 租户专用运营页，不补 |
+
+**修法**：跑专门脚本（幂等）
+
+```bash
+python3 scripts/36-share-station-across-dashboards.py            # 预演
+python3 scripts/36-share-station-across-dashboards.py --apply    # 只改客户级
+python3 scripts/36-share-station-across-dashboards.py --all --apply  # 连模板一起
+```
+
+> 这个脚本原来有**两个 bug**，只跑客户级时看不出来，加 `--all` 才暴露：
+>
+> **① 按 title 去重把模板挡掉了。**
+> `load()` 按 `ORDER BY title, id` 取行，同一 title 至少有「模板」和「客户副本」两行。
+> 原代码 `if title in seen: continue` —— 只有先出现的那行被改。
+> 实测：客户副本先出现且已符合 → 模板被 seen 挡掉 → 跑完仍无开关。
+> 已修：去重只用于「打印不刷屏」，每一行都必须写入。
+>
+> **② 会把 `(未设)` 也补成 true。**
+> 原判断 `cur.get(k) != v`，`None != True` 成立 → 连「客户能源档案」
+> 「峰谷时段」这类**租户专用运营页**也塞上场站开关。它们配的是跨客户的
+> 厂商/型号/费率主数据，挂一个「当前场站」只会让客户以为列表被筛过
+> （与 home.component.ts 对租户一律隐藏顶栏同理）。
+> 已修：只改**显式 false**，不补 None。
+
+**⚠ 重装会不会丢**
+
+「能耗概览」**不在**仓库 `data/json/tenant/dashboards/` 里（那里只有
+`energy_overview.json`，title 是「综合能耗」）。它是 `nenghaobao/tools/
+apply-energy-overview.mjs` 建的（不入 git）。所以：
+
+- `26-sync-dashboard-templates.py` 按 title 匹配，**不会**覆盖它
+- `apply-energy-overview.mjs` 只在**新建**时用 `defaultConfiguration()`，
+  不碰已有看板的 settings —— 已给它补上 `showStationSelect: true`，
+  这样全新部署建出来就带开关
+- 如果担心存量漏了：**跑一次 `36-...py --all --apply` 就行**（幂等）
+
+**判据**（租户账号，打开模板 `9d6df960`）：
+
+```js
+// 右上角应有场站选择器
+document.querySelectorAll('button.tb-station-trigger').length;   // 期望 1
+// 且它在看板工具栏里（y ≈ 10，距右 ~170px）
+```
+
+#### 顺带确认：功率因数面板**不跟随**顶栏是设计如此
+
+用户提「最下面的功率因数不随上面的场站走，它自己可以切换就好了」——
+这个行为**已经实现**，不需要改代码。实测（客户账号，顶栏从办公园区切到生产园区）：
+
+| | 切前 | 切后 |
+| --- | --- | --- |
+| 顶栏 | 办公园区 | 生产园区 |
+| `overview_stats` | 58.2 | **886.2**（跟随）|
+| `power_load`（平均功率因数） | 办公园区 · 0.92 | **办公园区 · 0.92**（不跟随）|
+
+它自己有完整的切换控件（截图可见）：
+
+```
+平均功率因数 · 2026年11月     [场站][关口表]  「办公园区 ▾」
+用电容量负荷需量监控         按日[按月]按年  「关口表：办公园区 · 1#进线总表 ▾」
+```
+
+实测它自己的下拉确实可切（办公园区 → 生产园区，功率因数 0.92 → 0.926），
+「场站/关口表」模式切换也正常。设计原因与完整说明见
+【客户手册】③-页面的「功率因数与负荷需量」一节：它统计的是**关口表**
+不是场站，一块关口表可能还要跨场站对比，硬套顶栏会出现
+「顶栏 A、面板 B」的自相矛盾。
+
 ### 验收脚本报一堆客户侧失败（302 / 缺字段 / 台账异常）（2026-11-07 实测修完）
 
 **症状**：`08-verify-release.sh` 报 13 项失败，其中七八项看着像后端坏了：
@@ -1856,7 +2008,12 @@ docker exec energy-server env | grep DATABASE_TS_TYPE
 
 > 2026-11-03 之前，安装脚本按**物理内存**自动选：≥10GB 就上 Cassandra。
 > 结果是 16GB 的机器选了 Cassandra，现场表现成「看板空白 / 功能不好使」，
-> 排查很久才定位。**现在默认已是 `sql`**（`docker-00-prepare.sh`）。
+> 排查很久才定位。
+>
+> **2026-11-07 起彻底固定 `sql`**，Cassandra 降级为「预留能力、不启用」：
+> compose 里保留定义但在独立 profile 下、默认不启动，镜像也已从本机删除。
+> 同时修掉了 compose 与启动脚本里 `${DATABASE_TS_TYPE:-cassandra}` 的兜底默认值
+> （变量未定义时会误启 Cassandra），现在一律兜底 `sql`。
 
 **平台已做的适配**：查历史前先探测后端类型（`TelemetryBackend`），
 走不通就自动降级走 `timeseriesService` —— 不会再砸 500，但**降级就是慢**。
@@ -1878,9 +2035,9 @@ bash docker-02-start.sh --admin-email ... --admin-pass '...'
 > **注意**：换后端只是换读取端，`ts_kv` 与 Cassandra 是两套存储。
 > 不重建库只会看到「设备在、数据全空」。
 
-**真要 Cassandra 时**：显式指定
-`DATABASE_TS_TYPE=cassandra bash docker-00-prepare.sh`，
-并接受上表的性能差异。
+**真要 Cassandra 时**（**当前不建议**，见 [① 安装 · Cassandra](/admin/install#cassandra)）：
+先确认满足 01-install 里列的四项前提，再显式指定
+`DATABASE_TS_TYPE=cassandra bash docker-00-prepare.sh`，并接受上表的性能差异。
 
 ### `bash: scripts/xxx.sh: No such file or directory`
 

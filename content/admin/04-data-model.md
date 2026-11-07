@@ -198,7 +198,8 @@ curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
 | `energy-server` | 日志时间戳、峰谷时段划分、`energy_day` 日边界 |
 | `postgres` | `now()` / `date_trunc('day')` 的「今天」 |
 | `gateway` | nginx access log 时间戳 |
-| `cassandra` / `install` / `ngxai-backend` / `allinone` | 保持一致，避免排查时心算时差 |
+| `spsspro-backend` / `install` / `allinone` | 保持一致，避免排查时心算时差 |
+| `cassandra`（预留，当前不启用） | 将来启用时同样要设 `TZ` |
 
 **`postgres` 光给 `TZ` 环境变量不够**（实测 2026-11-06）：
 `TZ` 只在数据库集群**首次初始化**时写进 `postgresql.conf`，
