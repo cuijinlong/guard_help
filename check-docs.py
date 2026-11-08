@@ -162,16 +162,21 @@ def count_org_tabs(_repo) -> int:
 
 def count_verify_items(_repo) -> int:
     """
-    发布验收项数：读 08-verify-release.sh 里的 EXPECTED_PASS。
+    发布验收项数：读 08-verify-release.sh 里的 MIN_PASS。
 
     不静态数 ok/ge/eq 调用 —— 有些断言在 if/else 分支里，
     实际执行到哪一支取决于数据，静态统计会得出错误项数。
-    脚本自己会在结尾用这个常量自校验，所以它是唯一可信来源。
+
+    2026-11-07 起这个常量从 EXPECTED_PASS（精确值）改名成 MIN_PASS（下限）：
+    通过项数本来就会随环境漂移（没传客户账号少 9 项、本库没虚拟表又少一项、
+    传了客户账号跳过项转成通过又变多），精确比对把正常差异报成了脚本漂移。
+    现在脚本只查下限，真正的质量门是 FAIL == 0。
+    手册已不复述项数（见下面 patterns 为空），这里只保证常量可读。
     """
     src = _read(DOWNLOADS / 'scripts' / '08-verify-release.sh')
-    m = re.search(r'^EXPECTED_PASS=(\d+)\s*$', src, re.M)
+    m = re.search(r'^MIN_PASS=(\d+)\s*$', src, re.M)
     if not m:
-        raise RuntimeError('08-verify-release.sh: 找不到 EXPECTED_PASS')
+        raise RuntimeError('08-verify-release.sh: 找不到 MIN_PASS')
     return int(m.group(1))
 
 

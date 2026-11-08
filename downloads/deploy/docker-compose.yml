@@ -3,8 +3,8 @@
 # 架构（全部在同一个 compose 网络里）：
 #
 #   浏览器 ──▶ gateway (nginx :80) ──┬──▶ energy-server (Java, 8090)
-#                                    ├──▶ ngxai-backend (Python, 18801)
-#                                    └──▶ /ngxai/ 静态文件（前端构建产物）
+#                                    ├──▶ spsspro-backend (Python, 9000)
+#                                    └──▶ /spsspro/ 静态文件（前端构建产物）
 #
 # 对外只暴露 gateway 一个端口。数据库与应用服务都不直接对外。
 #
@@ -19,7 +19,7 @@
 # 设计取舍：
 #   · 不构建自定义 Java/nginx 镜像 —— 官方镜像 + 挂载 jar / 配置 / 静态文件。
 #     镜像层里不落业务文件，卸载时删目录就干净了。
-#   · ngxai-backend 必须构建镜像：pip 依赖（含 Prophet 编译 Stan）无法挂载复用。
+#   · spsspro-backend 必须构建镜像：pip 依赖（numpy/scipy/sklearn/catboost/shap）无法挂载复用。
 #   · install 放在独立 profile，正常 up 不会误跑。
 
 name: energy
@@ -31,23 +31,46 @@ x-logging: &default-logging
     max-file: "5"
 
 x-db-env: &db-env
+  # ── 时区：全栈统一北京时间 ──
+  #
+  # 不设的后果（实测 2026-11-06）：
+  #   · 容器默认 UTC，日志比北京时间少 8 小时，排查时间线容易看错；
+  #   · **峰谷时段整体错位 8 小时** —— 尖/峰/平/谷按 UTC 小时划分，
+  #     账单金额直接算错（这是业务口径问题，不只是显示问题）；
+  #   · 「今日」从 UTC 00:00 开始 = 北京时间早上 8 点，
+  #     energy_day 当天累计会跳过凌晨那段。
+  #
+  # 遥测本身的 ts 是 epoch 毫秒（绝对时间），不受时区影响；
+  # 受影响的是「日期/小时边界」的计算 —— 这正是要改的。
+  #
+  # 想用其他时区：在 .env 里写 TZ=Asia/Tokyo 即可覆盖。
+  TZ: ${TZ:-Asia/Shanghai}
   SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-thingsboard}
   SPRING_DATASOURCE_USERNAME: ${DB_USER:-postgres}
   SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
   # 实体元数据恒在 Postgres（不可改）。
   DATABASE_ENTITIES_TYPE: sql
   # 遥测存哪：
-  #   cassandra （默认）遥测存 Cassandra，Postgres 只存实体与最新值
-  #   sql                遥测也存 Postgres 的 ts_kv，按月分区
-  # 改这个值等于换存储后端：**存量数据不会自动迁移**，
-  # 见手册「Cassandra」一节，务必先迁移再切换。
+  #   sql        （默认）遥测存 Postgres 的 ts_kv 表
+  #   cassandra  遥测存 Cassandra，Postgres 只存实体与最新值
   #
-  # 为什么默认 Cassandra：遥测是时序写入，点数随设备数 × 指标数 × 时间
-  # 线性增长，Postgres 的 ts_kv 在千万级之后索引维护成本明显上升。
-  # Cassandra 按 (entity_id, key, ts) 分区，写入随节点线性扩容。
-  # 小规模部署（几十万点）用 sql 也完全够 —— 改成 sql 即可，
-  # 此时 docker-01/02 脚本会自动跳过 Cassandra 容器，不白吃内存。
-  DATABASE_TS_TYPE: ${DATABASE_TS_TYPE:-cassandra}
+  # ★ 默认值是 sql，不是 cassandra（2026-11-07 修正）。
+  #
+  #   这里原来写的是 `:-cassandra`，与安装脚本 docker-00-prepare.sh 里
+  #   `DATABASE_TS_TYPE:-sql` 的决策矛盾。后果很隐蔽：
+  #   .env 里恰好写了 sql 时没事，一旦 .env 丢失 / 新环境没生成 .env /
+  #   有人直接 docker compose up，compose 就按 cassandra 启动，
+  #   去连一个在独立 profile 里、根本没起来的 cassandra:9042 ——
+  #   表现为服务起来后遥测读写全部超时，而日志里只会说连不上数据库。
+  #
+  #   为什么业务上必须是 sql：平台自研的峰谷分析、抄表、账单、闲时能耗、
+  #   电能质量都直接查 ts_kv 表（见 EnergyAnalysisController:548 等）。
+  #   Cassandra 部署下 Postgres 没有 ts_kv 表，这些接口会 relation does not exist。
+  #   详见提交 eaafb051「遥测后端适配」。
+  #
+  #   将来要切 Cassandra：不能只改这个变量，必须先把上述 ts_kv 直查
+  #   全部改走 timeseriesService，否则功能会成片 500。见手册「Cassandra」一节。
+  DATABASE_TS_TYPE: ${DATABASE_TS_TYPE:-sql}
   # 最新值（设备详情页、看板的实时数字）单独选存储。
   # 小规模建议留 sql：查询快、与实体同库、少一次跨库往返。
   # 只有 Cassandra 集群规模较大时才考虑也放 Cassandra。
@@ -73,6 +96,11 @@ services:
     stop_grace_period: 60s
     restart: unless-stopped
     environment:
+      # 时区（全栈统一北京时间，详见顶部 x-db-env 注释）。
+      # Postgres 存的是 timestamptz / epoch，本身不依赖时区；
+      # 但 now()、date_trunc('day') 这类 SQL 函数按会话时区算，
+      # 不设的话「今天」会是 UTC 口径，跟应用层的日期对不上。
+      TZ: ${TZ:-Asia/Shanghai}
       POSTGRES_DB: ${DB_NAME:-thingsboard}
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
@@ -83,6 +111,17 @@ services:
       - max_connections=200
       - -c
       - shared_buffers=256MB
+      # 会话时区。
+      #
+      # ⚠ 只给 TZ 环境变量不够：TZ 只在**数据库集群首次初始化**时被
+      # 写进 postgresql.conf，已经有数据卷的机器重启多少次都不会变
+      # （实测 2026-11-06：容器 date 已是 CST，但 now() 仍返回 UTC）。
+      # -c timezone=... 是启动参数，每次都生效，是唯一可靠的方式。
+      #
+      # 影响范围：now()、date_trunc('day')、
+      # ts 到日期/小时边界的换算。存量数据是 epoch 毫秒，不受影响。
+      - -c
+      - timezone=${TZ:-Asia/Shanghai}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -95,15 +134,20 @@ services:
     logging: *default-logging
 
   # ────────────────────────────────────────────────────────────────
-  # Cassandra：默认遥测存储（DATABASE_TS_TYPE=cassandra 时必需）。
+  # Cassandra：**预留能力，当前不启用**（2026-11-07 定案）。
   #
-  # 这个服务在独立的 "cassandra" profile 下，不在 split 里 ——
-  # 这样把 DATABASE_TS_TYPE 改成 sql 之后，它不会被顺带启动、白吃 2GB 内存。
-  # 启动脚本（docker-01/02）读 .env 自动决定要不要带 --profile cassandra。
+  # 遥测现在走 Postgres 的 ts_kv（DATABASE_TS_TYPE=sql），这是有意的：
+  # 峰谷分析 / 抄表 / 账单 / 闲时能耗 / 电能质量都直查 ts_kv，
+  # 换 Cassandra 这些功能会成片 500。要启用得先做业务适配，
+  # 不是改个环境变量的事 —— 详见 DATABASE_TS_TYPE 上方注释。
   #
-  # 手工启动时需要显式带 profile：
-  #   docker compose --profile split --profile cassandra up -d
-  # 或用管理脚本：scripts/11-cassandra.sh status|init|enable|disable
+  # 保留这段定义是为了将来系统稳定、数据量上千万行之后再启用，
+  # 免得重写。它跑在独立的 "cassandra" profile 里：
+  #   · 默认 up 不会启动，不占内存
+  #   · 只有显式 `--profile cassandra` 才会拉起来
+  #   · 镜像 cassandra:4.1（335MB）已在本机删除，启用时自动重新拉取
+  #
+  # 将来启用的完整步骤见手册「Cassandra」一节；现在别带这个 profile。
   #
   # 首次启动 2~5 分钟（JVM + 建系统表），健康检查就绪前不要跑 install ——
   # 否则安装程序会报 InvalidKeyspaceException: Invalid keyspace thingsboard。
@@ -118,6 +162,8 @@ services:
     stop_grace_period: 180s
     restart: unless-stopped
     environment:
+      # 时区（全栈统一北京时间）。
+      TZ: ${TZ:-Asia/Shanghai}
       # 单节点部署：把自己当种子。多节点时列全部节点 "c1,c2,c3"。
       CASSANDRA_CLUSTER_NAME: ${CASSANDRA_CLUSTER_NAME:-Thingsboard Cluster}
       CASSANDRA_SEEDS: ${CASSANDRA_SEEDS:-cassandra}
@@ -212,6 +258,23 @@ services:
       # 以后要跟进官方新版网关页时，临时改回 true 启动一次，再重新打一遍中文补丁。
       TB_GATEWAY_DASHBOARD_SYNC_ENABLED: "false"
       JAVA_TOOL_OPTIONS: "-Xms512m -Xmx${SERVER_HEAP:-2g}"
+      # 资产汇总间隔（AssetTotalsScheduler）。
+      #
+      # 看板读的是**资产**上的 energy_total，由这个定时任务从设备数据汇总上去。
+      # 默认 1 小时 → 新接的表要等最多 1 小时才会出现在概览页，
+      # 表现为「设备页有数、概览页 / 分项对比是空」（实测 2026-11-06）。
+      # 演示 / 现场调试建议改 300000（5 分钟）。
+      #
+      # 注意：.env 里的变量**不会自动进容器**，必须在 compose 里显式传递 ——
+      # 漏了这行，改 .env 就不会生效，且不会报错。
+      ENERGY_ASSET_TOTALS_REFRESH_INTERVAL_MS: "${ENERGY_ASSET_TOTALS_REFRESH_INTERVAL_MS:-3600000}"
+      ENERGY_ASSET_TOTALS_REFRESH_ENABLED: "${ENERGY_ASSET_TOTALS_REFRESH_ENABLED:-true}"
+      # 波形对象存储（S3 兼容）。服务名 = compose 里的 waveform-store。
+      # endpoint 留空则波形不落盘（仍能生成展示），所以这里给默认值不会阻断启动。
+      ENERGY_WAVEFORM_ENDPOINT: "${ENERGY_WAVEFORM_ENDPOINT:-http://waveform-store:8333}"
+      ENERGY_WAVEFORM_ACCESS_KEY: "${S3_ACCESS_KEY:-energy}"
+      ENERGY_WAVEFORM_SECRET_KEY: "${S3_SECRET_KEY:-}"
+      ENERGY_WAVEFORM_BUCKET: "${S3_BUCKET:-energy-waveform}"
     volumes:
       - ${APP_HOME}/guard-server-4.4.0.jar:/opt/energy/app.jar:ro
       - ${APP_HOME}/data:/opt/energy/data:ro
@@ -233,7 +296,7 @@ services:
     #   HTTP 链路问题，用 8091 绕过 nginx 试一次即可排除网关因素。
     #
     #   ⚠ 8091 只是**排查用**，不要把前端入口切到它：
-    #     它绕过 nginx，会丢掉 /ngxai 反向代理、gzip、SPA 回退等配置。
+    #     它绕过 nginx，会丢掉 /spsspro 反向代理、gzip、SPA 回退等配置。
     expose:
       - "8090"
     ports:
@@ -257,43 +320,185 @@ services:
       start_period: 120s
     logging: *default-logging
 
-  ngxai-backend:
+  # ────────────────────────────────────────────── spsspro 数据分析
+  #
+  # 与 energy-server 平级：独立镜像、独立数据卷、经同一个 gateway 对外。
+  # 访问路径：/spsspro/（前端静态）→ /spssproapi/（本服务）
+  #
+  # 为什么不复用 energy-server 的镜像：
+  #   spsspro 是 Python 科学计算栈（numpy/scipy/sklearn/catboost/shap/
+  #   statsmodels/matplotlib），和 Java 服务的依赖零重叠，
+  #   塞进同一个镜像只会让两边都变大且升级互相阻塞。
+  spsspro-backend:
     profiles: ["split"]
-    # 首次 up 会自动构建；镜像已存在且源码未变时秒过（有层缓存）
     build:
-      context: ${APP_HOME}/ngxai-backend
-      dockerfile: Dockerfile.prod
-    image: ${AI_IMAGE:-energy/ngxai-backend:4.4.0}
-    container_name: energy-ngxai-backend
-    # uvicorn 要时间优雅退出
-    stop_grace_period: 30s
+      context: ${APP_HOME}/spsspro-backend
+      dockerfile: Dockerfile
+    image: ${SPSSPRO_IMAGE:-energy/spsspro-backend:4.4.0}
+    container_name: energy-spsspro-backend
+    # uvicorn 与在跑的算法任务要时间收尾（训练可能正在跑）
+    stop_grace_period: 45s
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-      energy-server:
-        condition: service_started
     environment:
-      # 容器内互相访问用服务名；这里的 127.0.0.1 会是容器自己，必须是服务名
-      TB_BASE_URL: http://energy-server:8090
-      TB_USERNAME: ${TB_API_USERNAME:-tenant@thingsboard.org}
-      TB_PASSWORD: ${TB_API_PASSWORD:-tenant}
-      TB_MAX_CONCURRENCY: "16"
-      PG_ENABLED: "1"
-      PG_DSN: postgresql://${DB_USER:-postgres}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-thingsboard}
-      SQLITE_PATH: /app/data/ngxai.db
-      # 同源访问（都经 gateway），CORS 实际不触发；保留内网地址便于直连调试
-      CORS_ORIGINS: http://localhost:${HTTP_PORT:-8090},http://127.0.0.1:${HTTP_PORT:-8090}
+      TZ: Asia/Shanghai
+      # ── 平台地址（容器内必须用服务名）──────────────────────────
+      # 127.0.0.1 在容器里指向容器自己，不是宿主，更不是 energy-server。
+      # 实测（2026-11-07）：默认值会让数据源静默退回内置模拟数据 ——
+      # 页面照样能打开、能出图、能出报告，但分析的不是平台里的真实遥测。
+      # 这种「看起来完全正常」的失效最危险，所以 /spssproapi/explore/health
+      # 必须返回 has_real_data=true，验收脚本 03-verify.sh 里有这条断言。
+      TB_BASE: http://energy-server:8090
+      TB_USER: ${TB_API_USERNAME:-tenant@thingsboard.org}
+      TB_PASS: ${TB_API_PASSWORD:-tenant}
+      # platform（默认，连上就用真实遥测）/ simulated（强制模拟）
+      SPSSPRO_DATA_SOURCE: ${SPSSPRO_DATA_SOURCE:-platform}
+      # 对象存储（S3 兼容）：技术算法工作台的数据集物化文件。
+      # 与 guard-server 共用同一个存储服务，不同 bucket。
+      # endpoint 留空也能启动 —— 只是虚拟数据集以外的功能不可用。
+      SPSSPRO_S3_ENDPOINT: "${SPSSPRO_S3_ENDPOINT:-http://waveform-store:8333}"
+      SPSSPRO_S3_ACCESS_KEY: "${S3_ACCESS_KEY:-energy}"
+      SPSSPRO_S3_SECRET_KEY: "${S3_SECRET_KEY:-}"
+      SPSSPRO_S3_BUCKET: "${S3_GUARDIAN_BUCKET:-energy-guardian}"
+      # 演示数据模拟器。**默认 false** —— 它写的是假数据，
+      # 客户生产环境开着它，看板上每个数字都是编的，而且不会有任何提示。
+      # 演示机在 .env 里显式写 SPSSPRO_SIMULATOR_ENABLED=true。
+      SPSSPRO_SIMULATOR_ENABLED: "${SPSSPRO_SIMULATOR_ENABLED:-false}"
+      SPSSPRO_SIMULATOR_INTERVAL: "${SPSSPRO_SIMULATOR_INTERVAL:-60}"
+      SPSSPRO_SIMULATOR_CUSTOMER: "${SPSSPRO_SIMULATOR_CUSTOMER:-平台演示中心}"
+      SPSSPRO_SIMULATOR_SCRIPT: "${SPSSPRO_SIMULATOR_SCRIPT:-/opt/energy/scripts/23-demo-simulator.py}"
+      # ── 开户与初始化（**内部工具，不给客户用**）─────────────────
+      # 页面 /spsspro/guardian/onboard 能建租户 / 建客户 / 建账号。
+      # 它是交付时的一次性工具，不是客户功能。
+      #   默认 false：忘了配 = 关着，比忘了关安全。
+      #   要打开就把 .env 里设成 true（env.example 已经是 true）。
+      # ── 技术分析工作台的身份校验 ────────────────────────────────
+      # Trend 分析菜单挂在**租户端**（scope=TENANT 的自定义菜单），
+      # 客户的菜单是另一套（scope=CUSTOMER），物理上看不到入口。
+      # 但"看不到入口"不等于"打不开"：知道地址直接输照样能进 ——
+      # 所以这一层必须校验身份，不能只靠菜单隐藏。
+      #
+      #   tenant（默认）必须有平台令牌，且是 TENANT_ADMIN / SYS_ADMIN
+      #   soft          无令牌放行（记日志）；有客户令牌仍拒绝。给本地调试用
+      #   off           不校验。只在完全隔离的开发机上用
+      SPSSPRO_GUARDIAN_AUTH: "${SPSSPRO_GUARDIAN_AUTH:-tenant}"
+      SPSSPRO_ONBOARD_ENABLED: "${SPSSPRO_ONBOARD_ENABLED:-false}"
+      # 内部访问口令：非空时请求必须带 X-Onboard-Token，否则 401。
+      # 对外开放前**至少**要设这一项 —— 光隐藏菜单挡不住直接调接口。
+      SPSSPRO_ONBOARD_TOKEN: "${SPSSPRO_ONBOARD_TOKEN:-}"
+      # 平台系统管理员：建租户必须 SYS_ADMIN（TENANT_ADMIN 建不了租户）。
+      # 只用于开户，不参与平时的数据读取。留空回落到 TB_ADMIN_*。
+      SPSSPRO_ONBOARD_ADMIN_USER: "${SPSSPRO_ONBOARD_ADMIN_USER:-}"
+      SPSSPRO_ONBOARD_ADMIN_PASS: "${SPSSPRO_ONBOARD_ADMIN_PASS:-}"
+      TB_ADMIN_USER: "${TB_ADMIN_USER:-}"
+      TB_ADMIN_PASS: "${TB_ADMIN_PASS:-}"
+      # ── 数据目录 ──────────────────────────────────────────────
+      # config/algorithm_config.py 里这些字段的默认值指向开发机的
+      # macOS 绝对路径（/Users/.../ProgramData），容器里不存在。
+      #
+      # 这里靠 pydantic 的 env_nested_delimiter="__" 覆盖嵌套字段 ——
+      # 双下划线是嵌套分隔符：PROFILE_DATASET__DATA_DIR → dataset.data_dir。
+      # 不带双下划线写成 PROFILE_DATA_DIR 是**无效**的，且不会报错，
+      # 只会表现为「上传数据集失败 / 目录不存在」。
+      PROFILE_DATASET__DATA_DIR: /data/JJTDDatasets
+      PROFILE_DATASET__TEMP_DATA_DIR: /data/JJTDTempDatasets
+      PROFILE_DATASET__METADATA_DB: /data/datasets_metadata.csv
+      PROFILE_DATASET__CATEGORY_DB: /data/datasets_category.csv
+      PROFILE_DATASET__DUCKDB_PATH: /data/metadata.duckdb
+      PROFILE_MODEL_DIR: /data/models
+      # ── LLM 问答（可选）──────────────────────────────────────
+      # 不填也能启动，只是「AI 问答」页用不了；其余算法分析不受影响。
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DOUBAO_API_KEY: ${DOUBAO_API_KEY:-}
     volumes:
-      - ngxai-data:/app/data
+      # 命名卷：上传的数据集、metadata.duckdb、训练产物、报告都在这里。
+      # 不挂卷的话重建容器就全丢 —— 而这恰好是客户最不能丢的东西。
+      # ── 业务代码：bind mount，不烧进镜像 ──────────────────────
+      # 镜像只负责 pip 依赖（numpy/scipy/sklearn/shap 这些装一次几分钟）。
+      # 代码挂出来以后，改 Python 只需要：
+      #     docker compose --profile split restart spsspro-backend     （约 3 秒）
+      # 而不是 docker compose build（5~8 分钟）。
+      #
+      # ★ 为什么不用 uvicorn --reload 自动热载
+      #   reload 会 fork 一个 watcher 进程守着文件树。在 macOS + Docker
+      #   Desktop 的 virtiofs 上，目录事件经常丢失（改完不触发重载），
+      #   反而要手动 touch 才生效 —— 看起来像"改了没生效"，很难排查。
+      #   显式 restart 是确定性的：3 秒，且日志里能看到完整的重启边界。
+      #
+      # ★ 必须只挂目录，不能挂单个 .py
+      #   单文件 bind mount 在容器里重建文件时会断裂（inode 变了），
+      #   表现为改完代码容器里还是旧内容，且不报任何错。
+      - ${APP_HOME}/spsspro-backend/energyflow:/app/energyflow:ro
+      - ${APP_HOME}/spsspro-backend/routers:/app/routers:ro
+      - ${APP_HOME}/spsspro-backend/dvadmin:/app/dvadmin:ro
+      - ${APP_HOME}/spsspro-backend/config:/app/config:ro
+      - ${APP_HOME}/spsspro-backend/tcp:/app/tcp:ro
+      - ${APP_HOME}/spsspro-backend/main.py:/app/main.py:ro
+      # 演示模拟器脚本（23-demo-simulator.py）。
+      #
+      # ★ 挂载而不是复制进镜像：脚本的**唯一真相源**在
+      #   shiyongshouce/downloads/scripts/，部署时由 docker-01-install.sh
+      #   装到 ${APP_HOME}/scripts。复制一份到镜像里就会出现「仓库改了、
+      #   容器里还是旧的」那种漂移，而两边日志都正常 —— 这正是 2026-11-07
+      #   看板事故的同一类原因。
+      #
+      # 只读：模拟器只需要执行，不该改这个目录。
+      - ${APP_HOME}/scripts:/opt/energy/scripts:ro
+      - spsspro-data:/data
+    # 不映射宿主端口：统一从 gateway 的 /spssproapi/ 进。
+    # 要单独排查后端是否活着（绕过 nginx）：
+    #   docker compose exec spsspro-backend curl -fsS http://127.0.0.1:9000/health
     expose:
-      - "18801"
+      - "9000"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18801/ngxapi/health"]
-      interval: 15s
+      # /health 是 main.py 里唯一的无条件端点，不碰数据库、不碰文件系统
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 20s
       timeout: 5s
       retries: 20
-      start_period: 120s
+      # 首次构建要装 catboost/shap 这些大包，启动后再给 60 秒
+      start_period: 60s
+    logging: *default-logging
+
+  # ------------------------------------------------- S3 对象存储（波形文件）
+  #
+  # 存电力波形（COMTRADE 的 .cfg + .dat）。为什么不放数据库：
+  #   · 一次故障录波动辄几 MB，塞 bytea 会让 PG 备份膨胀、查询变慢
+  #   · 波形是**文件**，天然适合对象存储（将来 RTU 直接上传，不经过 Java）
+  #
+  # ★ 为什么不是 MinIO：
+  #   MinIO 官方镜像 2025-10 起已从 Docker Hub 下架（`repository does not exist`），
+  #   quay.io 也拒绝匿名拉取 —— 实测 2026-11-07 三种源全部失败。
+  #   改用 SeaweedFS：同样是 **S3 兼容 API**，Java 侧走标准 SigV4，
+  #   将来 MinIO 镜像恢复，只换 image + 端口，代码不用动。
+  #
+  # ★ 浏览器**不直接**访问本服务：中间隔着 guard-server 做权限校验。
+  #   端口只绑 127.0.0.1，供本机排查；不对外暴露。
+  #
+  waveform-store:
+    profiles: ["split"]
+    image: chrislusf/seaweedfs:latest
+    container_name: energy-waveform-store
+    restart: unless-stopped
+    command: >
+      server -dir=/data -s3 -s3.port=8333
+      -s3.config=/etc/seaweedfs/s3.json
+      -master.volumeSizeLimitMB=1024
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:${WAVEFORM_S3_PORT:-19333}:8333"
+    volumes:
+      - ${APP_HOME}/seaweedfs-data:/data
+      - ${APP_HOME}/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      # 不能用 GET /：配了 s3.json 后匿名请求返回 403，健康检查会一直失败。
+      # master 的 /cluster/healthz 不需要鉴权。
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9333/cluster/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     logging: *default-logging
 
   gateway:
@@ -301,14 +506,18 @@ services:
     image: nginx:1.27-alpine
     container_name: energy-gateway
     restart: unless-stopped
+    environment:
+      # 时区（全栈统一北京时间）。影响 access log 的时间戳，
+      # 跟应用日志对时间时不用再心算 -8 小时。
+      TZ: ${TZ:-Asia/Shanghai}
     depends_on:
       - energy-server
-      - ngxai-backend
+      - spsspro-backend
     ports:
       - "${HTTP_PORT:-8090}:80"
     volumes:
       - ${APP_HOME}/nginx/energy.conf:/etc/nginx/conf.d/default.conf:ro
-      - ${APP_HOME}/ngxai-dist:/usr/share/nginx/html/ngxai:ro
+      - ${APP_HOME}/spsspro-dist:/usr/share/nginx/html/spsspro:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null || exit 1"]
       interval: 15s
@@ -327,6 +536,8 @@ services:
     container_name: energy-allinone
     restart: unless-stopped
     environment:
+      # 时区（全栈统一北京时间）。
+      TZ: ${TZ:-Asia/Shanghai}
       DB_NAME: ${DB_NAME:-thingsboard}
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
@@ -358,7 +569,7 @@ volumes:
     name: energy-pgdata
   cassandra-data:
     name: energy-cassandra-data
-  ngxai-data:
-    name: energy-ngxai-data
+  spsspro-data:
+    name: energy-spsspro-data
   allinone-data:
     name: energy-allinone-data

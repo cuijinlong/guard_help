@@ -18,6 +18,10 @@
 | **设备有数、看板是 0** | §5 资产汇总（最常见） |
 | 设备不在场站/区域/分项下 | §6 归属关系 |
 | 分项显示 kWh 但装的是水表 | §6.2 按品种分键 |
+| **分项/区域能耗页的合计对不上 / 两页数字一样** | §6.2b 统计核算 |
+| **账单金额对不上 / 账单页与分时拆解页金额不同** | §6.2c 账单核算 |
+| **基础报表/参数报表的曲线或明细对不上** | §6.2d 报表核对 |
+| **手工填报页的月度数字/合计对不上** | §6.2e 手工填报核对 |
 | 数字是天文数字 | §6.3 哨兵读数 |
 | 抄表读不出表底 | §8 抄表 |
 | 磁盘满了 / 要备份 | §9 表结构与空间、§10 备份 |
@@ -491,6 +495,764 @@ GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
 
 ---
 
+### 6.2b 分项 / 区域能耗看板的数字怎么核对（统计准确性验收）
+
+**什么时候用**：客户问「这个分布图的数字对不对」「分项和区域两页为什么差不多」
+「合计是不是虚高了」。**不要凭观感点头**，一条 SQL 对到底。
+
+**口径**（先记清这四条，否则算出来必定对不上）：
+
+1. 看板读的是**资产的 `energy_total` 遥测**，不是设备、不是属性表 `attribute_kv`；
+2. `energy_total` 是**每个时间桶的用量**（不是累积表底），所以区间合计 = `SUM`；
+3. 分项与区域是**场站下两套并列分类**（`asset.type` = `分项` / `区域`），
+   同一个场站下两者都存在 —— 交叉混入就会虚高约一倍；
+4. 「按日」档是**单期**（只选一天），所以窗口 = 当天 `00:00` ~ 次日 `00:00`。
+
+```sql
+-- ① 某场站某一天，分项与区域各自的合计（把日期/场站 id 换掉）
+SET TIME ZONE 'Asia/Shanghai';
+WITH win AS (
+  SELECT EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-04 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-05 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+)
+SELECT a.type AS 维度, a.label AS 名称,
+       ROUND(SUM(COALESCE(kv.dbl_v, kv.long_v))::numeric, 2) AS 当日合计,
+       count(*) AS 数据点
+FROM relation r
+JOIN asset a     ON a.id = r.to_id AND r.to_type = 'ASSET'
+JOIN key_dictionary kd ON kd.key = 'energy_total'
+JOIN ts_kv kv    ON kv.entity_id = a.id AND kv.key = kd.key_id
+CROSS JOIN win
+WHERE r.relation_type = 'Contains' AND r.relation_type_group = 'COMMON'
+  AND r.from_id = '<场站资产id>'::uuid
+  AND kv.ts >= win.s AND kv.ts < win.e
+GROUP BY a.type, a.label
+ORDER BY a.type, 当日合计 DESC;
+```
+
+**判据**（这就是「对」的样子）：
+
+- `维度 = 分项` 的行加起来 = 分项能耗页分布图的「总用电量」；
+- `维度 = 区域` 的行加起来 = 区域能耗页分布图的「总用电量」；
+- **两个合计一般不相等**（两套分类各算各的），相等反而说明过滤没生效。
+
+实测样例（演示厂区A / 办公园区 / 2026-11-04）：
+
+| 维度 | 名称 | 当日合计 |
+| --- | --- | --- |
+| 分项 | 照明 | 297.83 |
+| 分项 | 插座 | 0.90 |
+| 区域 | 公共区域 | 406.97 |
+| 区域 | A栋办公区 | 120.56 |
+
+→ 分项页应显示 **298.73**，区域页应显示 **527.53**。
+
+```sql
+-- ② 换区间批量核对（近 N 天，按天出）
+SELECT a.type AS 维度, a.label AS 名称,
+       count(DISTINCT date_trunc('day', to_timestamp(kv.ts/1000) AT TIME ZONE 'Asia/Shanghai')) AS 天数,
+       ROUND(SUM(COALESCE(kv.dbl_v, kv.long_v))::numeric, 2) AS 区间合计
+FROM relation r
+JOIN asset a ON a.id = r.to_id AND r.to_type = 'ASSET'
+JOIN key_dictionary kd ON kd.key = 'energy_total'
+JOIN ts_kv kv ON kv.entity_id = a.id AND kv.key = kd.key_id
+WHERE r.relation_type = 'Contains' AND r.relation_type_group = 'COMMON'
+  AND r.from_id = '<场站资产id>'::uuid
+  AND kv.ts > (extract(epoch from now()) * 1000)::bigint - 7*86400000
+GROUP BY a.type, a.label
+ORDER BY a.type, 区间合计 DESC;
+```
+
+**三个已知的历史坑**（都实测踩过，见到对应现象直接按表处理）：
+
+| 现象 | 根因 | 判据 |
+| --- | --- | --- |
+| 两页数字**完全相同**、合计约虚高一倍 | 消费部件没读 `childType`，分项和区域混算 | 分布图里出现「公共区域」（分项页）或「照明」（区域页） |
+| 趋势图只有坐标轴、y 轴 `0.0~1.0`、一根柱都没有 | 读 `pt.value` 而接口返回 `pt.v` → 全 NaN | 浏览器里 `svg rect` 数为 0 |
+| 趋势图空白，但分布图有数 | 趋势图下钻到叶子资产，而数据只到父级 | 叶子资产该区间 `energy_total` 为空 |
+
+> 前两条是 2026-11-05 修掉的（`distribution_chart` / `asset_stats_chart`），
+> 第三条同时修（趋势图在维度约束下不再下钻，与分布图同口径）。
+
+---
+
+### 6.2c 用能账单的数字怎么核对（含与分时拆解对不上时）
+
+**什么时候用**：客户问「这张单为什么这么多钱」「账单页和分时拆解页金额不一样」
+「账单是不是算错了」。
+
+#### 先记死两件事，否则查出来全是空
+
+**① 账单不在 `billing` 表**
+
+`billing` / `billing_detail` 建好了但**没有任何写入方**（2026-11-06 实测各 0 行），
+按它们查永远是空。账单是**资产**：
+
+| 存什么 | 在哪 |
+| --- | --- |
+| 账单本体 | `asset`，`type = 'energy_bill'`，`name = BILL-<客户码>-<账期>-<品种>` |
+| 账单字段 | `attribute_kv`，`attribute_type = 2`（SERVER_SCOPE） |
+| 归属客户 | `asset.customer_id` |
+
+**② 账单的金额字段存在 `str_v`，不是 `dbl_v`**
+
+这是最容易踩的一条 —— 写成 `kv.dbl_v` 全部返回 NULL，看起来像「账单没数据」。
+
+实测某张账单每个字段的落列（2026-11-06）：
+
+| 存储列 | 字段 |
+| --- | --- |
+| `str_v` | `amount` `energyFee` `basicFee` `powerFactorFee` `surchargeFee` `usage` `ratio` `readingDelta` |
+| `dbl_v` | `dataFrom` `dueDate` `generatedAt` `hourlyPoints` `meterLevel` |
+| `bool_v` | `partialPeriod` |
+| `json_v` | `details` |
+| `str_v`（标识类） | `period` `energy` `unit` `status` `billingNo` `deviceId` `deviceName` `customerId` |
+
+所以取数值一律用（片段，不是完整语句）：
+
+```
+coalesce(kv.dbl_v, nullif(kv.str_v, '')::numeric)
+```
+
+> 手册里的 ```sql 代码块会被 `check-docs.py` **真实执行**校验，
+> 所以纯片段不要标 sql 语言，否则校验会报语法错误。
+
+#### ① 某客户某账期，逐张核对（最常用）
+
+```sql
+SET TIME ZONE 'Asia/Shanghai';
+WITH b AS (
+  SELECT a.id,
+    max(CASE WHEN kd.key='deviceName' THEN kv.str_v END) AS 计量点,
+    max(CASE WHEN kd.key='period'     THEN kv.str_v END) AS 账期,
+    max(CASE WHEN kd.key='energyFee'  THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS 电度,
+    max(CASE WHEN kd.key='basicFee'   THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS 基本,
+    max(CASE WHEN kd.key='powerFactorFee' THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS 力调,
+    max(CASE WHEN kd.key='surchargeFee'   THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS 附加,
+    max(CASE WHEN kd.key='amount'     THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS 应付
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+  JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+  WHERE a.type = 'energy_bill' AND a.customer_id = '<客户id>'::uuid
+  GROUP BY a.id
+)
+SELECT 计量点, 电度, 基本, 应付,
+       round((coalesce(电度,0)+coalesce(基本,0)+coalesce(力调,0)+coalesce(附加,0))::numeric,2) AS 四项之和,
+       round((应付 - (coalesce(电度,0)+coalesce(基本,0)+coalesce(力调,0)+coalesce(附加,0)))::numeric,2) AS 差
+FROM b WHERE 账期 = '2026-11' ORDER BY 应付 DESC;
+```
+
+**判据 ①**：`应付 = 电度 + 基本 + 力调 + 附加`，`差` 应为 **0.00**（浮点四舍五入允许 0.01）。
+
+实测（演示厂区A / 2026-11，19 张全部 `差 = 0.00`）：
+
+| 计量点 | 电度 | 基本 | 应付 |
+| --- | --- | --- | --- |
+| 三相园-1#进线总表 | 12,004.42 | 1,500 | 13,504.42 |
+| 三相园-车间动力总表 | 11,059.27 | 0 | 11,059.27 |
+| 单相园-1#进线总表 | 264.48 | 1,500 | 1,764.48 |
+
+#### ② 汇总构成
+
+```sql
+SELECT count(*) AS 账单数,
+       round(sum(amount)::numeric,2)     AS 应付合计,
+       round(sum(energy_fee)::numeric,2) AS 电度合计,
+       round(sum(coalesce(basic_fee,0))::numeric,2) AS 基本合计,
+       round(sum(coalesce(pf_fee,0))::numeric,2)    AS 力调合计,
+       round(sum(coalesce(sur_fee,0))::numeric,2)   AS 附加合计
+FROM (
+  SELECT a.id,
+    max(CASE WHEN kd.key='amount'     THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS amount,
+    max(CASE WHEN kd.key='energyFee'  THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS energy_fee,
+    max(CASE WHEN kd.key='basicFee'   THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS basic_fee,
+    max(CASE WHEN kd.key='powerFactorFee' THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS pf_fee,
+    max(CASE WHEN kd.key='surchargeFee'   THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS sur_fee
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+  JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+  WHERE a.type='energy_bill' AND a.customer_id = '<客户id>'::uuid
+  GROUP BY a.id) x;
+```
+
+实测：`19 | 56,746.35 | 53,746.35 | 3,000.00 | 0.00 | 0.00`
+（53,746.35 + 3,000 = 56,746.35 ✓，基本电费正好是两张进线表各 1,500）
+
+#### ③ 按月汇总（核对月度趋势）
+
+```sql
+WITH b AS (
+  SELECT a.id,
+    max(CASE WHEN kd.key='period' THEN kv.str_v END) AS period,
+    max(CASE WHEN kd.key='amount' THEN coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric) END) AS amount
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+  JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+  WHERE a.type='energy_bill' AND a.customer_id = '<客户id>'::uuid
+    AND kd.key IN ('period','amount')
+  GROUP BY a.id)
+SELECT period AS 账期, count(*) AS 账单数, round(sum(amount)::numeric,2) AS 合计
+FROM b GROUP BY period ORDER BY period;
+```
+
+#### ④ 账单是否重复（出账幂等被破坏时）
+
+```sql
+WITH b AS (
+  SELECT a.id,
+    max(CASE WHEN kd.key='period'   THEN kv.str_v END) AS period,
+    max(CASE WHEN kd.key='energy'   THEN kv.str_v END) AS energy,
+    max(CASE WHEN kd.key='deviceId' THEN kv.str_v END) AS device_id
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+  JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+  WHERE a.type = 'energy_bill' GROUP BY a.id)
+SELECT period, energy, device_id, count(*) AS 张数
+FROM b GROUP BY 1,2,3 HAVING count(*) > 1;
+```
+
+**判据 ④**：结果应为**空**。出账幂等靠「资产名 = `BILL-<客户码>-<账期>-<能源>`」，
+重跑只更新属性不新增。出现多行说明资产名规则被改过，或有手工建的账单。
+
+#### 账单页和「分时拆解」页金额不一样 —— 两个数都没错
+
+**实测样例**（三相园-1#进线总表 / 2026-11）：
+
+| 页面 | 显示 | 含义 |
+| --- | --- | --- |
+| 账单明细 | 13,504.42 | **应付金额**（含基本电费） |
+| 分时拆解 | 12,004.41 | **分时电度电费**（按逐时遥测 × 分时单价） |
+| 差额 | **1,500.00** | 就是该表的基本电费 |
+
+**只算电**的全客户核对（2026-11，与上面 ② 的全品种口径不同）：
+
+```
+分时拆解 feeTotal 合计        35,337.36
+全部电费账单 energyFee 合计   35,337.36   ← 完全相等
+全部电费账单 amount 合计      38,337.36
+差额                           3,000.00   ← 两张进线表各 1,500 基本电费
+```
+
+所以界面上有一条对账：`分时电度电费 + 不可分摊 = 应付合计`，
+其中「应付合计」一定与账单明细相等。这两个数永远对不上才是 bug。
+
+**金额对不上时的排查顺序**：
+
+1. 跑 ②，看 `应付合计` 是否等于页面「合计」 —— 不等是页面取数问题；
+2. 相等，再看差额是否正好等于 `基本合计` —— 是则属口径正常，不是 bug；
+3. 都不是，查分时单价与时段方案（见 §7 档案）。
+
+#### 某台表没有账单 —— 是「还没出账」，不是「算错了」
+
+**典型现象**：客户在「用能账单」里只勾几台表，结果列表里只出现一台，
+其余几台什么都不显示（连「0 元」都没有）。
+
+**根因：账单是一份快照，不是实时算的。** 出账（`POST /api/energy/billing/generate`）
+写一次 `energy_bill` 资产，之后**不会自动重算** —— 设备后来才有表底数据，
+也还是没它的账单，直到重新出账。
+
+**测一下有没有漏出账**（该账期有表底、但库里没账单的设备）：
+
+```sql
+SET TIME ZONE 'Asia/Shanghai';
+WITH p AS (SELECT '2026-11'::text AS period),
+win AS (
+  SELECT EXTRACT(EPOCH FROM (to_date(period||'-01','YYYY-MM-DD')::timestamp AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM ((to_date(period||'-01','YYYY-MM-DD') + INTERVAL '1 month')::timestamp AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+  FROM p
+),
+billed AS (
+  SELECT max(CASE WHEN kd.key='deviceId' THEN kv.str_v END)::uuid AS dev
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id=a.id AND kv.attribute_type=2
+  JOIN key_dictionary kd ON kd.key_id=kv.attribute_key
+  WHERE a.type='energy_bill'
+    AND a.id IN (SELECT kv2.entity_id FROM attribute_kv kv2
+                 JOIN key_dictionary kd2 ON kd2.key_id=kv2.attribute_key
+                 WHERE kd2.key='period' AND kv2.str_v=(SELECT period FROM p))
+  GROUP BY a.id
+),
+pts AS (
+  SELECT kv.entity_id AS dev, count(*) AS 表底点数,
+         min(kv.ts) AS 最早, max(kv.ts) AS 最晚
+  FROM key_dictionary kd JOIN ts_kv kv ON kv.key=kd.key_id CROSS JOIN win
+  WHERE kd.key='energy_reading' AND kv.ts>=win.s AND kv.ts<win.e
+  GROUP BY kv.entity_id
+)
+SELECT d.label AS 设备, d.type AS 类型, pts.表底点数,
+       to_char(to_timestamp(pts.最早/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 最早,
+       to_char(to_timestamp(pts.最晚/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS 最晚
+FROM pts JOIN device d ON d.id = pts.dev
+WHERE pts.表底点数 >= 2 AND pts.dev NOT IN (SELECT dev FROM billed WHERE dev IS NOT NULL)
+ORDER BY pts.表底点数 DESC;
+```
+
+**判据**：结果非空就是「有数据但没出账」，而不是「算成了 0」。
+实测 2026-11：13 台（DDSU666 5102 点、三相/单相电表各 483 点、新风机组各 85 点…）
+都在这张列表里 —— 它们的表底是 11-04 之后才补进来的，而账单是 11-04 00:33 出的。
+
+**「是不是还没出账」最快判据**：调一次 `dryRun`（只算不写），它会逐台返回
+`usable` 与跳过原因：
+
+```bash
+curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"period":"2026-11","dryRun":true}' \
+  http://127.0.0.1:8090/api/energy/billing/generate \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);
+print('total',d['total'],'skipped',d['skipped']);
+[print(i.get('deviceName'),i.get('usable'),i.get('reason')) for i in d['items'] if not i.get('usable')]"
+```
+
+只有两种 `usable=false` 是正常的：
+
+- `未配置「X」的电价` —— 该品种没有绑定费率模板（新风/热水泵是 env，本来就不计价）
+- `本账期读数不足两点` —— 设备未上报
+
+其余一律是真漏出账，重新生成即可（幂等，只更新不新增）。
+
+#### 重新出账 / 删单重出（界面、接口、应急 SQL）
+
+**客户自己在界面上就能做**（2026-11-06 起）：用能账单 → 账单明细 →
+勾选表计 → 点「生成账单」/「删除账单」。范围跟着左侧勾选走，
+没勾只会提示「请先勾选」，不会全量重刷。见用户手册「我的账单」。
+
+**运维批量做**（范围 = 不传 `devices`，或传具体 id 数组）：
+
+```bash
+# 出账（幂等：已有单只更新，不新增）
+curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"period":"2026-11","devices":["<设备id>","<设备id>"]}' \
+  http://127.0.0.1:8090/api/energy/billing/generate
+
+# 删单（可重出）—— 只删指定设备
+curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"period":"2026-11","devices":["<设备id>"]}' \
+  http://127.0.0.1:8090/api/energy/billing/delete
+
+# 清空整个账期 —— 必须显式 all:true
+curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"period":"2026-11","all":true}' \
+  http://127.0.0.1:8090/api/energy/billing/delete
+```
+
+> ⚠ **不传 `devices` 必须带 `"all": true`**，否则返回
+> `400 未指定 devices 时会清空整个账期的账单。确认要这么做请加 "all": true`。
+> 这道门槛是故意的：删单不可撤销，而「拼错 id 数组 → 空数组 → 全量删」
+> 是最容易发生的误用。让「我要删整月」变成一句必须写出来的话。
+>
+> 实测 2026-11：`all:true` 一次删掉 19 张（`deleted=19`），
+> 库内 `asset` 与 `attribute_kv` 都清干净，无孤属性残留。
+
+「设备设成了不参与厂站能耗计算」也会让出账跳过它，原因写在 `items[].reason` 里。
+这是 2026-11-06 新增的排除 —— 与资产汇总、峰谷分析同一口径
+（见数据模型手册「是否参与厂站能耗计算」）。
+
+**删除的保护**：`status = paid`（已收款）的单一律拒绝，返回 `refused` 计数。
+这是凭证完整性，不是权限问题；真要冲销请先作废（`void`）保留痕迹。
+
+**界面删不动、接口也 500 时的应急 SQL**（最后手段，会把审计痕迹一起删掉）：
+
+```sql
+-- 先看清楚要删哪几张（务必先跑这段确认）
+SET TIME ZONE 'Asia/Shanghai';
+SELECT a.id, a.name,
+       max(CASE WHEN kd.key='deviceName' THEN kv.str_v END) AS 设备,
+       max(CASE WHEN kd.key='amount' THEN coalesce(kv.dbl_v, kv.str_v::numeric) END) AS 金额,
+       max(CASE WHEN kd.key='status' THEN kv.str_v END) AS 状态
+FROM asset a
+JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+WHERE a.type = 'energy_bill' AND a.name LIKE 'BILL-%-2026-11-%'
+GROUP BY a.id, a.name
+ORDER BY 3;
+```
+
+确认无误后按 id 删（**先属性、再资产**，顺序反了会留孤属性行）：
+
+```sql
+-- 把 '00000000-0000-0000-0000-000000000000' 换成上面查出来的 a.id
+DELETE FROM attribute_kv WHERE entity_id = '00000000-0000-0000-0000-000000000000';
+DELETE FROM asset WHERE id = '00000000-0000-0000-0000-000000000000';
+```
+
+> 不用写 `AND entity_type = 'ASSET'` —— **`attribute_kv` 没有这一列**
+> （实测列只有 `entity_id / attribute_type / attribute_key / *_v / last_update_ts / version`）。
+> 写了会直接报 `column "entity_type" does not exist`。
+> `asset_location` 这张表在 4.4 里也不存在。
+
+> ⚠ 直接改库不会清 TB 的实体缓存，界面可能还要一会儿才刷新；
+> 能走接口就走接口。而且 SQL 删是**物理删除**，没有撤销。
+
+#### 基础报表的数字怎么核对（不是账单口径）
+
+**先分清两个口径，否则永远对不上**：
+
+| | 基础报表 | 用能账单 |
+| --- | --- | --- |
+| 数据源 | 设备遥测键 `energy`（实时上报的用量） | `energy_reading` 表底差 × 倍率 |
+| 聚合 | SUM（用电量）/ AVG（电压电流）/ MAX（累计电度） | 逐小时差分后按 TOU 分档 |
+| 用途 | 看趋势、查明细 | 出账收款 |
+
+两者来自不同遥测键，**数值天然不同**（一个是用量计数器，一个是累计读数）。
+
+**核对方法：界面「数据明细」页签的数字必须等于库里同一键的聚合值**
+
+```sql
+SET TIME ZONE 'Asia/Shanghai';
+-- 把 <设备id> / 日期换成界面上的设备与日期
+SELECT to_char(date_trunc('day', to_timestamp(ts/1000)), 'YYYY-MM-DD') AS 日期,
+       round(sum(dbl_v)::numeric, 3) AS 合计,
+       count(*) AS 点数
+FROM ts_kv
+WHERE entity_id = '00000000-0000-0000-0000-000000000000'
+  AND key = (SELECT key_id FROM key_dictionary WHERE key = 'energy')
+  AND ts >= 1793462400000 AND ts < 1793808000000
+GROUP BY 1 ORDER BY 1;
+```
+
+实测（演示厂区A / 2026-11-01 ~ 11-04）：
+
+| 设备 | 日期 | 界面 | SQL | 一致 |
+| --- | --- | --- | --- | --- |
+| 照明分项总表 | 11-01 | 58.42 | 58.420 | ✓ |
+| 照明分项总表 | 11-04 | 1.26 | 1.260 | ✓ |
+| 单相电表 | 11-03 | 162.36 | 162.360 | ✓ |
+| 单相电表 | 11-04 | 296.572 | 296.572 | ✓ |
+
+**「按分组维度」和「按设备层级」必须给出同一批设备**：
+勾一个分项 = 勾它下面全部设备，再按父子关系去重（父表读数含子表）。
+实测勾「照明」分项发出的设备清单，与在设备层级里逐台勾那些人完全一致。
+
+#### 分时拆解的数字怎么复算（账期首小时会被跳过）
+
+**统计口径**（`EnergyBillingService#readUsage`，2026-11-06 逐行核过）：
+
+```
+① 读 energy_reading（表底累计读数），按【小时 MAX】聚合
+② TB 的聚合桶返回的 ts 是【桶中点】—— 整点时段的桶给 xx:30，⚠ 不是整点
+③ 过滤 ts <= 账期起点 + 1h → 【丢掉账期第一个小时】
+④ 相邻两点差分 × 倍率 = 该小时用量
+⑤ 差分归入【后一个点】所在的 TOU 时段（峰/平/谷/深/尖峰）
+⑥ 各档用量分别 × 单价，各档金额先取两位小数再相加 = 电度电费
+```
+
+**③ 这一条会让每月少算第一小时，且【所有表都受影响】**
+
+不是个别表、不是随机误差。演示厂区A 2026-11 实测：**29 台有表底的表里
+28 台都被跳过首小时**（唯一例外 PowerMeter-DDSU666 是 11-04 才接入，
+账期首小时本来就没数据）。
+
+```
+账期 11-01 00:00 ~ 12-01 00:00
+桶：00:30=7789.77  01:30=7792.09  02:30=7794.33 …
+后端丢掉 00:30 → 从 01:30 起算 → 漏掉 00:00→01:00 这一段
+```
+
+**漏多少（2026-11 实测，按读取数差）**：
+
+| 表 | 账期用量 | 首小时漏 | 比例 |
+| --- | --- | --- | --- |
+| 三相园-1#进线总表 | 14,550.6 kWh | 57.01 kWh | 0.39% |
+| 三相园-车间动力总表 | 13,360.7 kWh | 49.52 kWh | 0.37% |
+| 单相园-1#进线总表 | 338.49 kWh | 2.32 kWh | 0.69% |
+| PowerMeter-3P-SIM | —— | 41.39 kWh | —— |
+| 三相园-车床组 | —— | 38.54 kWh | —— |
+
+规律：**比例稳定在 0.3%–0.7%**，方向永远是「少算」，金额上
+每台表每月几毛到几十元（三相园-1# 约 47 元）。
+
+> ⚠ 各分项表与进线表是父子关系，**不要把这些漏量相加** ——
+> 进线总表的读数已含分项表，相加会重复计量（见铁律 D3）。
+
+**自己环境受影响多大，一条 SQL 看全**（账期 2026-11）：
+
+```sql
+SET TIME ZONE 'Asia/Shanghai';
+WITH win AS (SELECT 1793462400000::bigint AS s, 1796054400000::bigint AS e),
+k AS (SELECT key_id FROM key_dictionary WHERE key='energy_reading'),
+h AS (
+  SELECT kv.entity_id AS dev,
+         (EXTRACT(EPOCH FROM date_trunc('hour', to_timestamp(kv.ts/1000)))*1000 + 1800000)::bigint AS bts,
+         max(kv.dbl_v) AS rd
+  FROM k JOIN ts_kv kv ON kv.key = k.key_id CROSS JOIN win
+  WHERE kv.ts >= win.s AND kv.ts < win.e
+  GROUP BY 1,2
+),
+s AS (SELECT dev, rd, row_number() OVER (PARTITION BY dev ORDER BY bts) AS rn FROM h)
+SELECT dd.name AS 表计, round((max(rd)-min(rd))::numeric,3) AS 首小时漏量
+FROM s JOIN device dd ON dd.id = s.dev
+WHERE s.rn <= 2
+GROUP BY dd.name HAVING max(rd)-min(rd) <> 0
+ORDER BY abs(max(rd)-min(rd)) DESC;
+```
+
+判据：返回行数 ≈ 账期内在线的有表底表数 → 说明全都在漏；
+返回 0 行说明这批表的账期首小时本来就没数据（新接入的表）。
+
+这是**已知偏差**。要修得改后端（读 `[from-1h, to]`，用 from 之前的最后一个读数做基线），
+**会改变已出账金额**，需要客户确认后再动。当前状态：**未修，客户决策中**。
+
+**独立复算（与上面的口径逐字对应）**：
+
+```sql
+SET TIME ZONE 'Asia/Shanghai';
+WITH p AS (SELECT '2026-11'::text AS period),
+win AS (
+  SELECT EXTRACT(EPOCH FROM (to_date(period||'-01','YYYY-MM-DD')::timestamp AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM ((to_date(period||'-01','YYYY-MM-DD') + INTERVAL '1 month')::timestamp AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+  FROM p
+),
+raw AS (
+  SELECT a.id AS bill_id, kd.key, kv.str_v, kv.dbl_v
+  FROM asset a
+  JOIN attribute_kv kv ON kv.entity_id = a.id AND kv.attribute_type = 2
+  JOIN key_dictionary kd ON kd.key_id = kv.attribute_key
+  WHERE a.type='energy_bill'
+    AND kd.key IN ('period','deviceId','deviceName','usage','usageSource','hourlyPoints')
+),
+bills AS (
+  SELECT bill_id,
+         max(CASE WHEN key='deviceId'   THEN str_v END) AS dev_id,
+         max(CASE WHEN key='deviceName' THEN str_v END) AS 计量点,
+         max(CASE WHEN key='usageSource' THEN str_v END) AS 来源,
+         max(CASE WHEN key='usage'      THEN str_v END)::numeric AS 账单用量,
+         max(CASE WHEN key='hourlyPoints' THEN dbl_v END)::int   AS 账单点数
+  FROM raw
+  WHERE bill_id IN (SELECT bill_id FROM raw WHERE key='period' AND str_v=(SELECT period FROM p))
+  GROUP BY bill_id
+),
+h AS (
+  -- 桶 ts = 桶起始 + 30min，与 TB 聚合桶中点一致
+  SELECT kv.entity_id AS dev,
+         (EXTRACT(EPOCH FROM date_trunc('hour', to_timestamp(kv.ts/1000)))*1000 + 1800000)::bigint AS ts,
+         max(kv.dbl_v) AS reading
+  FROM key_dictionary kd JOIN ts_kv kv ON kv.key=kd.key_id CROSS JOIN win
+  WHERE kd.key='energy_reading' AND kv.ts>=win.s AND kv.ts<win.e
+  GROUP BY 1,2
+),
+seq AS (
+  SELECT h.dev, h.ts, h.reading,
+         lag(h.reading) OVER (PARTITION BY h.dev ORDER BY h.ts) AS prev
+  FROM h CROSS JOIN win WHERE h.ts > win.s + 3600000
+),
+calc AS (
+  SELECT dev, round(sum(reading - prev)::numeric,4) AS 重算用量, count(*) AS 重算点数
+  FROM seq WHERE prev IS NOT NULL GROUP BY dev
+)
+SELECT b.计量点, b.来源, b.账单用量, c.重算用量,
+       round((b.账单用量 - coalesce(c.重算用量,0))::numeric,4) AS 差异,
+       b.账单点数, c.重算点数,
+       CASE WHEN b.来源 <> 'telemetry' THEN '（手工/非遥测）'
+            WHEN abs(b.账单用量 - coalesce(c.重算用量,0)) < 0.01 THEN '✓'
+            ELSE '✗' END AS 判定
+FROM bills b LEFT JOIN calc c ON c.dev = b.dev_id::uuid
+WHERE b.来源 = 'telemetry'
+ORDER BY 判定 DESC, b.计量点;
+```
+
+**判据**：全部 `✓`，`差异` 均为 `0.0000`；
+`账单点数 - 重算点数 = 1`（差的就是被丢掉的首小时）。
+实测 2026-11：17 张遥测账单全部 ✓。
+
+**分时电费复算**（各档金额先取两位再相加，不是先加再取两位）：
+
+```
+电度电费 = round(tip用量×1.35,2) + round(peak用量×1.15,2)
+         + round(flat用量×0.72,2) + round(valley用量×0.38,2)
+         + round(deep用量×0.25,2)
+```
+
+实测单相园-1#进线总表：`0×1.35 + 123.46×1.15 + 134.52×0.72 + 42.41×0.38 + 38.10×0.25`
+= `0 + 141.98 + 96.85 + 16.12 + 9.53` = **264.48** ✓（若先加再取两位会得 264.47，差 1 分）。
+
+> **单价不一定取上面这五个数**：以账单 `details` 里回写的 `prices` 为准。
+> 水/气/汽走单一单价（`flat`），实测水 4.5 元/m³、燃气 3.6 元/m³、蒸汽 260 元/t。
+
+#### 已知坑
+
+| 现象 | 根因 | 判据 |
+| --- | --- | --- |
+| 按 `billing` 表查永远 0 行 | 账单存 `asset` 资产，不写那两张表 | `SELECT count(*) FROM billing` = 0 |
+| SQL 能跑但金额列全是空 | 金额字段在 `str_v`，写成 `kv.dbl_v` | 用 `coalesce(kv.dbl_v, nullif(kv.str_v,'')::numeric)` |
+| 账单页总额远大于「实际用电」 | 账单按表逐张出，含上下级重复（总表+分表各一张），供分层分摊 | 见页面绿色「实际用电/实际电费」条 |
+| 客户看不到别人的账单 | TB owner 机制：`asset.customer_id` 隔离 | 租户账号查是全量 |
+
+---
+
+### 6.2d 基础报表 / 参数报表的数字怎么核对
+
+**什么时候用**：客户问「图上这条线对不对」「明细表某个格子为什么是 `/`」
+「合计跟别处对不上」。
+
+**口径**（三条，缺一条就对不上）：
+
+1. 报表读的是**设备遥测的原始键**（`energy` / `voltage_a` / `power_total` …），
+   不是资产的汇总键（`energy_total` 那套是分项/区域能耗用的）；
+2. 页面按**时间片聚合**：`interval=3600000&agg=SUM` 表示"每小时求和"，
+   所以核对也要先按小时 `SUM`，别直接拿原始点求和；
+3. **同一小时可能有多条原始点**（演示数据 10 分钟一条），按小时 SUM 后才是页面上的格子值。
+
+```sql
+-- ① 某设备某天，按小时聚合（与页面 interval=3600000 完全同口径）
+SET TIME ZONE 'Asia/Shanghai';
+WITH win AS (
+  SELECT EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-04 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-05 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+), h AS (
+  SELECT kv.entity_id,
+         date_trunc('hour', to_timestamp(kv.ts/1000) AT TIME ZONE 'Asia/Shanghai') AS 小时,
+         sum(kv.dbl_v) AS 值, count(*) AS 原始点数
+  FROM key_dictionary kd
+  JOIN ts_kv kv ON kv.key = kd.key_id
+  CROSS JOIN win
+  WHERE kd.key = 'energy' AND kv.ts >= win.s AND kv.ts < win.e
+  GROUP BY kv.entity_id, 小时
+)
+SELECT d.label AS 设备, h.小时, round(h.值::numeric, 2) AS 小时值, h.原始点数
+FROM h JOIN device d ON d.id = h.entity_id
+WHERE d.id = '<设备id>'::uuid
+ORDER BY h.小时;
+```
+
+**判据**：页面「数据明细」页签里该设备的每个非 `/` 格子 = 上表对应小时的 `小时值`；
+格子数 = 有数据的小时数。
+
+```sql
+-- ② 全天合计与极值（核对图上的峰值标注与整日合计）
+SET TIME ZONE 'Asia/Shanghai';
+WITH win AS (
+  SELECT EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-04 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM (TIMESTAMP '2026-11-05 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+), h AS (
+  SELECT kv.entity_id,
+         date_trunc('hour', to_timestamp(kv.ts/1000) AT TIME ZONE 'Asia/Shanghai') AS 小时,
+         sum(kv.dbl_v) AS 值
+  FROM key_dictionary kd
+  JOIN ts_kv kv ON kv.key = kd.key_id
+  CROSS JOIN win
+  WHERE kd.key = 'energy' AND kv.ts >= win.s AND kv.ts < win.e
+  GROUP BY kv.entity_id, 小时
+)
+SELECT d.label AS 设备, count(*) AS 有数小时,
+       round(sum(h.值)::numeric, 2) AS 全天合计,
+       round(min(h.值)::numeric, 2) AS 小时最小,
+       round(max(h.值)::numeric, 2) AS 小时最大
+FROM h JOIN device d ON d.id = h.entity_id
+WHERE d.id IN ('<设备id>'::uuid, '<设备id>'::uuid)
+GROUP BY d.label ORDER BY 全天合计 DESC;
+```
+
+**判据**：`小时最大` = 图上峰值标注；`有数小时` = 明细表里该行的非 `/` 格数。
+
+**实测样例**（演示厂区A / 办公园区 / 2026-11-04，与页面逐项核对一致）：
+
+| 设备 | 有数小时 | 全天合计 | 小时最小 | 小时最大 | 页面 |
+| --- | --- | --- | --- | --- | --- |
+| 单相电表 | 9 | 296.57 | 0.59 | 101.78 | 峰值标签 `101.8`、明细 9 格合计 `296.58` |
+| 1#进线总表 | 1 | 2.21 | 2.21 | 2.21 | 明细首格 `2.21` |
+
+> 明细 9 格手工相加是 296.58、SQL 是 296.57 —— 差 0.01 是**每格已四舍五入到两位**
+> 再相加造成的，属正常；核对时看「到分」即可，不要追到厘。
+
+#### ⚠️ 核对时最容易踩的一条：`label` 不唯一
+
+演示数据里**两台设备 label 都叫「1#进线总表」**：
+
+| name | label |
+| --- | --- |
+| `单相园-1#进线总表·演示厂区A` | `1#进线总表` |
+| `三相园-1#进线总表·演示厂区A` | `1#进线总表` |
+
+按 `WHERE d.label = '1#进线总表'` 查会把两台加在一起（实测 62.51 = 2.21 + 60.30），
+而页面只画了一台（2.21）—— 看着像"页面少了一半数据"，其实是 SQL 多算了。
+
+**核对一律用 `d.id`，不要用 `label` / `name` 之外的模糊条件**。
+要按可读名查就先跑一次 `SELECT id, name, label FROM device WHERE label = '…'`，
+确认只命中一台。
+
+---
+
+### 6.2e 手工填报的数字怎么核对
+
+**什么时候用**：客户问「我填的数怎么没上去」「合计跟 Excel 对不上」
+「某个月为什么是空的」。
+
+**口径**（三条，和报表页完全不同，别套 §6.2d 的聚合）：
+
+1. 手工填报只认**虚拟设备**的 `energy` 键；接了 RTU 的真实表不在候选里，
+   查真实表得到 0 行是正常的，不是故障。
+2. 每个设备每个月**只有 1 个点**，时间戳是**该月 1 日 00:00**，值就是这个月的用量。
+   所以核对**直接 `SUM(dbl_v)`，不要再按日/小时聚合** —— 再切一次时间片会把一个点拆散。
+3. 页面的「合计」= 所选月份区间内所有点之和；**未来月份没有点 → 画空柱**，
+   空柱不等于 0，也不等于漏填。
+
+```sql
+-- ① 某虚拟设备逐月用量（与页面抽屉里的 12 个格子、月度用量柱一一对应）
+SET TIME ZONE 'Asia/Shanghai';
+WITH win AS (
+  SELECT EXTRACT(EPOCH FROM (TIMESTAMP '2026-01-01 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS s,
+         EXTRACT(EPOCH FROM (TIMESTAMP '2027-01-01 00:00:00' AT TIME ZONE 'Asia/Shanghai'))*1000 AS e
+)
+SELECT to_char(date_trunc('month', to_timestamp(kv.ts/1000) AT TIME ZONE 'Asia/Shanghai'),
+               'YYYY-MM') AS 月,
+       round(sum(kv.dbl_v)::numeric, 2) AS 用量, count(*) AS 点数
+FROM key_dictionary kd
+JOIN ts_kv kv ON kv.key = kd.key_id
+CROSS JOIN win
+WHERE kd.key = 'energy'
+  AND kv.entity_id = '<虚拟设备id>'::uuid
+  AND kv.ts >= win.s AND kv.ts < win.e
+GROUP BY 月 ORDER BY 月;
+```
+
+```sql
+-- ② 全年合计与数据跨度（核对页面顶部的「合计」）
+SET TIME ZONE 'Asia/Shanghai';
+SELECT to_char(to_timestamp(min(kv.ts)/1000) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS 最早,
+       to_char(to_timestamp(max(kv.ts)/1000) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS 最晚,
+       round(sum(kv.dbl_v)::numeric, 2) AS 合计,
+       count(*) AS 点数
+FROM key_dictionary kd
+JOIN ts_kv kv ON kv.key = kd.key_id
+WHERE kd.key = 'energy' AND kv.entity_id = '<虚拟设备id>'::uuid;
+```
+
+**判据**：
+
+- `点数` = 实际填过的月份数（**不是 12** 就说明有空月，属正常）；
+- 页面「合计」= ② 的 `合计`；抽屉里逐月的数 = ① 的 `用量`；
+- 页面上空着的月 = ① 里没有该月的行（不是 0）。
+
+**实测样例**（演示厂区A / 空调虚拟表 `c4e37c80-d7a3-11f1-b139-b367a33eb8e4`，2026 年）：
+
+| 月 | 用量 | 月 | 用量 |
+| --- | --- | --- | --- |
+| 2026-01 | 1820.00 | 2026-07 | 1450.00 |
+| 2026-02 | 1650.00 | 2026-08 | 1780.00 |
+| 2026-03 | 980.00 | 2026-09 | 1520.00 |
+| 2026-04 | 420.00 | 2026-10 | 760.00 |
+| 2026-05 | 310.00 | 2026-11 | 480.00 |
+| 2026-06 | 620.00 | 2026-12 | （无点，空柱） |
+
+合计 `11790.00`、`点数 11`、跨度 `2026-01-01 ~ 2026-11-01` ——
+与页面「合计 11.8k kW·h」、12 根柱（12 月空）、抽屉里 11 个有数格完全一致。
+
+**为什么 12 月是空的**：演示数据只填到 2026-11；页面按区间铺 12 根柱，
+没点的月份画空柱。**不要把它当成 bug 去补 0** —— 补 0 会和「填了 0 度」混淆。
+
+**两个容易误判的现象**：
+
+- **虚拟表在分项/区域能耗里缺席**：先看设备的「参与厂站能耗计算」开关。
+  关掉后手工填报页照常能填能看，但分项/区域汇总不含它（详见 §6.2b）。
+- **改了数页面没变**：抽屉「保存」写的是资产/设备遥测，保存后要**点查询**才刷新；
+  另外浏览器缓存会让旧值停留，`Cmd/Ctrl + Shift + R` 硬刷新一次。
+
+---
+
 ### 6.3 哨兵读数：真实表底会突然变成 7777.7 / 8888.8
 
 ```sql
@@ -644,8 +1406,8 @@ ORDER BY lv.long_v DESC NULLS LAST;
 | 分项能耗 | 分项资产各品种 `*_total` | 选电能时水/气/汽/热为空，正常 |
 | 区域能耗 | 区域资产各品种 `*_total` | 同一台表挂两个区域会双算 |
 | 峰谷分析 | 设备 `energy_reading` 按小时切片 | 与台账口径不同，不是 bug |
-| 用能账单 | `billing` / `billing_detail` | 金额 = 电度 + 基本 + 力调 + 其他 |
-| 抄表台账 | `billing_detail` 或 `energy_reading` 区间差 | 「用量来源」列说明用的是哪种 |
+| 用能账单 | **`asset`（`type='energy_bill'`）+ `attribute_kv`** | 金额 = 电度 + 基本 + 力调 + 其他；**不在 `billing` 表**（空表） |
+| 抄表台账 | `meter_reading_record` / `meter_reading_batch` | 「用量来源」列说明用的是哪种（`source` = auto/manual） |
 | 电能质量 | 设备 `voltage_thd_*` / `unbalance` / `flicker_*` | 逐桶判极值，不用均值 |
 | 告警事件 | `alarm` 表 | 只读未清除的（`clear_ts IS NULL`） |
 

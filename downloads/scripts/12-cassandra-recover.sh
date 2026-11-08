@@ -62,7 +62,7 @@ done
 
 [[ -f .env ]] && { set -a; . ./.env; set +a; }
 APP_HOME="${APP_HOME:-$(pwd)}"
-TS_TYPE="${DATABASE_TS_TYPE:-cassandra}"
+TS_TYPE="${DATABASE_TS_TYPE:-sql}"
 BACKUP_ROOT="${CASSANDRA_COMMITLOG_BACKUP:-$HOME/.cassandra-commitlog-backup}"
 
 echo "============================================================"

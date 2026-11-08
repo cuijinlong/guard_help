@@ -142,16 +142,19 @@ if [[ -n "$CTOK" ]]; then
 fi
 
 # ---------------------------------------------------------------- 4. 分析服务
-C "4. 分析服务（ngx-ai）"
+C "4. 分析服务（spsspro）"
 if [[ -n "$AI" ]]; then
   CODE=$(ncurl -o /dev/null -w '%{http_code}' -m 10 "$AI/")
   [[ "$CODE" == "200" ]]; chk $? "分析前端可访问（HTTP ${CODE}）"
 
-  CODE=$(ncurl -o /dev/null -w '%{http_code}' -m 10 "$AI/ngxapi/health")
+  CODE=$(ncurl -o /dev/null -w '%{http_code}' -m 10 "$AI/spssproapi/explore/health")
   [[ "$CODE" == "200" ]]; chk $? "分析后端健康检查（HTTP ${CODE}）"
 
-  HEALTH=$(ncurl -m 10 "$AI/ngxapi/health")
-  echo "$HEALTH" | grep -q '"reachable":true'; chk $? "分析后端可连 ThingsBoard"
+  # has_real_data=true 表示 spsspro 真的连上了平台并走真实遥测，
+  # 而不是退回了内置模拟数据 —— 这是最容易静默失效的一环
+  # （容器内 TB_BASE 写成 127.0.0.1 就会退回，页面看起来完全正常）。
+  HEALTH=$(ncurl -m 10 "$AI/spssproapi/explore/health")
+  echo "$HEALTH" | grep -q '"has_real_data":true'; chk $? "分析后端已连上平台并读取真实遥测"
 
   if [[ -n "$CTOK" ]]; then
     # 未发布对象应 404 而不是 500

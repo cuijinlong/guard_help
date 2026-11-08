@@ -289,7 +289,6 @@ DB_PORT=$_dp
 SERVER_HEAP=2g
 # dev = 只有控制台日志；pro = 生产，日志按天落盘到 ${APP_HOME}/logs/
 SPRING_PROFILE=dev
-AI_IMAGE=energy/ngxai-backend:4.4.0
 TB_API_USERNAME=tenant@thingsboard.org
 TB_API_PASSWORD=tenant
 ENVEOF
@@ -356,8 +355,8 @@ log "部署模式：$MODE"
 [[ -f "$APP_HOME/data/sql/schema-entities.sql" ]] || die "找不到 $APP_HOME/data/sql/schema-entities.sql —— data/sql 必须有 8 个 sql 文件"
 [[ -d "$APP_HOME/data/json/system/widget_types" ]] || die "找不到 $APP_HOME/data/json/system/widget_types"
 [[ -f "$APP_HOME/nginx/energy.conf" ]] || die "找不到 $APP_HOME/nginx/energy.conf —— 网关配置缺失"
-[[ -d "$APP_HOME/ngxai-dist" ]] || warn "找不到 $APP_HOME/ngxai-dist，分析页将不可用（后端仍可运行）"
-[[ -d "$APP_HOME/ngxai-backend" ]] || warn "找不到 $APP_HOME/ngxai-backend，分析服务将不会启动"
+[[ -d "$APP_HOME/spsspro-dist" ]] || warn "找不到 $APP_HOME/spsspro-dist，数据探索页将不可用（后端仍可运行）"
+[[ -d "$APP_HOME/spsspro-backend" ]] || warn "找不到 $APP_HOME/spsspro-backend，数据分析服务将不会启动"
 
 # 内存：ES 不需要，但 JVM + PG 建议 4G 起
 MEM_MB=$(docker info --format '{{.MemTotal}}' 2>/dev/null | awk '{printf "%d", $1/1024/1024}')
@@ -407,7 +406,6 @@ ok "docker / compose / 文件 / 端口 检查通过"
 # ---------------- 单容器模式：install 在容器内自动完成 ----------------
 if [[ "$MODE" == "allinone" ]]; then
   [[ -f "$APP_HOME/allinone/Dockerfile" ]] || die "找不到 $APP_HOME/allinone/Dockerfile"
-  [[ -d "$APP_HOME/ngxai-dist" ]] || die "找不到 $APP_HOME/ngxai-dist"
   ok "单容器模式无需单独 install：首次启动时由容器自动建库并初始化"
   cat <<DONE
 
@@ -552,6 +550,6 @@ cat <<DONE
   cd ${APP_HOME} && bash docker-02-start.sh --admin-email admin@example.com --admin-pass 'ChangeMe123!'
 
   把邮箱和密码换成你自己要用的（密码至少 8 位）。
-  首次会构建 ngx-ai 镜像，约 5-10 分钟；就绪提示约 2 分钟。
+  首次会构建 spsspro 镜像，约 10-15 分钟；就绪提示约 2 分钟。
 
 DONE

@@ -381,6 +381,50 @@ d=json.load(sys.stdin); print(len(d.get('data',[])))" 2>/dev/null || echo 0)
   else warn "客户名下仪表板只有 $DASH_N 个 —— 「仪表板」页会是空的"; FAIL=1; fi
 fi
 
+# ---------------------------------------------------------------- 看板占位符
+#
+# 客户看板里的实体引用必须是该客户自己的真实 id。模板用占位符标记「这里要换成
+# 客户实际实体」（00000000-…-05a1 场站 / 05a2 组织 / d101~d104 四个维度根），
+# 复制看板时由 substitutePlaceholders 替换。
+#
+# 替换没覆盖到时，部件会拿假 id 去查实体 —— GET /api/asset/<占位符> 404，
+# 再回退 GET /api/device/<占位符> 又 404，全局拦截器弹成红条挂在页面底部。
+# 实测 2026-11-07：客户「基础报表」点「按分组维度」就报
+#   GET: /api/device/00000000-0000-0000-0000-00000000d102  404: OK
+# 而库里四个维度根明明都在（客户的「基础报表」副本与模板字节完全一致 = 一个字符都没替换）。
+#
+# repair-init 里的 repairCustomerDashboards 就是干这个的，幂等。
+# 09-onboard-customer.sh 早就调了它，但首装走的这条路（本脚本）漏了 —— 补上。
+log "检查客户看板占位符"
+ncurl -X POST "$BASE/api/energy/repair-init" -H "X-Authorization: Bearer $TOKEN" \
+  -o /dev/null 2>&1 || warn "repair-init 调用失败（看板占位符可能残留）"
+
+PH_LEFT=$(api GET "/api/customer/$CUSTOMER_ID/dashboards?pageSize=100&page=0" | python3 -c "
+import json, re, sys
+# 占位符形如 00000000-0000-0000-0000-00000000xxxx
+# 11b7（能源参数字典）/ e1ec（电能品种）是**故意保留**的：它们是租户级资产，
+# 客户直接读会 403，部件走 /api/energy/metric-params 取，不依赖这两个实体。
+PH = re.compile(r'00000000-0000-0000-0000-00000000([0-9a-f]{4})')
+KEEP = {'11b7', 'e1ec'}
+left = []
+try:
+    rows = (json.load(sys.stdin) or {}).get('data') or []
+except Exception:
+    rows = []
+for d in rows:
+    cfg = json.dumps(d.get('configuration') or {})
+    hits = [k for k in PH.findall(cfg) if k not in KEEP]
+    if hits:
+        left.append('%s(%d处)' % (d.get('title') or (d.get('id') or '')[:8], len(hits)))
+print(' '.join(left))" 2>/dev/null || echo "")
+if [[ -z "$PH_LEFT" ]]; then ok "客户看板无占位符残留"
+else
+  warn "客户看板仍残留占位符：$PH_LEFT"
+  warn "  这些页面的部件会拿假 id 查实体，页底出现「404: OK」红条"
+  warn "  修：再调一次 POST /api/energy/repair-init（幂等），然后看这一条是否转绿"
+  FAIL=1
+fi
+
 echo
 if [[ "$FAIL" == "0" ]]; then
   ok "全部验证通过"

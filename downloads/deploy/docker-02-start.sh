@@ -96,14 +96,21 @@ PORT="${HTTP_PORT:-8090}"
 BASE="http://127.0.0.1:${PORT}"
 MODE="${DEPLOY_MODE:-split}"
 case "$MODE" in
-  split)    PROFILE_ARGS="--profile split";    TARGET="energy-server gateway" ;;
+  # waveform-store 必须一起拉起：问题详情里的波形读它。
+  # 它起不来不会阻断平台（Java 侧降级为"每次重新生成、不落盘"），
+  # 但漏在这里的话，客户点「详情」永远看不到「已缓存」。
+  split)    PROFILE_ARGS="--profile split";    TARGET="energy-server gateway waveform-store" ;;
   allinone) PROFILE_ARGS="--profile allinone"; TARGET="allinone" ;;
   *) die "DEPLOY_MODE 只能是 split 或 allinone，当前：$MODE" ;;
 esac
-# 遥测存 Cassandra 时必须把 cassandra profile 一起带上，
-# 否则 energy-server 连不上 9042，启动即报 InvalidKeyspaceException。
-# 这个容器不在 split profile 里 —— 用 sql 时不会被顺带拉起。
-if [[ "$MODE" == "split" && "${DATABASE_TS_TYPE:-cassandra}" == "cassandra" ]]; then
+# Cassandra 是预留能力，默认不启用（2026-11-07）。
+# 只有 .env 显式写 DATABASE_TS_TYPE=cassandra 时才带 cassandra profile。
+#
+# ★ 默认值必须是 sql，不能是 cassandra：变量未定义（.env 丢失 / 新环境）
+#   时的兜底行为必须是「不启动 Cassandra」。写成 cassandra 会去拉一个
+#   2GB 内存的容器，而业务侧根本没用它 —— 白吃内存且连不上就报
+#   InvalidKeyspaceException，排查方向全错。
+if [[ "$MODE" == "split" && "${DATABASE_TS_TYPE:-sql}" == "cassandra" ]]; then
   PROFILE_ARGS="$PROFILE_ARGS --profile cassandra"
 fi
 # 本机代理会把 127.0.0.1 也接管，必须绕过
@@ -127,7 +134,7 @@ fi
 #   等它循环几十次再人工排查，成本远高于启动前一次 2 秒的探测。
 # 判定交给专门脚本（12-cassandra-recover.sh）：只在「确实损坏」时才动手，
 # 健康或没启用 Cassandra 时直接退出，不影响正常启动。
-if [[ "$MODE" == "split" && "${DATABASE_TS_TYPE:-cassandra}" == "cassandra" ]]    && [[ -f "$(dirname "$0")/scripts/12-cassandra-recover.sh" ]]; then
+if [[ "$MODE" == "split" && "${DATABASE_TS_TYPE:-sql}" == "cassandra" ]]    && [[ -f "$(dirname "$0")/scripts/12-cassandra-recover.sh" ]]; then
   RECOVER="$(dirname "$0")/scripts/12-cassandra-recover.sh"
   if ! bash "$RECOVER" --status 2>/dev/null | grep -q "未发现 commitlog 损坏"; then
     warn "检测到 Cassandra 状态异常，尝试自愈（详见 scripts/12-cassandra-recover.sh）"
@@ -141,16 +148,16 @@ if [[ "$MODE" == "allinone" ]]; then
   log "启动单容器（已在上一步拉起，等待就绪）"
 else
 log "启动服务"
-# 不带服务名：把 postgres / energy-server / ngxai-backend / gateway 一起拉起来。
-# 首次运行会构建 ngx-ai 后端镜像（pip 装依赖 + 编译 Stan，约 5-10 分钟）。
-log "启动全部服务（首次构建 ngx-ai 镜像较慢，请耐心）"
+# 不带服务名：把 postgres / energy-server / spsspro-backend / gateway 一起拉起来。
+# 首次运行会构建 spsspro 后端镜像（pip 装 numpy/scipy/catboost/shap，约 10-15 分钟）。
+log "启动全部服务（首次构建 spsspro 镜像较慢，请耐心）"
 $COMPOSE $PROFILE_ARGS up -d --build
 fi
 
 if [[ "$MODE" == "allinone" ]]; then
   WAIT_MAX=180   # 单容器首次要跑 install，给 15 分钟
   log "等待服务就绪（单容器首次含 install，约 3–5 分钟）"
-elif [[ "${DATABASE_TS_TYPE:-cassandra}" == "cassandra" ]]; then
+elif [[ "${DATABASE_TS_TYPE:-sql}" == "cassandra" ]]; then
   # Cassandra 模式启动明显更慢：实体缓存预热 + 驱动连接池 + 分区索引都要从
   # 远端拉。实测 2026-10-23：冷启动到 200 约 7 分钟，旧的 240 秒必然超时。
   WAIT_MAX=120   # 600 秒
@@ -405,7 +412,7 @@ cat <<DONE
 
   ★ ${PORT}（.env 里的 HTTP_PORT）是 **gateway(nginx)**，不是 Java。
     nginx 挂了页面打不开，但 Java 可能还活着 —— 用直连口区分。
-    不要把浏览器入口改成直连口：会丢掉 /ngxai 反代与 SPA 回退。
+    不要把浏览器入口改成直连口：会丢掉 /spsspro 反代与 SPA 回退。
 
   系统管理员
     ${ADMIN_EMAIL}

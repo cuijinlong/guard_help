@@ -138,11 +138,17 @@ def dash_link(title, icon, menu_name=None):
         return None
     return link(menu_name or title, icon, dash_id=did)
 
-def ai_link(name, icon, path):
-    """ngx-ai 子应用：新标签页 + 带 token（前端已把 /ngxai 排除在 Angular 路由外）"""
+def app_link(name, icon, path):
+    """独立子应用：新标签页打开。
+
+    与普通 link 的区别只有 openInNewTab —— 子应用是另一个 SPA，
+    在 Angular 壳子里打开会被路由拦截。
+
+    ★ 不带 setAccessToken：spsspro 自己用服务账号（TB_USER/TB_PASS）
+      连平台读遥测，不像原 ngx-ai 那样需要借浏览器的 TB token。
+      传了反而没用，还会让链接带上超长的 query。"""
     it = link(name, icon, url=path)
     it["openInNewTab"] = True
-    it["setAccessToken"] = True
     return it
 
 def group(name, icon, pages):
@@ -175,9 +181,11 @@ items = [
 
     group("能耗优化", "trending_down", [
         dash_link("闲时能耗", "nightlight"),
-        ai_link("负载预测", "online_prediction", "/ngxai/biz/forecast"),
-        ai_link("用能建议", "lightbulb", "/ngxai/biz/advice"),
-        ai_link("用能质量", "verified", "/ngxai/biz/quality"),
+        # 原 ngx-ai 的三项（负载预测 / 用能建议 / 用能质量）已下线，
+        # 由 spsspro 数据探索统一承接：选场站设备 → 建数据集 → 发现线索
+        # → AHP/TOPSIS 归因 → 出报告。入口指向工作台而不是首页，
+        # 因为首页是算法树，客户点「用能质量」是想直接分析数据。
+        app_link("电能质量分析", "verified", "/spsspro/explore"),
     ]),
 
     # 告警只有「看发生了什么」这一件事，不再套一层分组（规则在场站详情页配）

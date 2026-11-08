@@ -264,7 +264,7 @@ cmd_enable() {
   if grep -q '^DATABASE_TS_TYPE=' "$ENV_FILE"; then
     sed -i.bak "s|^DATABASE_TS_TYPE=.*|DATABASE_TS_TYPE=cassandra|" "$ENV_FILE"
   else
-    printf '\n# 遥测存储后端：cassandra（默认）| sql\nDATABASE_TS_TYPE=cassandra\n' >> "$ENV_FILE"
+    printf '\n# 遥测存储后端：sql（默认）| cassandra（预留，当前不启用）\nDATABASE_TS_TYPE=cassandra\n' >> "$ENV_FILE"
   fi
   if grep -q '^DATABASE_TS_LATEST_TYPE=' "$ENV_FILE"; then
     sed -i.bak "s|^DATABASE_TS_LATEST_TYPE=.*|DATABASE_TS_LATEST_TYPE=${DATABASE_TS_LATEST_TYPE:-sql}|" "$ENV_FILE"

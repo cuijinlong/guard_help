@@ -65,11 +65,25 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-# 与 21-rtu-onboard.py 保持一致：这几台由真实 RTU 出数，模拟器不能碰
-RTU_DEFAULT = {"ED1-Gateway", "PowerMeter-DDSU777", "Sensor-HZ8706", "Relay-8CH"}
+# 与 21-rtu-onboard.py / 30-rtu-env-init.py / 31-rtu-simulate.py 保持一致：
+# 这几台由真实 RTU 出数，模拟器不能碰。
+#
+# ★ 表名必须逐字一致（2026-11-07 修）：原先这里写的是 PowerMeter-DDSU777，
+#   而真机设备名是 PowerMeter-DDSU666。一个字母的差别导致这台**真实电表**
+#   被当成模拟设备写入 —— 真机在线时两个源同时写，表底会跳变，
+#   抄表直接判 abnormal。而脚本自己注释里还写着「与 21 保持一致」，
+#   看上去像是核对过了。
+#
+#   为什么很久没发作：DDSU666 从 11-03 起就没上报（RTU 离线），
+#   没有第二个源在写，冲突是隐性的。RTU 一上线就会撞上 ——
+#   而那时排查方向会指向「抄表算法有问题」，不会有人怀疑到这里。
+RTU_DEFAULT = {"ED1-Gateway", "PowerMeter-DDSU666", "Sensor-HZ8706", "Relay-8CH"}
 
 ELECTRIC_PROFILES = {"单相电能表", "电能表"}
-UTILITY_PROFILES = {"水表": "water", "燃气表": "gas", "蒸汽表": "steam"}
+# 热力表也是表计，之前漏了 —— 表现为「13 台表计里永远有 1 台是 stale」，
+# 而它并不属于 RTU 真机（真机只有单相电表 + 温湿度 + 继电器）。
+UTILITY_PROFILES = {"水表": "water", "燃气表": "gas", "蒸汽表": "steam",
+                    "热力表": "heat"}
 SENSOR_PROFILES = {"温湿度变送器"}
 
 
@@ -123,6 +137,13 @@ def load_factor(hour, kind):
         curve = [0.15, 0.12, 0.12, 0.12, 0.15, 0.35, 0.75, 0.85, 0.55, 0.35,
                  0.30, 0.65, 0.85, 0.50, 0.30, 0.28, 0.45, 0.70, 0.80, 0.55,
                  0.35, 0.25, 0.20, 0.17]
+    elif kind == "heat":
+        # 热力与电/水相反：夜间与清晨供暖负荷高，午后气温上来就回落。
+        # 照抄 water 曲线（白天高）会让「热力」这一页看着不像供热，
+        # 客户第一眼就会觉得数据是编的 —— 而它确实是编的，更该编得像。
+        curve = [0.92, 0.94, 0.95, 0.94, 0.90, 0.82, 0.70, 0.58, 0.46, 0.38,
+                 0.34, 0.32, 0.33, 0.36, 0.42, 0.52, 0.64, 0.74, 0.82, 0.88,
+                 0.90, 0.91, 0.92, 0.93]
     else:  # water
         curve = [0.25, 0.22, 0.20, 0.20, 0.22, 0.35, 0.62, 0.80, 0.88, 0.85,
                  0.75, 0.70, 0.72, 0.80, 0.86, 0.84, 0.78, 0.70, 0.62, 0.55,
@@ -141,7 +162,7 @@ class Meter:
         self.level = level              # 1 进线 / 2 分项 / 3 回路 / 0 不计入
         self.reading = float(reading)   # 累积表底，单调递增
         self.nominal_kw = float(nominal_kw)
-        self.kind = kind                # electric / water / gas / steam / sensor
+        self.kind = kind                # electric / water / gas / steam / heat / sensor
         self.device_id = device_id
         self.phases = phases            # 1 单相 / 3 三相
         self.site_id = site_id
@@ -269,7 +290,8 @@ def discover(base, token, customer_id):
         elif prof_name in UTILITY_PROFILES:
             kind = UTILITY_PROFILES[prof_name]
             phases = 1
-            nominal = 0.35 if kind == "gas" else (0.25 if kind == "water" else 0.18)
+            nominal = {"gas": 0.35, "water": 0.25, "steam": 0.18,
+                       "heat": 0.30}.get(kind, 0.18)
         elif prof_name in SENSOR_PROFILES:
             kind, phases, nominal = "sensor", 1, 0.0
         else:

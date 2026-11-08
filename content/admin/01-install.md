@@ -141,7 +141,9 @@ docker compose version                          # 要看到 v2.x
 > 不该用 sudo 跑，加了 sudo 反而会因为 socket 属主变成 root 而把环境搞坏。
 
 **内存给够**：Docker Desktop → Settings → Resources，建议 ≥ 8 GB。
-平台 split 模式要跑 postgres + cassandra + 后端 + 网关，4 GB 会 OOM。
+平台 split 模式要跑 postgres + Java 后端 + 数据分析后端 + 网关（4 个容器，
+实测约 2.7 GB）。Cassandra 为预留能力、默认不启动，不占内存。
+给 6 GB 以上比较稳，4 GB 会 OOM。
 
 **开机自启**（跑演示环境时建议开）：Settings → General →
 `Start Docker Desktop when you sign in`。
@@ -432,7 +434,32 @@ docker compose exec postgres psql -U postgres -d thingsboard
 
 ---
 
-## 四、可选：遥测换成 Cassandra
+## 四、可选：遥测换成 Cassandra（**预留能力，当前不启用**）
+
+> **现在的状态：不启用，也不要启用。**（2026-11-07 定案）
+>
+> · 遥测固定走 Postgres 的 `ts_kv`（`DATABASE_TS_TYPE=sql`）
+> · compose 里保留了 Cassandra 的服务定义，但在独立 profile 下，
+>   默认 `up` 不会启动、不占内存；镜像也已从本机删除（335MB）
+> · 保留定义只是为了将来系统稳定、数据量上千万行之后能直接启用，免得重写
+>
+> **为什么现在不能切**：平台自研的峰谷分析、抄表、账单、闲时能耗、电能质量
+> **全部直查 `ts_kv` 表**。Cassandra 部署下 Postgres 没有这张表，
+> 这些接口会 `relation "ts_kv" does not exist`（500）。
+> 虽然代码里有 `TelemetryBackend` 做降级（走 `timeseriesService`），
+> 但降级路径的性能与数值正确性都没有在大数据量下验证过。
+> 切之前必须实测这四条链路都能出正确结果 —— 光看接口不报错不够，要核对数值。
+>
+> 下面内容保留给将来启用时参考。
+
+### 将来启用前的前提
+
+- [ ] 数据量确实到了千万行以上 / 写入成为瓶颈
+- [ ] 峰谷分析、抄表、账单、电能质量四条链路在 Cassandra 下实测通过（核对数值）
+- [ ] 手册里的运维 SQL 章节已更新（现在全是 `ts_kv` 查询，Cassandra 下跑不了）
+- [ ] 机器内存 ≥ 16GB（Cassandra 堆就要 2~4GB）
+
+### 原来的说明
 
 **默认不换。** 平台默认 `DATABASE_TS_TYPE=sql`，遥测与实体同库（`ts_kv` 分区表）。
 这个默认值在**单机、几十台表、几千万点**的规模下完全够用，而且备份/恢复简单。

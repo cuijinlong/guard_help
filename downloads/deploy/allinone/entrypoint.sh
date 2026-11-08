@@ -110,5 +110,5 @@ else
 fi
 
 # ---------------------------------------------------------------- 5. 交给 supervisord
-log "启动 Java / ngx-ai / Nginx"
+log "启动 Java / Nginx"
 exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf

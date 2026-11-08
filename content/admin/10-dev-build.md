@@ -223,14 +223,23 @@ bash ~/energy-app/scripts/dev-fast-build.sh --deploy
 # ── 2b. 改了 pom / 资源 / 签名 → 全量
 cd guard-server && mvn package -DskipTests -o
 cp target/guard-server-4.4.0.jar ~/energy-app/
-cd ~/energy-app && docker compose --profile split --profile cassandra \
-  restart energy-server      # ⚠ 默认后端是 Cassandra，漏了 profile 会起不来
+cd ~/energy-app && docker compose --profile split restart energy-server
+  # 默认遥测后端是 sql，不需要 --profile cassandra（Cassandra 为预留能力，未启用）
 
 # ── 3. 验证（至少这四条）
-bash scripts/ts-mirror.sh                                    # Cassandra 后端必跑：镜像遥测到 PG
+bash scripts/ts-mirror.sh                                    # 仅 Cassandra 后端需要（当前 sql，可跳过）
 python3 scripts/27-customer-surface-probe.py ... --strict    # 客户视角无 4xx + 语义断言通过
-bash scripts/08-verify-release.sh ...                        # 75 项
+bash scripts/08-verify-release.sh ... \
+  --customer demo@126.com --customer-pass '密码'             # 0 失败（项数随环境变，见下）
 bash scripts/06-verify-e2e.sh ...                            # 53 项
+
+# ★ 08 脚本必须传客户账号（2026-11-07 修）：
+#   不传时客户侧 9 项检查会 skip（会把它们当成「未提供客户账号」），
+#   而不是报红。以前不传会得到一串假的「接口缺字段 / 返回 302」——
+#   那是空 token 被服务端 302 重定向到登录页造成的。
+#   实测：不传 65 项通过，传了 90 项通过，两边都应 0 失败。
+#   通过项数会因「有没有虚拟表 / 有没有拓扑 / 本月抄没抄表」浮动，
+#   所以脚本只查下限（MIN_PASS）；**真正的门是 FAIL == 0**。
 
 # ── 3b. 改了看板/部件 → 浏览器实测（探针只打接口，看不到渲染）
 #        用客户账号打开「能耗概览」，确认四张卡有数字、日历有热力
@@ -246,6 +255,15 @@ cd ../guard_help && git add -A && git commit -m 'update manual' && git push
 
 ```bash
 cd ui-ngx
+
+# ── 0. 先过部件依赖自检（2026-11-04 加，必跑）
+#    586 个部件模板里的管道 / 结构指令 / Material 控件，是否都在动态组件
+#    imports 的作用域里。缺管道的后果是「整页空白且几乎不报错」，
+#    缺 Material 的后果是「全站控件没样式」。
+node esbuild/check-widget-deps.mjs
+# 用到新的 Material 控件时，先重新生成清单：
+# node esbuild/gen-material-jit-directives.mjs
+
 node --max_old_space_size=8192 ./node_modules/@angular/cli/bin/ng build --configuration production
 cd target/generated-resources && jar cf /tmp/ui-ngx-4.4.0.jar public
 cp /tmp/ui-ngx-4.4.0.jar ~/Documents/dev_tools/maven_repository/rule-engine/org/thingsboard/ui-ngx/4.4.0/
@@ -255,6 +273,42 @@ cd ../../guard-server && mvn package -DskipTests -o
 
 > 前端改动**不能用增量脚本**：`ui-ngx` 是独立的 jar 依赖，
 > `jar uf` 改不了嵌套 jar 里的资源。
+
+### ⚠ 部件 JSON 的真实来源：`widget_types/*.json` 本身，不是生成器
+
+`nenghaobao/widgets/build-*.mjs` 里有几个脚本会写
+`guard-server/src/main/data/json/system/widget_types/*.json`：
+
+| 生成器 | 写哪个部件 |
+| --- | --- |
+| `build-energy-analysis.mjs` | `energy_management_analysis_bar.json` |
+| `build-energy-analysis-results.mjs` | `energy_management_ranking_list.json` 等 |
+
+**但这些生成器已经落后于产物了，不要重跑。** 实测对比（2026-11-07）：
+
+| 特征 | 产物里有 | 生成器里有 |
+| --- | --- | --- |
+| `activeSiteId` | ✓ | ✗ |
+| `externalSiteCtx` | ✓ | ✗ |
+| `watchExternalSite` | ✓ | ✗ |
+| `assetTypeCache` | ✓ | ✗ |
+
+这些都是 2026-10-25 之后加进产物的（顶栏场站跟随、批量 brief、缓存）。
+重跑 `build-energy-analysis.mjs` 会把 `analysis_bar` **回退到十月底的旧版**：
+场站不跟顶栏、每个节点单查一次实体，整页卡十几秒。
+
+**改部件的正确姿势只有两条**：
+
+```bash
+# ① 直接改产物 JSON（它已入 git，是唯一真相源），然后用部署脚本推库
+vim guard-server/src/main/data/json/system/widget_types/energy_management_xxx.json
+bash shiyongshouce/downloads/scripts/31-deploy-widget.sh --yes energy_management_xxx
+
+# ② 新增部件才用生成器（生成完就不再回头跑）
+```
+
+> `nenghaobao/` 在 `.gitignore` 里，生成器不在版本控制内；
+> 而 `widget_types/*.json` 是入库的。真正需追溯的历史看 git log 就好。
 
 ---
 

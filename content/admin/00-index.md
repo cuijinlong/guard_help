@@ -135,21 +135,31 @@ bash scripts/29-rtu-demo-up.sh               # 两者并存
         ├─ 部件运行时      自定义部件（模板 + 控制器脚本）
         └─ 内置前端        Angular 产物打进 jar
               │
-              ├─ energy-postgres    实体 + 遥测（默认）
-              └─ energy-ngxai-backend  AI 分析（可选）
+              ├─ energy-postgres     实体 + 遥测（ts_kv）
+              ├─ energy-spsspro-backend  数据分析（数据探索 / 用能质量）
+              └─ energy-waveform-store   波形文件（S3 兼容）
 ```
 
-四个容器，都是 Docker 管理：
+五个容器，都是 Docker 管理：
 
 | 容器 | 作用 | 端口 |
 | --- | --- | --- |
 | `energy-gateway` | 反向代理 / 静态资源 | 80 |
 | `energy-server` | 后端 + 前端 | 8090（默认直连） |
-| `energy-postgres` | 数据库（实体 + 遥测） | 5432 |
-| `energy-ngxai-backend` | AI 分析服务（可选） | 内部 |
+| `energy-postgres` | 数据库（实体 + 遥测 `ts_kv`） | 5432 |
+| `energy-spsspro-backend` | 数据分析（数据探索 / 用能质量归因） | 内部 |
+| `energy-waveform-store` | 波形文件 + 数据集物化（S3 兼容） | `127.0.0.1:19333`（不对外） |
 
-> **遥测存储**：默认 `DATABASE_TS_TYPE=sql`，遥测与实体同库（`ts_kv` 分区表）。
-> 需要独立时序库时才切 Cassandra，见 [① 安装 · Cassandra](/admin/install#cassandra)。
+> **波形存储为什么是 SeaweedFS 不是 MinIO**：MinIO 官方镜像 2025-10 起已从
+> Docker Hub 下架、quay.io 也拒绝匿名拉取（2026-11-07 实测三种源全部失败）。
+> SeaweedFS 提供**同一套 S3 API**，Java 侧走标准 SigV4，
+> 将来 MinIO 镜像恢复只换 `image`，代码不动。
+> 数据在 `~/energy-app/seaweedfs-data`，随部署目录备份。
+
+> **遥测存储**：固定 `DATABASE_TS_TYPE=sql`，遥测与实体同库（`ts_kv` 分区表）。
+> **Cassandra 是预留能力、当前不启用** —— 峰谷分析、抄表、账单、电能质量都直查
+> `ts_kv`，切过去会成片 500。等系统稳定、数据量上千万行后再评估，
+> 见 [① 安装 · Cassandra](/admin/install#cassandra)。
 
 ---
 

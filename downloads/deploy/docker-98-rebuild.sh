@@ -83,6 +83,17 @@ TPL="$ROOT/guard-server/src/main/data/json/tenant/dashboards"
 TPL_N=$(ls "$TPL" 2>/dev/null | wc -l | tr -d ' ')
 [[ "$TPL_N" -ge 1 ]] || die "仓库里没有仪表板模板：$TPL"
 
+# jar 是否包含最新前端产物（2026-11-04 加，来自一次真实事故）。
+#
+# 事故形态：改了 ui-ngx（部件依赖 / 样式），只 build 了前端没重打 jar。
+# 部署下去的还是旧 UI：部件按钮没样式、整页空白，看起来像"初始化脚本没跑对"，
+# 实际是**产物根本没进 jar**。这条检查把它挡在部署之前。
+WEB_INDEX="$ROOT/ui-ngx/target/generated-resources/public/index.html"
+if [[ -f "$WEB_INDEX" && "$JAR" -ot "$WEB_INDEX" ]]; then
+  die "jar 比前端产物旧，部署下去会是旧 UI：
+     重打 jar：cd $ROOT/guard-server && mvn package -DskipTests"
+fi
+
 # 手册与代码一致性：重装后你会照手册验收，手册数字不对就是白验一遍。
 # 不一致只警告不中断 —— 重装本身不该被文档问题挡住，但你要知道。
 if [[ -x "$ROOT/shiyongshouce/check-docs.py" ]]; then
