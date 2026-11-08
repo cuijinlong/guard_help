@@ -1140,6 +1140,107 @@ document.querySelectorAll('button.tb-station-trigger').length;   // 期望 1
 // 且它在看板工具栏里（y ≈ 10，距右 ~170px）
 ```
 
+#### ★ 两项都是「不写就错」，而且默认值相反（2026-11-08 三块看板踩到）
+
+客户原话：「这几个功能在客户用户的仪表板上右上角没有场站下拉选择，
+而且还有多余的时间窗口选择，导致这三个功能我都用不了」。
+
+判据在 `dashboard-page.component.ts`，**两个方法的默认值相反**：
+
+| 设置项 | 缺省时行为 | 代码 |
+| --- | --- | --- |
+| `showStationSelect` | **false（没有场站选择器）** | `settings?.showStationSelect === true` |
+| `showDashboardTimewindow` | **true（多出一个时间窗口）** | 未定义时 `return true` |
+
+所以建看板时**两项都必须显式写**，漏一个就少一个功能、多一个没用的控件：
+
+```json
+"settings": {
+  "showStationSelect": true,
+  "showDashboardTimewindow": false
+}
+```
+
+**全库体检一条 SQL 就够**（两项一起看）：
+
+```sql
+SELECT title,
+  coalesce(configuration::jsonb->'settings'->>'showStationSelect','MISSING') AS station,
+  coalesce(configuration::jsonb->'settings'->>'showDashboardTimewindow','MISSING') AS tw
+FROM dashboard
+WHERE coalesce(configuration::jsonb->'settings'->>'showStationSelect','MISSING') <> 'true'
+   OR coalesce(configuration::jsonb->'settings'->>'showDashboardTimewindow','MISSING') <> 'false'
+ORDER BY title;
+```
+
+期望结果是**空**（或只剩刻意关闭的：组织与场站 / 客户能源档案 / 峰谷时段 / PQ数据集-验证）。
+
+2026-11-08 实测命中三块 —— 都是 `50-apply-model-analysis-boards.mjs` 建的，
+那个脚本的 `buildDashboard()` 当时漏写了这两行：
+
+```
+用能建议   1cebb370   station=MISSING  tw=MISSING
+用能质量   1d661390   station=MISSING  tw=MISSING
+问题台账   bce63750   station=MISSING  tw=MISSING
+```
+
+已修：脚本补两项（注释里写了为什么必须显式写）；库内三块通过
+`POST /api/dashboard` 补齐（**不要直接 UPDATE 库** —— dashboard 有缓存，
+直接改库不一定立即生效）。
+
+> **为什么时间窗口是「多余」而不是「有用」**：这几块看板的部件自己按
+> 「30 天 / 预测 24 小时」取数，顶栏那个时间窗对它们没有任何作用。
+> 客户点来点去以为坏了。凡是「部件自管时间口径」的看板，都要关掉它。
+
+#### ★ 部件里不要再放第二个场站下拉
+
+顶栏是全局唯一真相源。原先专题部件自己还有一套 `localStorage` 记忆
+与下拉（`tb.energy.siteCtx`），与顶栏（cookie `tb.energy.site.<customerId>`）
+**不是同一份** —— 两个下拉各记各的，选了这个那个不变，客户看到的是错的数据。
+
+现在的做法（`energy_management_model_topic`）：
+
+- 顶栏给了场站 → 只读显示场站名（`.mt-site-ro`），**不再放下拉**
+- 顶栏没给（独立嵌入）→ 才退回本地下拉
+- 顶栏换场站 → 清旧结论 → 自动重跑
+- 跑到一半又换 → 记 `pendingRun`，等这一轮结束补跑（不丢）
+- 顶栏给的 id **必须在 `/api/energy/visible-sites` 里出现才采用**
+  （防失效 id 查出空表，见 E3）
+
+判据（客户账号，任一专题看板）：
+
+```js
+document.querySelector('select.mt-sel');        // 期望 null（顶栏已给场站）
+document.querySelectorAll('.mt-site-ro').length; // 期望 1
+document.querySelector('tb-station-select');     // 期望存在
+```
+
+#### ★ 「上面换了、下面没换」：发布者漏发布
+
+负载预测看板有上下两个部件，`forecast_context` 是「场站 + 日期」的
+**唯一发布者**，把值写进 state 的 `forecastSiteId` / `forecastDate`；
+`forecast_chart` 只读。
+
+实测症状（2026-11-08，顶栏办公园区 → 质量示范站）：
+
+```
+上面「负荷情况」  23 个整点 · 6 台表      ← 跟随了
+下面「负荷预测」  办公园区 · 2 台表        ← 没跟随，还是旧场站的数
+```
+
+根因：context 订阅了顶栏场站，切场站时改了内部 `siteId` 并 `load()`，
+但**没有 `publish()`** —— `forecastSiteId` 仍是旧值。
+
+修两处：
+
+1. context 切场站后 `publish()`（publish 会再触发订阅，但此刻
+   `sid === siteId` 直接跳过，不会循环）
+2. chart 改成**顶栏优先**：`p.siteCtx.entityId.id || p.forecastSiteId`
+   —— 反过来的话顶栏已换、图还是别处
+
+> 以后加这类「一个部件发布、另一个订阅」的联动，**发布者每一步改值
+> 都要 publish**，别只在初始化时发一次。
+
 #### 顺带确认：功率因数面板**不跟随**顶栏是设计如此
 
 用户提「最下面的功率因数不随上面的场站走，它自己可以切换就好了」——
