@@ -190,7 +190,7 @@ bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
 
 ```bash
 ls ~/energy-app/guard-server-4.4.0.jar
-ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 30
+ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 31
 ls ~/energy-app/data/sql/*.sql | wc -l                   # 必须是 8
 ```
 
@@ -4436,6 +4436,111 @@ bash scripts/09-onboard-customer.sh \
 
 ---
 
+### 客户打开三块看板看到什么（客户诊断报告）
+
+客户登录后菜单里的「负载预测 / 电能质量 / 用能建议」，三块看板各只有 **1 个部件**
+（`system.energy_management.diagnosis_brief`），靠 `settings.view` 区分显示哪一段：
+
+| 看板 | view | 部件高度 | 客户看到什么 |
+| --- | --- | --- | --- |
+| 负载预测 | `forecast` | sizeY 13 | 未来最高/最低/均值 + 峰谷时刻 + 这数能不能信 |
+| 电能质量 | `quality` | sizeY 20 | 几类问题、涉及几台设备、怎么做、怎么验、判定依据 |
+| 用能建议 | `savings` | sizeY 14 | 每月/每年能省多少 + 每项的测算前提 + 还缺什么数据 |
+
+**数据是只读的**：来自 trend 分析（spsspro）里**模型定时任务**的产出 —— 事件台账、
+问题族、最近一次预测运行。**不实时计算**。首响约 5 秒（要算金额），命中缓存 0.2 秒。
+改前是实时跑 `pulse.examine()`，一份报告 133 秒。
+
+#### 三个必须知道的设计
+
+**① 场站没挂表时不是报错，是自动兜底**
+
+客户登录后顶栏默认落在第一个场站，而它常常一台表都没挂（演示环境：总部 0 台、
+办公园区 0 台，数据全在质量示范站）。后端回 **200 + `no_data`**（不是 4xx —— 4xx 会触发
+TB 顶部红条，而「这个场站没表」是正常业务状态），部件拿到 `suggest` 后自动切过去，
+并在页面顶部显示黄色说明：
+
+```
+! 当前场站还没有接入电表，下方显示的是「质量示范站」的报告
+```
+
+**不能悄悄换场站** —— 客户顶栏选 A、报告说的是 B，不说明就是更严重的误导。
+
+**② 场站跟顶栏，部件自己不放下拉**
+
+一页两个场站开关、各记各的存储，客户选了这个那个不变，看到的就是错的数据。
+"跟随顶栏"是唯一真相源。
+
+**③ 每个结论都带「谁判的、依据什么」**
+
+客户会问「这是系统猜的还是量出来的」。所以每条问题都带 `sources`（哪几个模型判的）
+与 `standard`（GB/T 12325、GB/T 14549 这类），金额类带 `confidence_text` 与 `assumption`
+（测算前提）。算不准的金额被客户拿去对账，是最伤信任的一类错。
+
+#### 接口
+
+```bash
+# 平台端 Java 代理（客户账号可调，会按设备可见性校验场站归属）
+GET /api/energy/diagnosis/brief?siteId=<场站id>&days=30
+GET /api/energy/diagnosis/sites      # 哪些场站有数据、建议看哪个
+GET /api/energy/diagnosis/health
+
+# spsspro 直连（用调用者自己的令牌）
+GET /spssproapi/guardian/customer/brief?site_id=&days=30
+```
+
+`no_data` 响应（HTTP 200）：
+
+```json
+{"brief": null, "meter_count": 0,
+ "no_data": {"ready": false,
+             "reason": "这个场站还没有接入电表，暂时出不了报告",
+             "hint": "请到「组织与场站 → 设备管理」…",
+             "suggest": {"id": "7f1f3160-...", "name": "质量示范站", "meters": 11}}}
+```
+
+#### 结论会过期：先看「几个模型开了定时」
+
+报告里的结论是模型跑出来的。模型没开定时，结论就停在最后一次手工运行上 ——
+页面上那行「系统在 8 小时前自动分析过 · 9 个分析模型在监测（0 个已开定时）」
+就是在说这件事。**0 个开定时 = 客户看到的永远是旧结论。**
+
+演示/交付前到 trend 分析「模型库」把该场站的模型定时打开。
+
+#### 改文案 / 重排：模板在哪、怎么生效
+
+```
+仓库   guard-server/src/main/data/json/tenant/dashboards/
+         load_forecast.json    ← 负载预测（title 必须逐字等于「负载预测」）
+         power_quality.json    ← 电能质量
+         advice.json           ← 用能建议
+部署   ~/energy-app/data/json/tenant/dashboards/   ← install 只读这里，不读仓库
+```
+
+改完必须同步 + 让**已存在的客户看板**也跟着变，两条都要做：
+
+```bash
+cd <仓库目录>
+
+# ① 仓库 → 部署目录（缺这一步：新装/新客户拿到的还是旧模板）
+bash shiyongshouce/downloads/scripts/32-check-deploy-sync.sh --app ~/energy-app --fix
+
+# ② 已经复制给客户的看板副本：重启后由启动自检自动升级，无需手工改库
+cd ~/energy-app && docker compose --profile split restart energy-server
+# 日志里应有：
+#   [install] 客户 xxx 的报告看板「用能建议」已升级为诊断报告结构（模板 advice.json）
+#   [energy-schema] 客户报告看板已升级为诊断报告结构：1 块
+```
+
+升级判据收得很窄，三条同时成立才动：**标题**属于这三块 + 看板里**一个
+`diagnosis_brief` 都没有** + 模板文件存在。只换 `configuration`，看板 id、
+customer_id、createdTime 全保留，所以菜单不用重建、客户可见性不动。
+幂等：升级过的看板含 `diagnosis_brief`，再重启不会再有日志。
+
+客户自己改过看板名的，标题对不上 —— 不会被动。
+
+---
+
 ## 第 7b 步　接入真实 RTU（现场演示必做）
 
 **平台侧不需要任何操作。** 第 7 步建客户时已经把网关建成固件认的那一台：
@@ -4689,6 +4794,37 @@ bash shiyongshouce/downloads/scripts/31-deploy-widget.sh --all
 
 > 两个都**必须从仓库跑**。从 `~/energy-app/scripts` 跑时，`32` 会拒绝（拿自己比自己永远报一致）。
 
+### 看板模板改完为什么不生效：三份拷贝
+
+看板模板比部件多一层，三处都对齐才算改完：
+
+| 位置 | 谁读 | 什么时候读 |
+| --- | --- | --- |
+| 仓库 `guard-server/src/main/data/json/tenant/dashboards/` | 人 | 永远不读（源副本） |
+| 部署 `~/energy-app/data/json/tenant/dashboards/` | `InstallScripts` | **建租户 / 补建客户看板时** |
+| 数据库 `dashboard` 表 | 前端 `/api/dashboard/:id` | 每次打开看板 |
+
+于是有三种「改了没变」：
+
+1. **只改仓库** → 部署目录还是旧模板，重装/新客户拿到旧结构，而看板上看着正常；
+2. **只改部署目录** → 已存在的客户看板是当年复制的副本，**不会**跟着变；
+3. **只改数据库** → 下次重装被模板覆盖回去。
+
+```bash
+# ① 仓库 → 部署（32 脚本会逐文件比对，列出差异再同步）
+bash shiyongshouce/downloads/scripts/32-check-deploy-sync.sh --app ~/energy-app --fix
+
+# ② 存量客户看板：重启，启动自检会自动升级（见「客户诊断报告」一节）
+cd ~/energy-app && docker compose --profile split restart energy-server
+```
+
+**实测踩过的坑**：仓库里新加了 `advice.json`，只重启没同步部署目录 ——
+升级逻辑判「模板文件不存在」直接跳过，**不报错、不打日志**，看板继续是旧结构。
+`32 --fix` 之后再重启，日志才出现「已升级为诊断报告结构」。
+
+> 同理适用于 `data/json/system/widget_types/*.json`：`install` 只读部署目录，
+> 不读仓库副本。改完部件永远先跑 `32 --fix`（或 `31-deploy-widget.sh`）。
+
 ## C　彻底重来（数据全不要了）
 
 ```bash
@@ -4745,8 +4881,8 @@ bash docker-02-start.sh --allinone --admin-email ... --admin-pass ...
 | --- | --- |
 | 库表 | 150 上下（`SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`） |
 | 系统部件（install 后 DB 行数） | 740 上下 |
-| 交付的部件文件 | 588 个 |
-| 客户看板模板 | 30 个 |
+| 交付的部件文件 | 589 个 |
+| 客户看板模板 | 31 个 |
 | 建表 SQL | 8 个 |
 | 能源参数字典 | 1 个资产，标准 key **137** 个（电能 122） |
 | 演示客户 | 10 台设备（8 台可模拟） |
