@@ -3149,6 +3149,9 @@ fingerprint / evidence(JSON) / run_at / run_id / resolved_at
    | 功率因数报告的波形变成电压跌落 | `KIND_RULES` 加了通用词「偏低」，`infer_kind('power_factor_total','功率因数偏低')` 撞车 | 规则表只留技术键名，稳态偏高/偏低由 `evidence.category` 精确纠正 |
    | 20 h 稳态偏低中间夹一次深跌，整段变成 1 条「长时深跌」 | 回差改成按侧别判以后，只看「偏低侧还在 −4.5% 以下」，深跌桶被吸进稳态区间 | `_still_in` 里加 `if span_kind != 'sag' and _kind(p) == 'sag': return False`，先断开再按 `_bad` 开 sag 区间 |
    | 切段后出现「幽灵行」：整月峰值 + 段外的最严重时刻 | 子段内一个遥测点都没有时，沿用了整段的 `dev_max/avg_u/peak_row` | 空段清空统计并标 `_nodata`，类别落 `unknown`，文案改成「该段无遥测数据」（不是电压合格，也不是判不了） |
+   | **重跑一次模型，历史事件凭空少了两条** | `platform.telemetry` 按「设备 × 天」分段并发取数，单段失败被静默 `continue`；`prune_events` 却按「运行时刻 − range_days」这个**假定窗口**清理，于是「没扫到」被当成「重扫了但没产出」删掉 | ① prune 的 `since_ts` 改用 `lineage.window.from`（实际数据起点）；② 实际覆盖 < 期望 90% 时往 warnings 写一条明确告警 |
+   | 客户反馈「没有事件台账、看不到效果」 | 模型中心点运行结果里的事件，`window.location.href` 跳的是通用详情页 `/guardian/events/{id}`，五个专项的报告都进不去 | 改成按 `evidence.report` 分流到专项报告 + `router.push`（整页刷新会丢 SPA 状态），事件行加报告徽章 |
+   | 事件台账里找不到电压偏差 | 4 条电压偏差等级全是「中」（长期损耗风险），按「等级=高」筛时一条不剩；台账原本只有状态/等级/场站三个筛选 | 加「全部类型」下拉（前端 computed 筛选，不额外请求）。等级不为了能被筛到而虚增 |
 
    **浅跌落的归类口径（必须知道，不是 bug）**：偏差只有 −6% 的短时跌落
    不会进「暂降」（暂降按 IEC 61000-4-30 要低于 90% Un），而是按越限时长
