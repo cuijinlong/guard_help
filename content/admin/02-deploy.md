@@ -1544,8 +1544,20 @@ ie=0.80 peak=305.74 k=382.12 recovered=False → short_circuit   （实际是软
 τ=1.60 真截断 0.915  ← 真实电机要 5 s 才稳，2 s 录波必然落在这一段
 ```
 
-余量只有 4 个百分点，**这一条必须靠回归集守住**（`motor_scenario.py verify`
-+ 停机启动 / 跳闸切除等 9 个形态）。
+余量只有 4 个百分点，**这一条必须靠回归集守住**：
+
+```bash
+cd spsspro/tools/meter-sim
+python3 motor_judge_regression.py        # 11 个形态，改任何阈值前先跑
+python3 motor_scenario.py verify         # 演示录波的 5 个形态
+```
+
+`motor_judge_regression.py` 覆盖：停机启动（软/硬）、运行中启动（软/硬/无冲击）、
+短路保持高位、短路跳闸切除、录波截断（判不了）、回落后停机、连续两次启动、
+启动后带载更重。全部走真实的 `analyze_waveform` + `classify`，
+不在测试里复刻逻辑 —— 复刻出来的测试只会证明复刻是对的。
+
+**加新阈值时必须同时在回归集里加一条形态**，否则那个阈值等于没有守卫。
 
 **⑬ 每份录波都落一条事件，包括「无启动冲击」**
 
