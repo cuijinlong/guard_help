@@ -190,7 +190,7 @@ bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
 
 ```bash
 ls ~/energy-app/guard-server-4.4.0.jar
-ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 31
+ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 32
 ls ~/energy-app/data/sql/*.sql | wc -l                   # 必须是 8
 ```
 
@@ -4436,20 +4436,73 @@ bash scripts/09-onboard-customer.sh \
 
 ---
 
-### 客户打开三块看板看到什么（客户诊断报告）
+### 客户打开四块看板看到什么（实时监测 + 三块报告）
 
-客户登录后菜单里的「负载预测 / 电能质量 / 用能建议」，三块看板各只有 **1 个部件**
-（`system.energy_management.diagnosis_brief`），靠 `settings.view` 区分显示哪一段：
+客户的「能耗优化」与「电能质量」两个菜单下共四块相关看板。**它们的分工不能混**：
 
-| 看板 | view | 部件高度 | 客户看到什么 |
+| 菜单位置 | 看板 | 装什么 | 回答客户什么问题 |
 | --- | --- | --- | --- |
-| 负载预测 | `forecast` | sizeY 13 | 未来最高/最低/均值 + 峰谷时刻 + 这数能不能信 |
-| 电能质量 | `quality` | sizeY 20 | 几类问题、涉及几台设备、怎么做、怎么验、判定依据 |
-| 用能建议 | `savings` | sizeY 14 | 每月/每年能省多少 + 每项的测算前提 + 还缺什么数据 |
+| 电能质量 → 实时监测 | 电能质量 | `power_quality`（实时） | 现在这几相电压电流是多少 |
+| 能耗优化 → 负载预测 | 负载预测 | `diagnosis_brief` view=`forecast` | 接下来用电会怎么走 |
+| 能耗优化 → 用能质量 | 用能质量 | `diagnosis_brief` view=`quality` | 系统查出了哪些问题、当时现场什么样 |
+| 能耗优化 → 用能建议 | 用能建议 | `diagnosis_brief` view=`savings` | 改动哪里能省钱、省多少 |
+
+**三块报告的部件都是 `system.energy_management.diagnosis_brief`**，靠 `settings.view`
+区分显示哪一段：
+
+| 看板 | view | sizeY | 客户看到什么 |
+| --- | --- | --- | --- |
+| 负载预测 | `forecast` | 13 | 未来最高/最低/均值 + 峰谷时刻 + 这数能不能信 |
+| 用能质量 | `quality` | 20 | 几类问题、涉及几台设备、怎么做、怎么验、判定依据 |
+| 用能建议 | `savings` | 14 | 每月/每年能省多少 + 每项的测算前提 + 还缺什么数据 |
 
 **数据是只读的**：来自 trend 分析（spsspro）里**模型定时任务**的产出 —— 事件台账、
 问题族、最近一次预测运行。**不实时计算**。首响约 5 秒（要算金额），命中缓存 0.2 秒。
 改前是实时跑 `pulse.examine()`，一份报告 133 秒。
+
+> ⚠ **「电能质量」不要做成报告**。「实时监测」回答的是「现在怎么样」，
+> 报告回答的是「系统查出了什么问题」—— 两件事两个入口。
+> 把实时监测改成报告过一次（2026-11-10），客户当场反馈「用能质量还在现算」——
+> 因为他点的那个入口其实还挂着 `model_topic`（技术员的现场分析台，带
+> 「重新分析」「判据参数」「AHP/TOPSIS」），客户点开只会看到红条
+> 「该场站下没有可分析的三相电能表」。
+
+#### 客户从事件追溯「当时现场到底什么样」
+
+问题条目下点「看明细与当时的数据」→ 每条明细右侧有「看当时数据」。
+点开后**就地**展开一张表：
+
+```
+三相质量-02 谐波超标    10-12 02:05 ~ 10-12 03:05 · 判据最差点 2026-10-12 02:35:00
+指标                       最低    平均    最高   最差点   走势
+A 相电压谐波畸变率（%）    6.01    7.78    9.00   9.00    ~~~~~~~~
+B 相电压谐波畸变率（%）    6.32    8.05    8.88   8.01    ~~~~~~~~
+A 相电流（A）             106.8   124.9   152.3  113.7    ~~~~~~~~
+数据直接读平台遥测库，就是那段时间设备真实上报的值。其中 72 超出判据限值。
+```
+
+设计要点：
+
+- **锚点是 `evidence.worst_at`**（模型算出的最差点），不是事件写入时间 ——
+  客户看到的时间要对得上报告里那个数字。
+- **窗口是锚点前后各 30 分钟**：太短只有几个采样点看不出趋势，太长客户看不出「那一段」。
+- **拉一整组指标而不是只拉判据那一个**：客户要判断的是因果。谐波超标时他还要看
+  三相电压/电流是否同时异常 —— 只给一个 THD 数字反而让人以为是采集坏了。
+  组按问题族定（`customer_brief.WATCH_KEYS`），指标中文名与单位在
+  `METRIC_META`（鼠标悬停显示英文 key）。
+- **就地展开、不跳转**：跳「历史能耗」要穿 state、带设备与时间窗两个参数，
+  客户一旦跳走就丢了报告的上下文 —— 而报告才是他判断要不要动手的依据。
+- 显示「几个点超出限值」：把「超标」从形容词变成一个可数的量。
+
+实现要点：
+
+- 接口 `GET /api/plugins/telemetry/DEVICE/{deviceId}/values/timeseries?keys=&startTs=&endTs=`，
+  客户账号直接可读（按设备可见性由 TB 自身校验）。
+- ★ **不能用 `http.get(url).map(...)`**：TB 的 `http.get` 返回 RxJS Observable，
+  RxJS 6+ 把 `map` 从原型上移除了，运行时抛「res.map is not a function」，
+  而部件里看不到堆栈 —— 客户只看到按钮无反应。要在 `subscribe` 内部变异。
+- 平台返回的序列是**最新在前**，画走势前要按 ts 正序排。
+- 值全相同（例如恒定 220V）时画中线，别除零。
 
 #### 三个必须知道的设计
 
@@ -4573,10 +4626,17 @@ curl "$BASE/spssproapi/guardian/scheduler" -H "X-TB-Token: $TOK"
 ```
 仓库   guard-server/src/main/data/json/tenant/dashboards/
          load_forecast.json    ← 负载预测（title 必须逐字等于「负载预测」）
-         power_quality.json    ← 电能质量
+         quality.json          ← 用能质量（title 必须逐字等于「用能质量」）
          advice.json           ← 用能建议
+         power_quality.json    ← 电能质量 · 实时监测（**不是**报告）
 部署   ~/energy-app/data/json/tenant/dashboards/   ← install 只读这里，不读仓库
 ```
+
+> ⚠ **四份模板的 `configuration` 必须含 `timewindow`**
+> （`{"realtime":{"realtimeType":0},"aggregation":{"type":"NONE","limit":200}}`）。
+> 缺了它，库里那份 `configuration.timewindow` 就是 null：看板能建出来、接口也正常，
+> 但**部件区域一片空白** —— 没有报错、没有红条、控制台干净，只有 favicon 一个 404。
+> 实测 2026-11-10 查了半小时。同时补全 `entityAliases` / `filters`（空对象 / 空数组即可）。
 
 改完必须同步 + 让**已存在的客户看板**也跟着变，两条都要做：
 
@@ -4943,7 +5003,7 @@ bash docker-02-start.sh --allinone --admin-email ... --admin-pass ...
 | 库表 | 150 上下（`SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`） |
 | 系统部件（install 后 DB 行数） | 740 上下 |
 | 交付的部件文件 | 589 个 |
-| 客户看板模板 | 31 个 |
+| 客户看板模板 | 32 个 |
 | 建表 SQL | 8 个 |
 | 能源参数字典 | 1 个资产，标准 key **137** 个（电能 122） |
 | 演示客户 | 10 台设备（8 台可模拟） |
