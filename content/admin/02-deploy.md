@@ -4467,7 +4467,7 @@ bash scripts/09-onboard-customer.sh \
 > 「重新分析」「判据参数」「AHP/TOPSIS」），客户点开只会看到红条
 > 「该场站下没有可分析的三相电能表」。
 
-#### 负载预测：以「现在」为中心，按设备看
+#### 负载预测：左右布局 · ECharts 图表 · 多设备对比
 
 这一块与另外两块报告**不是同一个数据源**，这点必须记住：
 
@@ -4478,33 +4478,115 @@ bash scripts/09-onboard-customer.sh \
 
 **界面形态**（客户 2026-11-10 明确要求）：
 
+- **左右布局**：左侧常驻设备树（树形、可多选、最多 4 台），右侧跨度切换 +
+  摘要 + 图表 + 模型评价。客户会频繁换设备对比，树比顶部下拉顺手。
 - **不显示「需要处理」结论条**。结论条回答「有没有问题」，预测回答
   「接下来怎么走」；混成一个颜色徽标会让客户以为预测本身是个告警。
 - 横轴以**当前时刻为中心**：左半是设备真实上报的历史，右半是预测，
-  中间一条竖线标「现在」。只给未来曲线时客户无法判断它跟历史接不接得上。
+  中间一条竖线标「现在」。
 - **前后推移长度跟着预测跨度走**：选 3 天 = 前 72 小时 + 后 72 小时。
-  固定前后窗口会让「选 1 天」时曲线被拉扁、「选 14 天」时看不见接续处。
 - 跨度只有 **1 / 2 / 3 天（小时粒度）** 与 **7 / 14 天（日粒度）**。
-  中间的 4/5/6 天在小时粒度下点太多、日粒度下点太少，两个粒度都不合适。
 
-**设备清单来自数据集，不是设备档案**：
+**图上五条线，对应客户的四个疑问**：
+
+| 线 | 回答什么 |
+| --- | --- |
+| 真实值（实线） | 设备实际上报的值 |
+| 当时算出的预测（点线，过去段） | **模型在那段历史上准不准** —— 回测段是模型没见过的数据 |
+| 未来预测（虚线） | 接下来会怎么走 |
+| 范围上界 / 下界（两条细虚线） | 可能的波动范围 |
+| 「现在」竖线（橙） | 历史与预测的分界 |
+
+客户原话：「当前时刻以前的又有真实值和预测值吧？未来的肯定是没有真实值了」——
+正是这句决定了必须画回测段的两条线。只给历史实际值 + 未来预测，客户无从验证
+模型准不准，只能选择信或不信。
+
+**波动范围怎么算的**（客户问「我不知道你是怎么算的」）：
+
+不是「±若干」拍出来的，而是取模型在历史回测中**残差的第 10 与第 90 百分位**。
+即历史上十次里有八次落在带内。不用正态假设：负荷分布明显右偏（有尖峰），
+`±1.96σ` 会给出对称区间，而实际低估的那一侧风险更大。这句话直接显示在图下方。
+
+**模型评价**（默认折叠，客户被罚款时会追问「你怎么知道的」）：
+
+每台设备展开后给：用了哪个算法、与「照着上周同一时刻抄」这个朴素参照比
+误差高低多少、回测用了多少点 / 训练用了多少点与时间范围、六个候选算法各自的
+误差与权重、以及「误差超过三成只能看趋势」的结论。术语一律换成人话
+（`wMAPE` → 「回测误差」，数字照实留着 —— 那是客户核对工作的依据）。
+
+#### 图表用 ECharts：平台本来就自带
+
+客户反馈：「图表你应该是自己画的？这么不像 echarts 图表呢？」
+
+对 —— 之前是手绘 SVG。平台**本来就是 ECharts**：`ui-ngx/package.json` 里
+`echarts: https://github.com/thingsboard/echarts/archive/5.5.2-TB.tar.gz`，
+TB 原生图表部件全用它画。但那是 Angular bundle 内部的 import，
+`window.echarts` 在前端页面里是 `undefined`（实测），自定义部件拿不到，
+所以必须再加载一份。
+
+**加载方式：走 TB 官方的 `descriptor.resources`**，不要自己在 controllerScript
+里插 `<script>`：
+
+```js
+// build-diagnosis-brief.mjs
+resources: [{ url: '/assets/lib/echarts.min.js', isModule: false }],
+```
+
+官方的 `ResourcesService` 会去重、等加载完成再跑 `onInit`、加载失败给出可读错误。
+参考 TB 自带文档 `ui-ngx/src/assets/help/.../plain_analytics_resources.md`。
+
+**不要用 CDN**：内网环境加载不到，页面会静默没有图。
+
+**文件从哪来**：拷平台自己的那一份（就是 TB 定制版），不是引入第三方新库：
+
+```bash
+cp ui-ngx/node_modules/echarts/dist/echarts.common.min.js \
+   ui-ngx/src/assets/lib/echarts.min.js
+# src/assets 由 angular.json 的 assets 配置整个复制进产物 → 打包时自动进 jar
+```
+
+#### ★ custom series 在这个 ECharts 版本里会崩
+
+**这是本轮最耗时的一个坑**，写下来省下次几小时。
+
+这个平台的 ECharts 是 TB 定制版（浏览器里 `echarts.version` 报 5.5.0，
+来源是 `5.5.2-TB`）。**custom series 与 line series 混用必然崩**：
+
+```
+band + line                  → Cannot read properties of undefined (reading 'get')
+band + line（无 markLine）    → ... (reading 'getProgressive')
+给 custom 加 progressive:0     → 一样崩
+全局 progressive:0            → 一样崩
+band 单独用                   → 正常
+```
+
+浏览器里二分到最小组合（2026-11-10）：只要图里有 custom series 和 line series
+并存，整个图**完全不画**，`canvas` 为 `null`，控制台只有一条看不出所以的错误。
+
+所以**波动范围用上下两条细虚线画，不用填充多边形**。这是 ECharts 官方也认可的
+区间表达方式（confidence band as 2 lines），客户看图例就知道「两条虚线之间是范围」。
+
+> ⚠ 排查这类问题的正确姿势：在浏览器里 `echarts.init` 一个离屏容器，
+> 逐项加 series 二分。看 `document.querySelector('.db-fcp-ec canvas')` 是否存在
+> —— 比读 min 文件里的堆栈快得多。
+
+#### 设备清单来自数据集，不是设备档案
 
 预测要等间隔、有足够历史的序列。设备档案里那些刚接入、长期离线、
 没接 `power_total` 的表跑了必然报错 —— 客户点一次一个错，最后就不用了。
 数据集是已经拉过验过的数据，所以只列数据集里出现过的设备
-（`customer_forecast.devices_from_datasets`），并标出哪些能预测。
+（`customer_forecast.devices_from_datasets`），并标出哪些能预测（其余置灰）。
 
 ```bash
-# 按设备预测（客户账号可调；device_id 留空 = 该场站第一台可预测的表）
-GET /api/energy/diagnosis/forecast?siteId=<场站>&deviceId=<设备>&days=3
+# 多设备（逗号分隔，最多 4 台）
+GET /api/energy/diagnosis/forecast?siteId=<场站>&deviceIds=<id1>,<id2>&days=3
 
 # 直连 spsspro
-GET /spssproapi/guardian/customer/forecast?site_id=&device_id=&days=3
+GET /spssproapi/guardian/customer/forecast?site_id=&device_ids=&days=3
 ```
 
-响应要点：`history[]`（显示段实际值）、`points[]`（预测值 + lo/hi 区间）、
-`center`（「现在」那一刻）、`summary.hist_mean`（**显示段**均值，不是全训练集）、
-`data_shift` / `shift_note`（见下）。
+上限 4 台：一次赛马约 8 秒/台（客户等不起），一张图超过 4 组曲线也分不清。
+超出的部分 spsspro 截断并在 `truncated` 里告知。
 
 #### 量级突变必须拦：否则会输出荒谬预测
 
