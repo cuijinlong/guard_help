@@ -1707,6 +1707,46 @@ cd ~/energy-app && docker compose --profile split restart energy-server
 `电压偏差/不平衡` 类判据对应的模拟波形本身就不含谐波，接近正弦是正确的。
 另外确认部件版本是最新的（旧版降采样到 240 点，谐波会被抹平）。
 
+### 部件里的 ECharts 图不重画 / 切走再回来图没了（2026-11-10 实测）
+
+**症状**：勾选第二台设备，图的条数没变；或者离开看板再回来，图区一片空白，
+但数据、图例、摘要都正常 —— **不报任何错**。
+
+**根因**：Angular 会重建部件模板里的 DOM 节点（切看板 state、`*ngIf` 条件翻转、
+看板重排、浏览器缩放）。旧 ECharts 实例还挂在**已经脱离文档**的节点上，
+新节点里当然没有 canvas。而如果数据指纹（`fcChartKey`）没变，
+`if (key === lastKey) return;` 会把它永远挡住。
+
+```js
+// ✗ 错：只看数据变没变
+if (key === fcChartKey) { return; }
+
+// ✓ 对：先确认实例还绑在**当前**这个节点上
+if (chart && chart.getDom() !== el) {
+  chart.dispose(); chart = null; key = '';
+}
+if (!chart) { chart = echarts.init(el, null, { renderer: 'canvas' }); }
+if (key === fcChartKey) { chart.resize(); return; }   // 尺寸可能变了
+```
+
+**两个配套细节**：
+
+- 指纹里要带上「序列条数」（`(d.series || []).length`）。只拼 `computed_at`
+  时，勾选设备数变化可能撞上同一个指纹。
+- `init` 之前要等 DOM 落位（`setTimeout(..., 0)`），但**重试必须限次**
+  （实测用 25 次）；无限递归会每秒跑十几次查询，把主线程拖住。
+
+**自检命令**（浏览器 console，能直接看到图表真实状态）：
+
+```js
+const el = document.querySelector('.db-fcp-ec');
+const inst = window.echarts.getInstanceByDom(el);
+console.log(inst.getOption().series.map(s => s.name));
+```
+
+`getInstanceByDom` 返回 `null` = 实例不在这个节点上（就是上面那个坑）；
+`series.length` 与设备数对不上 = 数据没刷新。
+
 ### 改完部件 JSON 前端没变化
 
 | 层次 | 判据 | 修 |

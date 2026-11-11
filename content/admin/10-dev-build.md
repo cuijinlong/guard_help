@@ -310,6 +310,35 @@ bash shiyongshouce/downloads/scripts/31-deploy-widget.sh --yes energy_management
 > `nenghaobao/` 在 `.gitignore` 里，生成器不在版本控制内；
 > 而 `widget_types/*.json` 是入库的。真正需追溯的历史看 git log 就好。
 
+### 设备拓扑用图库（cytoscape）：换库不重打 jar
+
+「设备管理 → 设备拓扑」的关系图视图用 **cytoscape** 渲染（力导向 + 缩放 + 导出），
+库文件**不在 jar 里**，而是作为 TB 的 `JS_MODULE` 资源存在数据库。
+
+**为什么不用常规静态资源**：TB 的 `ResourcesService.loadResourceByType` 是
+`document.createElement('script')` + `el.src = url`。`<script src>` **不带认证头**，
+而本平台取静态资源要 JWT，实测除 `/assets/lib/*` 之外一律 401。
+要走这条路就得把文件打进 jar 的 `BOOT-INF/classes/public/` —— 那就得重打 jar。
+
+**现在的做法**：部件运行时用 `ctx.http.get('/api/resource/js_module/system/cytoscape.min.js',
+{responseType:'text'})` 把源码取回来，塞进 `<script>` 的 textContent 执行。
+`ctx.http` 是 Angular HttpClient，interceptor 自动带 `X-Authorization`，
+所以客户用户也能取（实测 200 / 435649 bytes，无认证才 401）。
+
+**换库 / 升库**：
+
+```bash
+node nenghaobao/energy-config/89-apply-graph-lib.mjs --check   # 看库里是哪一版
+node nenghaobao/energy-config/89-apply-graph-lib.mjs           # 上传/更新（幂等）
+node nenghaobao/energy-config/89-apply-graph-lib.mjs --src <别的库.js>
+```
+
+跑完浏览器硬刷新即可，**不用 `mvn package`、不用重启容器**。
+
+> 踩过的坑：① `responseType` 必须是 `'text'`，默认 `'json'` 会把库源码当 JSON 解析，
+> 报错看起来像"文件损坏"；② 判断 UMD 不能只看文件头几百字节 ——
+> cytoscape.min.js 前面有一大段 MIT 许可注释，第一版因此误判"不是 UMD"。
+
 ---
 
 ## 五、还能再快吗
