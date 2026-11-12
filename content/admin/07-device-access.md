@@ -396,6 +396,74 @@ python3 scripts/23-demo-simulator.py \
 新版固件对 1、2 都做了处理（端口回退、强制带 ts、时间不可信时拒发并提示）；
 3 是平台侧的数据，用上面的 `21-rtu-onboard.py` 一次配好。
 
+## RTU 换电表型号 / 加新型号
+
+RTU 固件不按型号分叉，**型号码 → 寄存器表**全在 `rtu/meter_profiles.py`。
+接新表只改这一个文件，不动 `main.py`。
+
+已内置三型：`DDSU666`（正泰单相）/ `DTSD3366D-J(P4)`（正泰三相）/ `YDPQ200-A`（雅达三相电能质量）。
+
+### 换型号（现场已有一块表）
+
+1. 确认 RTU 当前型号：串口第一屏「配置自检」会回显 `METER_MODEL`
+2. 改 `rtu/main.py` 的 `METER_MODEL`
+   （拼错的型号会**静默回退到 DDSU666**，见 `meter_profiles.get()` —— 不报错，只会采错表）
+3. 重烧固件；平台侧设备 `name` 必须与固件里的名字**逐字一致**
+4. 平台侧用型号页的「批量刷新快照」把 `measurePoints` 更新成新型号的 key
+
+> 只换表不换型号（比如换了一台同型号的新表）不需要动任何配置，
+> 但表底会从 0 开始 —— 平台用量走「表底差」，**必须做一次换表登记**，
+> 否则当天的用量会算成一个负值或一个巨大的数。
+
+### 加新型号
+
+在 `rtu/meter_profiles.py` 的 `PROFILES` 里加一项：
+
+```python
+'METER-X': {
+    'vendor': '厂家拼音',
+    'name': 'METER-X',
+    'wiring': '3P4W',          # 1P2W 单相 / 3P4W 三相四线
+    'baud': 9600,
+    'points': [
+        _p('Ua', 'voltage_a', 0x16E, 'uint32', 0.0001, 'V'),
+        # ...
+    ],
+},
+```
+
+三条硬要求：
+
+| 要求 | 为什么 |
+| --- | --- |
+| `std` 必须是 `standardKeys` 里的 key | 否则数据进不了业务视图 |
+| `reg` 不能重叠（同一寄存器解码两次） | 会重复读数、数值错乱 |
+| 单次读取块 ≤ 100 寄存器 | `read_plan()` 已自动切块，两块表文档都写 100 上限 |
+
+同时要在 `energy_library.json → vendor_models.json` 加同型号，
+并把厂家代号写进 `builtinKeyMap.elec`（否则建档页测点快照预填不出来）。
+
+自检（改完必跑）：
+
+```bash
+cd rtu
+python3 - <<'PY'
+import json, meter_profiles as mp
+std = {k['code'] for k in json.load(open(
+    '../guard-server/src/main/resources/data/json/system/energy/energy_library.json'
+))['dictionaries']['standardKeys']}
+for n in mp.PROFILES:
+    ks = mp.standard_keys(n)
+    bad = [k for k in ks if k not in std]
+    print(f'{n}: {len(ks)} key, 不在字典内: {bad or "无"}')
+PY
+```
+
+期望每个型号都输出「不在字典内: 无」。
+
+> 改完 `meter_profiles.py` 还要重烧固件才能生效；
+> 平台侧不需要重新部署 —— `meter_profiles.py` 只在 RTU 上跑。
+
 ---
 
 ---

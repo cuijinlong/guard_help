@@ -107,6 +107,51 @@ POST /api/customer
 **ngxai 里该保留什么**：只保留模型平台自己的入口（租户菜单「AI 分析」→ `/ngxai/`，
 模型训练与自定义预测）。**业务语义不进 Python**（AGENTS.md A7）。
 
+### 客户之间数据隔离（2026-11-11 定案）
+
+TB 原生接口的客户边界是可靠的（实测 `/api/asset/{别家}`、`/api/dashboard/{别家}`、
+`/api/customer/{别家}/devices` 全部 403）。**风险在自研 `/api/energy/*` 接口** ——
+它们绕过 TB 权限框架直接查库，一个条件写漏就是跨客户读取。
+
+**实测踩过的三个坑**（都已修，写在这里是为了不再犯）：
+
+| 坑 | 症状 | 正确做法 |
+| --- | --- | --- |
+| 只按 `tenant_id` 过滤 SQL | 客户 A 拼出客户 B 的 uuid 读到 B 的遥测/场站/关系 | SQL 里必须再叠 `customer_id IN (客户树)`，不要在 Java 侧过滤完了就当安全 |
+| 把 `visibleDeviceIds() == null` 当成「全租户」 | 客户管理员（无场站组授权）能看到全场站 | `null` 的语义是「没做**场站级**授权」；客户边界要另外用 `customerOwnedIds()` 叠一层 |
+| 空集当「不限」 | `visible != null && !visible.isEmpty()` 放行 → 一台都没授权时反而看到全部 | 空集就是空集，`visible != null && !visible.contains(id)` 直接拒 |
+
+**两个新增工具方法**（`EnergyScopeService`）：
+
+- `customerOwnedIds(tenantId, user)` —— 客户用户 → 本客户树名下全部设备/资产/实体视图 id；
+  租户账号 → `null`（不受限）。对客户用户**永不返回 null**，失败时返回空集（关闭）。
+- `customerSiteIds(tenantId, user)` —— 同上但只含 `type='场站'`，给场站下拉用。
+
+**排查「客户说看到别家数据」，按这个顺序查**：
+
+```bash
+# ① 先确认是哪个接口。浏览器 F12 → Network，记下 URL
+
+# ② 用该客户的 token 复现，看是否真拿到别家数据
+TOKEN=<客户 token>
+curl -s --noproxy '*' -H "X-Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:8090/api/<出问题的接口>' | python3 -m json.tool
+
+# ③ 若返回里有别家的实体 id，查它归谁
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc \
+  "SELECT id,name,customer_id FROM device WHERE id='<可疑 id>';"
+
+# ④ 在代码里定位：该接口的 WHERE 是否只有 tenant_id
+grep -n 'tenant_id = ?' guard-server/src/main/java/com/guard/server/controller/<Xxx>Controller.java
+```
+
+**判定标准**：`@PreAuthorize` 里有 `CUSTOMER_USER` + SQL 只按 `tenant_id` ⇒ 就是漏洞。
+只有 `TENANT_ADMIN` / `SYS_ADMIN` 能调的接口不需要客户过滤。
+
+> `ts_kv` 表**没有** tenant_id / customer_id 列，遥测类接口必须靠
+> `entity_id IN (SELECT id FROM device WHERE ... UNION SELECT id FROM asset WHERE ...)` 反查。
+> 只写 tenant 条件时，同一个租户里不同客户之间就是通的。
+
 ---
 
 ## 三、部件与看板

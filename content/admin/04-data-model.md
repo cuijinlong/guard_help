@@ -91,6 +91,10 @@
   键包括 `period` / `energy` / `usage` / `amount` / `energyFee` / `basicFee` / `status` / `details` 等
 - 归属：`asset.customer_id`，客户账号靠 TB owner 机制隔离
 
+  **但「TB owner 机制」只管 TB 原生接口**。自研 `/api/energy/*` 直接查库，
+  必须自己叠一道客户边界（`EnergyScopeService.customerOwnedIds`）—— 
+  只写 `tenant_id` 就会跨客户。详见 `09-troubleshoot.md` §二「客户之间数据隔离」。
+
 后端注释原文：「不写 `billing` 表 —— 现有两个消费方（抄表台账的「账单金额」、
 峰谷页的账单交叉表）读的都是资产属性；换表等于把已跑通的链路推倒。」
 
@@ -405,7 +409,7 @@ ORDER BY type;
 | --- | --- | --- |
 | 资产档案 | 17 个业务档案（库里共 23 行，含 6 个系统内置） | 影响所有客户的资产类型下拉 |
 | 设备档案 | 7 个业务档案（库里共 14 行，含 7 个系统内置） | 影响所有客户建档可选类型 |
-| 能源参数字典 | 5 品种 / 9 种设备类型 / 137 个标准 key / 2 种接线 | 影响所有设备的遥测可读性 |
+| 能源参数字典 | 5 品种（电能/水/燃气/蒸汽/热力，另 3 个非用能品种不算）/ 9 种设备类型 / 155 个标准 key / 2 种接线 | 影响所有设备的遥测可读性 |
 | 分时时段方案 | 4 套 | 影响所有客户峰谷计算 |
 | 费率模板（示例价） | 4 个 | 只是示例，客户应替换 |
 | 告警 + 派生指标 | 11 条（5 种，租户 + 系统各一份） | 影响所有电表的告警 |
@@ -475,6 +479,87 @@ python3 tools/rebuild-elec-keys.py           # 写回 energy_library.json
 
 这个脚本同时做四件事：删编造项、扩谐波到 31 次、给每个 key 打 `tier`/`standard`、
 按 `tier` 重建 `keysByWiring`。**不要手改 JSON**。
+
+### 标准 key 的来源：三份真实文档（2026-11-12）
+
+`standardKeys` 不是拍脑袋编的，每一条都要能指回一份厂家文档或国标：
+
+| 型号 | 厂商 | 文档 | 关键差异 |
+| --- | --- | --- | --- |
+| DDSU666 | 正泰 | 厂方 Modbus 表（表 8） | IEEE754 浮点，只有 8 个统计量 |
+| DTSD3366D-J(P4) | 正泰 | Modbus 通讯协议 V1.10（2025-05-10） | 二次侧**定点整数**：电压电流 ×0.0001，功率 int32 ×0.0001 kW，电能 ×0.001 kWh |
+| YDPQ200-A | 广东雅达 | Modbus-RTU 规范 V1.00（2026-03-07） | 电压/电流/功率 **IEEE754 浮点**，电能 int64 ×0.001 kWh，带电能质量区 |
+
+寄存器表落在三处，**必须同时改**：
+
+| 位置 | 谁读 | 改错的后果 |
+| --- | --- | --- |
+| `rtu/meter_profiles.py` | 现场 RTU 固件 | 采不到数 / 解出乱码 |
+| `energy_library.json → vendor_models.json` | 建档页的测点快照 | 界面预填的键名对不上 |
+| `energy_library.json → builtinKeyMap.elec` | 规则链 renameKeys 的默认猜测 | 厂家代号转不成标准 key |
+
+判据：`rtu/meter_profiles.py` 的 `standard_keys(型号)` 必须 **100% 落在** `standardKeys` 内。
+三型号当前是 8 / 34 / 44 个 key。
+
+### 旧键改名：`legacyKeyRenames`
+
+存量设备的 paramDict 与遥测里还有一批**旧简写**，与标准 key 不一致：
+
+| 旧名 | 标准名 | 为什么改 |
+| --- | --- | --- |
+| `harmonic_3rd/5th/7th` | `current_harmonic_3/5/7` | 旧名没说电压还是电流 |
+| `voltage_dev_a/b/c` | `voltage_deviation_a/b/c` | dev 是「偏差」还是「偏差率」有歧义 |
+| `voltage_negative` / `voltage_zero` | `voltage_seq_negative` / `voltage_seq_zero` | 旧名丢了「序分量」 |
+| `current_negative` / `current_zero` | `current_seq_negative` / `current_seq_zero` | 同上 |
+| `demand_kw` | `power_total`（删旧条） | 瞬时功率冒充「需量」，与 `demand_max`（最大需量）不是一回事 |
+
+映射表在 `energy_library.json → dictionaries.legacyKeyRenames`，**两处共用**：
+
+- 平台侧：`EnergyLibraryInstaller.renameLegacyKeys()` 在租户初始化补丁里改名（幂等）
+- 分析侧：`spsspro/backend/energyflow/key_aliases.py` 在查遥测时展开别名
+
+三条规则：
+
+1. 旧键在、标准键不在 → **原地改名**（保住客户改过的名称/单位/分组）
+2. 两个都在 → **删旧条**（否则界面上同名指标两个，旧的永远空）
+3. 一级指标因删 child 变空 → 整组删除，但绝不会把 paramDict 删空
+
+### ⚠ `dict_version` 是比对锚，不是装饰
+
+`dictionaries` 属性旁边有一个 `dict_version`（long）。`installCoreDictionaries`
+的判据是：
+
+```
+库里 dict_version == 资源文件 dictionaries.version  →  直接 return，一个字都不写
+```
+
+**改了 `energy_library.json` 里 `dictionaries` 的任何内容（包括 `standardKeys`、
+`builtinKeyMap`、`legacyKeyRenames`），必须把 `dictionaries.version` +1**，
+否则重启后「改了等于没改」，而且不报错。
+
+2026-11-12 就踩到：加了 18 个标准 key，但 version 没动（库里 9、文件 9），
+`/api/energy/core-dictionaries` 返回的仍是 137 个。升到 10 再跑一次
+`POST /api/energy/repair-init` 才变成 155 个。
+
+> 改了字典之后的标准动作：
+>
+> ```bash
+> # ① 改 energy_library.json，并把 dictionaries.version +1
+> # ② 重打 jar 并重启 energy-server
+> cd guard-server && mvn -o package -DskipTests -q
+> cp target/guard-server-4.4.0.jar ~/energy-app/guard-server-4.4.0.jar
+> cd ~/energy-app && docker compose --profile split restart energy-server
+> # ③ 用租户管理员调一次 repair-init
+> curl -X POST -H "X-Authorization: Bearer $TOKEN" \
+>   http://127.0.0.1:8090/api/energy/repair-init
+> # ④ 复核（应输出 155）
+> curl -s -H "X-Authorization: Bearer $TOKEN" \
+>   http://127.0.0.1:8090/api/energy/core-dictionaries \
+>   | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["standardKeys"]))'
+> ```
+
+> `repair-init` 跑一遍约 2~3 分钟（要遍历全部品种、修看板、补测点快照），
+> **不是卡死**。它幂等，重跑零副作用。
 
 ### 品种的唯一权威来源
 
