@@ -132,12 +132,18 @@ def count_elec_keys(_repo) -> int:
 
 
 def count_tou_schemes(_repo) -> int:
-    """分时方案数：createTouScheme(tenantId, ...) 的调用次数"""
+    """分时方案数：TOU_TEMPLATES 数组的元素个数。
+
+    <p>★ 不要数 {@code createTouScheme(tenantId, ...)} 的调用次数（2026-11-12 改）：
+    那个写法假定「一个方案一次调用」，而 2026-11-12 起改成遍历
+    {@code TOU_TEMPLATES} 循环 —— 数调用会得到 1，看着像方案只剩一个。
+    方案表本身才是真相源，直接数它。
+    """
     src = _read(JAVA_INSTALL / 'EnergyLibraryInstaller.java')
-    body = re.search(r'private void createTouSchemes\(.*?\n    \}', src, re.S)
+    body = re.search(r'TOU_TEMPLATES = new TouTemplate\[\]\{(.*?)\n        \};', src, re.S)
     if not body:
-        raise RuntimeError('EnergyLibraryInstaller: 找不到 createTouSchemes')
-    return len(re.findall(r'createTouScheme\(tenantId,', body.group(0)))
+        raise RuntimeError('EnergyLibraryInstaller: 找不到 TOU_TEMPLATES 初始化块')
+    return len(re.findall(r'new TouTemplate\(', body.group(1)))
 
 
 def count_rate_templates(_repo) -> int:

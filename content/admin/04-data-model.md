@@ -410,7 +410,7 @@ ORDER BY type;
 | 资产档案 | 17 个业务档案（库里共 23 行，含 6 个系统内置） | 影响所有客户的资产类型下拉 |
 | 设备档案 | 7 个业务档案（库里共 14 行，含 7 个系统内置） | 影响所有客户建档可选类型 |
 | 能源参数字典 | 5 品种（电能/水/燃气/蒸汽/热力，另 3 个非用能品种不算）/ 9 种设备类型 / 155 个标准 key / 2 种接线 | 影响所有设备的遥测可读性 |
-| 分时时段方案 | 4 套 | 影响所有客户峰谷计算 |
+| 分时时段方案 | 6 套 | 3 季 × 工作日/周末；影响所有客户峰谷计算 |
 | 费率模板（示例价） | 4 个 | 只是示例，客户应替换 |
 | 告警 + 派生指标 | 11 条（5 种，租户 + 系统各一份） | 影响所有电表的告警 |
 | 租户菜单 | 11 个顶层项 | 影响租户自己的侧边栏，**不影响客户菜单** |
@@ -645,6 +645,91 @@ print("一级指标", len(k["params"]), "| key", sum(len(p["children"]) for p in
 ```
 
 **禁止用设备名做品种判定**。客户把「电能表」改叫「电度表」就断。
+
+### 峰谷时段：颜色与方案都只有一份定义（2026-11-12 统一）
+
+客户报「面包屑和时段方案编辑页里尖峰平谷不自洽」，査下来是**同一概念多处定义**：
+
+| 概念 | 修前 | 修后 |
+| --- | --- | --- |
+| 尖峰平谷颜色 | 5 处 → 4 套（「平」有深蓝/亮蓝/灰三种） | 5 处同值 |
+| 标准时段方案 | 后端 4 个（夏季尖峰 19-21）/ 部件 6 个（10-12） | 后端一份，部件调接口 |
+| 周末划分 | 春秋季周末=工作日副本；夏/冬周末缺失 | 三季各一个，无尖峰 |
+
+#### 颜色表（全平台唯一）
+
+| 档位 | 色值 | 语义 |
+| --- | --- | --- |
+| 尖峰 `tip` | `#c62828` | 红，最贵 |
+| 峰 `peak` | `#ef6c00` | 橙 |
+| 平 `flat` | `#1565c0` | 蓝，中性 |
+| 谷 `valley` | `#2e7d32` | 绿 |
+| 深谷 `deep` | `#00897b` | 青绿，最便宜 |
+
+色阶语义是「暖色贵、冷色便宜」。**不要再用「颜色越深越贵」那套**
+（曾把谷画成蓝色）—— 两套语义无法共存。
+
+用到这五色的地方（改一处必须五处一起改，改前先搜 `#c62828`）：
+
+```
+时段方案编辑页   energy_management_tou_config.json   → COLORS
+峰谷分析         energy_management_tou_analysis.json → colorFlat 等设置默认
+账单分析         energy_management_billing_analysis.json → colorFlat 等
+场站费率         site-rate.component.ts → TOU_TYPES
+费率编辑         energy-rate-editor.component.ts → TOU_KEYS
+```
+
+#### 标准时段方案（6 个）
+
+| 方案 | 季节 | 日期类型 | 尖峰 |
+| --- | --- | --- | --- |
+| 春秋季工作日 | `spring_autumn` | `weekday` | 无 |
+| 夏季工作日 | `summer` | `weekday` | 19-21 |
+| 冬季工作日 | `winter` | `weekday` | 17-19 |
+| 春秋季周末及节假日 | `spring_autumn` | `weekend` | 无 |
+| 夏季周末及节假日 | `summer` | `weekend` | 无 |
+| 冬季周末及节假日 | `winter` | `weekend` | 无 |
+
+**唯一真相源是 `EnergyLibraryInstaller.TOU_TEMPLATES`**（Java 静态数组）。
+部件里的「一键初始化」不再硬编码，调：
+
+```bash
+curl -s --noproxy '*' -H "X-Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8090/api/energy/tou-scheme-templates
+```
+
+返回结构与部件的 `initSchemes` 一致，可直接喀。
+
+> **为什么周末必须独立成方案**：原来注释写着「周末沿用春秋季划分：宁可粗一点，
+> 也不能缺」——实质是把周末按工作日计价。工作日有尖峰，周末也跟着算尖峰，
+> 且只建了「春秋季周末」，夏/冬周末在 `TouMatcher.pick` 里回退到同季工作日。
+> 三个季节三种行为，客户无从解释。
+>
+> 周末三季共用一套划分：周末负荷以生活/值班为主，不受生产班次影响；
+> 分季节硬造差异反而难解释。客户有实际政策就在页面上复制一份改。
+
+#### 校验 SQL（改完方案后必跑）
+
+```bash
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+SELECT s.name, a.json_v::text FROM attribute_kv a
+JOIN key_dictionary kd ON kd.key_id=a.attribute_key
+JOIN asset s ON s.id=a.entity_id
+WHERE s.type='tou_scheme' AND kd.key='blocks' ORDER BY s.name;"
+```
+
+每个方案必须满足：
+
+1. 共 6 个，覆盖 3 季 × 2 日型（缺一个就会回退到别的方案，而且不报错）
+2. 每个合计 **1440 分钟**，首尾相接无空洞、无重叠
+3. 周末方案**不含 `tip`**
+
+#### 两个易错点
+
+- `createTouScheme` 按 **`code`** 查重，不按名字 —— 名字客户能改，
+  按名字查会在他改名后新建重复方案
+- 读 `blocks` 属性必须兼容 `json_v` 列（`JsonDataEntry` 写的不在 `str_v`）——
+  只读 `getStrValue()` 拿到 null，会让自愈逻辑静默跳过
 
 ---
 
