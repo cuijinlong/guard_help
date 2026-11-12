@@ -194,6 +194,17 @@ GET /api/energy/site-devices?siteId=<场站id>&nameFilter=<片段>&pageSize=50&p
 合计 18 + 6 + 6 + 5 = 35  ✅ 无重叠、无遗漏
 ```
 
+**分页语义**：`totalElements` 是**匹配到的总数**，与 `pageSize` 无关。
+
+```
+pageSize=5  → total 18, 本页 5,  hasNext true
+pageSize=50 → total 18, 本页 18, hasNext false
+```
+
+> 第一版实现「凑够当前页就停」，`total` 变成已扫到的条数（pageSize=5 时返回 5，
+> 实际 18）。分页 UI 会据此画错页数，前端依赖它判断「还有没有更多」时会提前收手。
+> 现在扫完再分页 —— 代价是每次请求扫一遍租户设备（内存过滤，不逐台查库）。
+
 > **没有归场站的设备不出现在任何场站下**。这是有意的：它们该在设备档案里
 > 补归属，而不是被算进随便哪个场站。判据：`siteIdOf()` 返回 null 就跳过。
 
