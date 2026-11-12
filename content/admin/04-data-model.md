@@ -482,13 +482,22 @@ python3 tools/rebuild-elec-keys.py           # 写回 energy_library.json
 
 ### 标准 key 的来源：三份真实文档（2026-11-12）
 
-`standardKeys` 不是拍脑袋编的，每一条都要能指回一份厂家文档或国标：
+`standardKeys` 不是拍脑袋编的，每一条都要能指回一份厂家文档或国标。
+三份原件都在 **`电表/`** 目录：
 
 | 型号 | 厂商 | 文档 | 关键差异 |
 | --- | --- | --- | --- |
-| DDSU666 | 正泰 | 厂方 Modbus 表（表 8） | IEEE754 浮点，只有 8 个统计量 |
-| DTSD3366D-J(P4) | 正泰 | Modbus 通讯协议 V1.10（2025-05-10） | 二次侧**定点整数**：电压电流 ×0.0001，功率 int32 ×0.0001 kW，电能 ×0.001 kWh |
-| YDPQ200-A | 广东雅达 | Modbus-RTU 规范 V1.00（2026-03-07） | 电压/电流/功率 **IEEE754 浮点**，电能 int64 ×0.001 kWh，带电能质量区 |
+| DDSU666 | 正泰 | 使用说明书 DDSU666.004.0004（2022.06）§4.3 | IEEE754 浮点，只有 8 个统计量；功率单位 **kW/kvar/kVA** |
+| DTSD3366D-J(P4) | 正泰 | Modbus 通讯协议 V1.10（2025-05-10）§5 | 二次侧**定点整数**：电压电流 ×0.0001，功率 int32 ×0.0001 kW，电能 ×0.001 kWh |
+| YDPQ200-A | 广东雅达 | Modbus-RTU 规范 V1.00（2026-03-07）§8 | 电压/电流/功率 **IEEE754 浮点**，电能 int64 ×0.001 kWh，带电能质量区 |
+
+> **DDSU666 的单位最容易搞错**（2026-11-12 定论）：
+> 说明书 §4.2 显示功能里 LCD 功率单位写的是 **kW**（原文「左图为 P=1.100kW」）。
+> 现场实测 `PowerMeter-DDSU666`：U=229.1 V、I=0.643 A、PF=0.975，
+> 而 `power_total=0.101` —— 若表输出 W，这个值应该在 144 附近。
+> 两条证据互相印证：**寄存器输出已是 kW，`scale` 保持 1.0**。
+> 原来 `unit` 标注成 W/var/VA 是错的，数据本身一直是对的 ——
+> 错标注的危害在于：核对的人会以为要除 1000，照着「修」就把真机数据改小 1000 倍。
 
 寄存器表落在三处，**必须同时改**：
 
@@ -499,7 +508,7 @@ python3 tools/rebuild-elec-keys.py           # 写回 energy_library.json
 | `energy_library.json → builtinKeyMap.elec` | 规则链 renameKeys 的默认猜测 | 厂家代号转不成标准 key |
 
 判据：`rtu/meter_profiles.py` 的 `standard_keys(型号)` 必须 **100% 落在** `standardKeys` 内。
-三型号当前是 8 / 34 / 44 个 key。
+三型号当前是 8 / 34 / 45 个 key。
 
 > **为什么这么较真**：平台不接受任何“看起来像”的数据。采集参数来自厂家文档，
 > 分析公式来自国标，模型结论能溯源到具体测点，看板上每个数字都绑真实遥测 ——
@@ -567,6 +576,55 @@ python3 tools/rebuild-elec-keys.py           # 写回 energy_library.json
 
 > `repair-init` 跑一遍约 2~3 分钟（要遍历全部品种、修看板、补测点快照），
 > **不是卡死**。它幂等，重跑零副作用。
+
+### ⚠ 改了资源文件不等于改了库：四处会漏
+
+字典只是其中一处。2026-11-12 客户问「厂商与型号里怎么没看到这两个厂商」
+时，一次暴露了四种不同的漏法 —— 每一种都**不报错**，只是界面上看不到：
+
+| 漏在哪 | 表现 | 根因 | 正确做法 |
+| --- | --- | --- | --- |
+| 字典内容 | 接口返回旧 key 数 | `dict_version` 没升 | `dictionaries.version` +1 |
+| 厂商/型号 | 「厂商与型号」页看不到新厂商 | 早退分支不调 `createVendorModels` | 早退分支必须也补装 |
+| 型号的 `registers` / `vendorKeys` | 型号看得到、点开一片空白 | 新建分支只写 4 个属性；已存在分支直接 `continue` | 两条分支共用 `backfillModelAttrs` |
+| 品种指标 | 采上来了但页面上没这一项 | 只改了 `standardKeys`，没补 `kinds[].params` | 走 `appendElecGroupsFromTemplate` 五级补丁 |
+
+**自检（改完数据后逐条跑）**
+
+```bash
+TOKEN=$(curl -s -X POST --noproxy '*' \
+  http://127.0.0.1:8090/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# ① 字典
+curl -s --noproxy '*' -H "X-Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8090/api/energy/core-dictionaries \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("standardKeys",len(d["standardKeys"]))'
+
+# ② 厂商 / 型号 / 标准 key 映射（三个数都应 > 0）
+curl -s --noproxy '*' -H "X-Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8090/api/energy/vendor-models \
+  | python3 -c '
+import sys,json
+for m in json.load(sys.stdin)["models"]:
+    if m["name"] in ("DDSU666","DTSD3366D-J(P4)","YDPQ200-A"):
+        print(m["name"], "| vendorKeys", len(m.get("vendorKeys") or {}), "| wiring", m.get("wiring"))'
+
+# ③ 品种指标
+curl -s --noproxy '*' -H "X-Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:8090/api/energy/metric-params?kind=elec' \
+  | python3 -c '
+import sys,json
+k=[x for x in json.load(sys.stdin)["kinds"] if x["code"]=="elec"][0]
+print("一级指标", len(k["params"]), "| key", sum(len(p["children"]) for p in k["params"]))'
+```
+
+期望：`standardKeys 155`、三个型号 `vendorKeys` 分别 8 / 34 / 45、
+电能一级指标 39 项 / key 82 个。
+
+> **为什么四处都要查**：它们分别对应「采集能动 / 建档能选 / 报表能展开 / 看板能取数」。
+> 只查一处就以为改好了，客户会在另一处发现空白 —— 而每一处的空白都不报错。
 
 ### 品种的唯一权威来源
 
