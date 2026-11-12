@@ -731,6 +731,37 @@ WHERE s.type='tou_scheme' AND kd.key='blocks' ORDER BY s.name;"
 - 读 `blocks` 属性必须兼容 `json_v` 列（`JsonDataEntry` 写的不在 `str_v`）——
   只读 `getStrValue()` 拿到 null，会让自愈逻辑静默跳过
 
+#### 编辑弹窗的控件（2026-11-12 改为 Material）
+
+客户报：「编辑时段方案里为什么还都是下拉框默认都是尖峰」+「UI 控件也不符合铁律」。
+
+两件事，两个不同原因：
+
+| 现象 | 根因 |
+| --- | --- |
+| 每段档位都显示「尖峰」 | 原生 `<select [value]>` 配 `*ngFor` 生成 option：Angular 设值早于 option 渲染，回落到第一个 option |
+| 控件不像 TB | 用的是原生 `select`/`input`/`button` + 自绘 border，违反铁律 C2 |
+
+**换成 Material 后还要注意两条**（否则“看起来对了”但细节错）：
+
+```text
+① mat-form-field 必须用 [ngModel]（或 formControl）—— 用 [value] 时控件不知道有值，
+   浮动标签会压在内容上
+② 压高度后 infix 要留 padding-top: 11px —— 否则输入文字贴顶，与浮起的 label 重叠
+```
+
+几何判据（实测）：`label` 底边 395.3 / `input` 顶边 396.5 → 垂直重叠 0px。
+
+还有一条只影响下拉面板：**`mat-select` 的选项面板在 CDK overlay 里，
+脱离 widget 的 DOM 树**，`templateCss` 的前缀选择器匹配不到里面的元素 ——
+档位前的色点必须用内联 style，否则一个都不显示。
+
+现在弹窗里一共 **7 个 `mat-form-field`**：方案名称 / 季节 / 日期类型 +
+每段的档位 / 开始 / 结束 / 时长。每段多了一个只读的「时长」框，
+客户不用自己算 22:00→24:00 是几小时。
+
+列表也换成了 `.tb-data-table`（铁律 C3），列宽显式约束（季节/日期类型/版本窄列）。
+
 ---
 
 ## 四、资产与设备的类型码
