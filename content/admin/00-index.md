@@ -136,7 +136,7 @@ bash scripts/29-rtu-demo-up.sh               # 两者并存
         └─ 内置前端        Angular 产物打进 jar
               │
               ├─ energy-postgres     实体 + 遥测（ts_kv）
-              ├─ energy-spsspro-backend  数据分析（数据探索 / 用能质量）
+              ├─ energy-spsspro-backend  数据分析（数据集 / 统计 / 用能质量）
               └─ energy-waveform-store   波形文件（S3 兼容）
 ```
 
@@ -147,7 +147,7 @@ bash scripts/29-rtu-demo-up.sh               # 两者并存
 | `energy-gateway` | 反向代理 / 静态资源 | 80 |
 | `energy-server` | 后端 + 前端 | 8090（默认直连） |
 | `energy-postgres` | 数据库（实体 + 遥测 `ts_kv`） | 5432 |
-| `energy-spsspro-backend` | 数据分析（数据探索 / 用能质量归因） | 内部 |
+| `energy-spsspro-backend` | 数据分析（数据集 / 统计分析 / 用能质量归因） | 内部 |
 | `energy-waveform-store` | 波形文件 + 数据集物化（S3 兼容） | `127.0.0.1:19333`（不对外） |
 
 > **波形存储为什么是 SeaweedFS 不是 MinIO**：MinIO 官方镜像 2025-10 起已从

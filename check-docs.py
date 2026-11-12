@@ -119,6 +119,31 @@ def count_elec_params(_repo) -> int:
     return len(_elec_params())
 
 
+def _model_keys(name: str) -> int:
+    """从 vendor_models.json 取某型号的通用 key 条数。
+
+    ★ 字段名是 `registers`，**不是** `vendorKeys`：
+      源文件里叫 registers（每条是 一条寄存器映射：code/key/register/scale），
+      接口 `/api/energy/vendor-models` 返回时才改叫 vendorKeys。
+      读源要用 registers —— 用 vendorKeys 会数出 0，
+      然后误报「型号没配映射」（2026-11-12 实际踩到）。
+    """
+    doc = json.loads(_read(RES_ENERGY / 'vendor_models.json'))
+    for m in doc.get('models') or []:
+        if m.get('name') == name:
+            return len(m.get('registers') or [])
+    raise RuntimeError(f'vendor_models.json: 找不到型号「{name}」')
+
+
+# 三个有真实协议文档支撑的型号 → 手册里写明的 vendorKeys 条数。
+# 手册 02-deploy.md「开户流程会核对电表标准化 key」一节引用这些数字。
+METER_MODELS = {
+    'DDSU666': 8,
+    'DTSD3366D-J(P4)': 34,
+    'YDPQ200-A': 45,
+}
+
+
 def count_elec_keys(_repo) -> int:
     """标准 key 总数：读 dictionaries.standardKeys。
 
@@ -268,6 +293,13 @@ CHECKS = [
         ('04-data-model.md', r'/ (\d+) 个标准 key'),
         ('02-deploy.md', r'标准 key \*\*(\d+)\*\* 个'),
     ]),
+    # 电表型号 vendorKeys —— 手册 02-deploy.md 的「开户核对」小节写死了这三个数字。
+    # 用 lambda 闭包绑名字（默认参数），否则循环里的 name 全是最后一个。
+    *[Check(f'model_keys_{i}', f'{name} 映射条数',
+            (lambda _repo, n=name: _model_keys(n)), [
+                ('02-deploy.md', rf'{re.escape(name)}\s+(\d+) 条 vendorKeys'),
+            ])
+      for i, name in enumerate(METER_MODELS)],
     Check('tou', '分时时段方案', count_tou_schemes, [
         ('04-data-model.md', r'\| 分时时段方案 \| (\d+) 套 \|'),
     ]),
