@@ -501,6 +501,13 @@ python3 tools/rebuild-elec-keys.py           # 写回 energy_library.json
 判据：`rtu/meter_profiles.py` 的 `standard_keys(型号)` 必须 **100% 落在** `standardKeys` 内。
 三型号当前是 8 / 34 / 44 个 key。
 
+> **为什么这么较真**：平台不接受任何“看起来像”的数据。采集参数来自厂家文档，
+> 分析公式来自国标，模型结论能溯源到具体测点，看板上每个数字都绑真实遥测 ——
+> 四层同源（同一套 key、同一种物理量）。这条已写入 `AGENTS.md` **D6 铁律**。
+>
+> 具体到界面上的差别：键名对不上时**不报错**，只是报表整列空白、
+> 或图上画出一条贴零的线。排查的人会先去查设备，白跑一趟。
+
 ### 旧键改名：`legacyKeyRenames`
 
 存量设备的 paramDict 与遥测里还有一批**旧简写**，与标准 key 不一致：
