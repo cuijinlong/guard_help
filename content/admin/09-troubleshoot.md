@@ -152,6 +152,71 @@ grep -n 'tenant_id = ?' guard-server/src/main/java/com/guard/server/controller/<
 > `entity_id IN (SELECT id FROM device WHERE ... UNION SELECT id FROM asset WHERE ...)` 反查。
 > 只写 tenant 条件时，同一个租户里不同客户之间就是通的。
 
+### 改个名字，厂商/型号就从列表里消失了（2026-11-12 实测修复）
+
+**现象**：把厂商「广东雅达」改成「雅达」，保存提示成功，
+但左侧厂商列表里找不到它了。型号、客户、场站等任何走
+「新建/编辑」弹框的资产生效同理。
+
+**这不是改名改坏了，是保存时把 `type` 丢了。**
+
+#### 三行就能说清的原因
+
+| 环节 | 发生了什么 |
+| --- | --- |
+| TB 保存 | `POST /api/asset` 是**整体替换**语义：请求体里没带的字段会被写成默认值，不是保持原值 |
+| 前端 | 保存时用 `raw.type` 回传（`vendor-model.service.ts → updateAsset`）；`raw` 就是列表接口返回的资产 |
+| 列表接口 | **厂商节点当时只返回了 id/name/code/source，没返回 `type`** → `raw.type` 是 undefined → JSON 里直接消失 |
+| 后端 | `type` 为空 → `BaseAssetService` 走 `findDefaultAssetProfile` → `asset.setType("default")` |
+| 列表 | 按 `type='厂商'` 查 → 查不到 → 从界面上消失 |
+
+**最关键的一行**在 `BaseAssetService.doSaveAsset`：
+
+```java
+asset.setType(assetProfile.getName());   // type 是从 assetProfileId 反推的
+```
+
+所以修的时候只 `setType("厂商")` **没用** —— 库里读出来的资产带着 default 的
+`assetProfileId`，这行会把 type 又改回 `default`。日志写着「已修正」，库里还是 default。
+必须同时 `setAssetProfileId(null)`，让 saveAsset 按 type 重新找 profile。
+（2026-11-12 修这个时真在这上面绕了一圈）
+
+#### 快速判断
+
+```bash
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+SELECT name, type, coalesce(label,'(空)') FROM asset WHERE name='<你改的那个名字>';"
+```
+
+- `type` 变成 `default`、`label` 为空 ⇒ 就是这个坑
+- 注意：**能源品种资产（电能/水表/燃气…）的 type 本来就是 `default`**，
+  不要把它们也「修」成别的。区分方法看 `code` 属性：品种是 `elec`/`water`，
+  厂商是 `chint`/`yada`
+
+#### 修法
+
+```bash
+# 一键自愈（幂等）：会把 code 命中种子清单、但 type 不对的资产修回去
+curl -X POST --noproxy '*' -H "X-Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8090/api/energy/repair-init
+```
+
+日志里会出现 `修正被改坏的资产「雅达」：type → 厂商（code=yada）`。
+
+**自愈不会新建重复条目**：它按 `code` 属性（不是名字）认领 ——
+客户把「广东雅达」改成「雅达」后，名字对不上但 code 没变，
+于是找回原来那一条，**保留客户改的新名字**，只补回 type。
+
+#### 为什么不能光靠「修数据」
+
+不修接口的话，客户下次再改一次名，又丢一次。所以同时做了两件事：
+
+1. **接口返回全部原样字段**（id/name/code/source/type/label/createdTime/
+   version/tenantId/customerId）—— 厂商与型号共用同一个 `writeAssetIdentity`，
+   不再各写一份。型号那边 2026-11-01 已经踩过同一个坑（打丢过两个型号），
+   当时只修了型号节点，没想到厂商也有一份。
+2. **后端自愈**：扫 `type='default'` 的资产，`code` 命中种子清单就修正 type。
+
 ---
 
 ## 三、部件与看板
