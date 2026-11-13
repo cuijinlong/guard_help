@@ -289,6 +289,50 @@ curl -X POST --noproxy '*' -H "X-Authorization: Bearer $TOKEN" \
 | 部件显示「部件无数据可显示」但脚本会自己取数 | 部件仍按「有数据源」模式跑 | 设 `datasources: []` 并确认部件支持自取数 |
 | 客户看板与租户模板不一致 | 开户时复制的是旧版模板 | 重新复制看板（`09` 幂等，会跳过已有的） |
 | 表格没边框 / 表头像普通文字 | 部件 CSS 被 TB 全局样式覆盖 | 样式写 `templateCss` 用普通选择器，别用 `::ng-deep` |
+| 几个部件一直转圈 + 弹 `Failed to parse the payload` | 看板 `entityAlias` 的 `singleEntity.id` 不是合法 UUID | 跑 `41-fix-energy-aliases.py`（见下） |
+
+### 部件一直转圈 + `Failed to parse the payload`（2026-11-13 实测）
+
+**判据**：打开看板，若干部件永远转圈，页面右上角弹
+`Failed to parse the payload`。浏览器 DevTools → Network → WS 里能看到
+前端发出的订阅命令中：
+
+```json
+"entityFilter": {"type":"singleEntity",
+                 "singleEntity":{"id":"<该客户第一个场站 id>","entityType":"ASSET"}}
+```
+
+`id` 是**中文描述文本**而不是 UUID。
+
+**为什么整批都挂**：TB 的订阅命令是一个 `WsCommandsWrapper` JSON，
+`singleEntity.id` 按 UUID 反序列化。遇到中文文本直接抛异常，
+**整个 cmds 数组被丢弃**（不是只跳过这一条），所以用到这个别名的部件
+全都收不到数据。后端只有 debug 级日志，默认看不见。
+
+**关键区分**：`00000000-0000-0000-0000-0000000005a1` 这类**合法 UUID**
+占位符不会出问题 —— 前端把它当哨兵，不发起实体查询。
+只有**非法文本**才炸。
+
+**修**：
+
+```bash
+python3 /path/to/scripts/41-fix-energy-aliases.py --check   # 先看会改什么
+python3 /path/to/scripts/41-fix-energy-aliases.py          # 修（幂等，带备份）
+```
+
+它按看板所属客户把别名换成真实资产：
+
+| 别名 | 换成 |
+| --- | --- |
+| `场站` | `<客户名>·单相园区` |
+| `用电分项` | `用能分项·<客户名>` |
+
+租户级看板（`customer_id` 为空）用 `--demo-customer`（默认「平台演示中心」）
+作演示默认值。
+
+> **两块看板 KPI 完全相同不一定是 bug**：右上角的场站选择器（state）
+> 优先级高于 entityAlias。想确认数据到底跟谁走，看
+> `/api/energy/metric-params?siteId=…` 里的 siteId 是不是同一个。
 
 ### 部件没样式 / 整页空白：管道与 Material 指令没进作用域（2026-11-04 实测）
 
