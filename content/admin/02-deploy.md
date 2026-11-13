@@ -275,6 +275,64 @@ bash docker-02-start.sh --admin-email you@example.com --admin-pass '你的密码
 
 ---
 
+## ★ 客户左侧菜单在数据库里，改前端代码无效（2026-11-13 踩到）
+
+客户看到的菜单**不是**前端 `menu.models.ts` 里那套，而是数据库
+`custom_menu` 表里的 `CustomMenu`（库里的名字是「业务导航（能源管理）」，
+`scope=CUSTOMER`）。前端那套客户菜单只在「客户没绑自定义菜单、且租户下
+也没有 CUSTOMER 作用域默认菜单」时才兜底 —— 实际环境永远轮不到它。
+
+所以：**改 `menu.models.ts` 删掉一个客户菜单项，界面上不会有任何变化。**
+这跟 A1「改部件 JSON」是同一类坑，只是换了个地方。
+
+| 菜单来自哪 | 谁生成 | 怎么改 |
+| --- | --- | --- |
+| 数据库 `custom_menu.config`（客户） | `EnergyMenuInstaller.installCustomerMenu` | **改库 + 改 Java**，两边都要动 |
+| 前端 `menu.models.ts`（租户） | 代码里静态定义 | 改代码，重新构建前端 |
+
+只改库 → 下次 `repair-init` 或新建客户时被代码生成的版本盖回去；
+只改 Java → 存量客户永远看不到变化（`needs*Upgrade` 只检测结构是否过期）。
+
+### 2026-11-13 这一轮改了什么
+
+| 改动 | Java 里改的位置 | 库里的效果 |
+| --- | --- | --- |
+| 删「综合报表 ▾ 参数报表」 | `installCustomerMenu` 的 `section("综合报表", …)` | 该分组只剩基础报表 / 手工填报 |
+| 删一级「平台自检」 | 同一方法里的 `items.add(url("平台自检", …))` | 客户菜单不再有这一项 |
+| 「仪表板」提到「组织」上面 | 把 `items.add(url("仪表板", …))` 移到组织那行之前 | 一级项倒数第二项 |
+
+一键打补丁（幂等，带备份）：
+
+```bash
+python3 shiyongshouce/downloads/scripts/38-customer-menu-cleanup.py --check   # 先看会改什么
+python3 shiyongshouce/downloads/scripts/38-customer-menu-cleanup.py           # 打补丁
+python3 shiyongshouce/downloads/scripts/38-customer-menu-cleanup.py --restore  # 还原
+```
+
+备份在 `~/.energy-customer-menu-bak/<菜单id>.json`（首次改动前落盘，不覆盖）。
+
+**怎么验证改对了** —— 别看代码，看客户实际拿到的菜单：
+
+```bash
+# 1. 租户登录拿 token
+TOK=$(curl -s -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' | jq -r .token)
+
+# 2. 用租户身份给客户用户发一个 token（impersonate，需 tokenAccessEnabled=true）
+CTOK=$(curl -s "http://127.0.0.1:8090/api/user/<客户userId>/token" \
+  -H "X-Authorization: Bearer $TOK" | jq -r .token)
+
+# 3. 这个接口返回的就是客户侧边栏的内容
+curl -s http://127.0.0.1:8090/api/customMenu \
+  -H "X-Authorization: Bearer $CTOK" | jq '.items[] | .name'
+```
+
+拿到的顺序应该以 `… 空调管理 / 仪表板 / 组织` 结尾，且没有「平台自检」「参数报表」。
+
+> 客户账号的密码通常不知道，**别去重置密码**（改不回去）。
+> 用上面第 2 步的 impersonate 拿 token 就够了。
+
 ## 第 5b 步　数据分析子应用（spsspro）
 
 平台自带一个独立的分析子应用，用于「模拟电表遥测 → 选区设备建数据集 →
