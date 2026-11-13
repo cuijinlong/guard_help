@@ -86,7 +86,7 @@ WHERE kv.attribute_type = 2
 **正常**：`dict_version` 与 `energy_library.json` 里的 `dictionaries.version` 一致；
 `standard_keys` = 125（含电能质量 63 个）；`wirings` = 2（1P2W / 3P4W，3P3W 已移除）。
 
-**异常**：版本号对不上 = 升级没生效。改完 seed 必须点「平台自检 → 一键修复初始化」，
+**异常**：版本号对不上 = 升级没生效。改完 seed 必须到 `/self-check` 点「一键修复初始化」（该页已从左侧菜单移除），
 否则库里永远是旧版（实测：重启 3 次字典仍是旧版，跑一次修复才变）。
 
 ### 1.2 电能质量 key 是否齐
