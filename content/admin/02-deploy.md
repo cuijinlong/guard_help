@@ -190,11 +190,13 @@ bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
 
 ```bash
 ls ~/energy-app/guard-server-4.4.0.jar
-ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 32
+ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 31
 ls ~/energy-app/data/sql/*.sql | wc -l                   # 必须是 8
 ```
 
-30 和 8，对不上就是组装漏了东西，回第 2 步确认 jar 存在后重跑。
+31 和 8，对不上就是组装漏了东西，回第 2 步确认 jar 存在后重跑。
+
+> 2026-11-13：看板模板从 32 减到 31 —— 「参数报表」看板按客户要求删除。
 
 > **要装到「另一台机器」？** 这一步换成：
 > ```bash
@@ -5569,8 +5571,8 @@ bash docker-02-start.sh --allinone --admin-email ... --admin-pass ...
 | --- | --- |
 | 库表 | 150 上下（`SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`） |
 | 系统部件（install 后 DB 行数） | 740 上下 |
-| 交付的部件文件 | 589 个 |
-| 客户看板模板 | 32 个 |
+| 交付的部件文件 | 579 个 |
+| 客户看板模板 | 31 个 |
 | 建表 SQL | 8 个 |
 | 能源参数字典 | 1 个资产，标准 key **155** 个（电能 140） |
 | 演示客户 | 10 台设备（8 台可模拟） |
