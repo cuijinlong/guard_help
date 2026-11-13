@@ -279,6 +279,64 @@ curl -X POST --noproxy '*' -H "X-Authorization: Bearer $TOKEN" \
 
 ---
 
+### 仪表板「分组」点不进去，URL 跳回首页（2026-11-14 实测）
+
+**现象**：`/dashboards → 分组` 里能看见「能耗查询」「能耗分析」等分组，
+点进去地址变成 `/dashboards/groups/<id>`，然后**立刻跳回首页**，
+页面不报任何错。只有 `All` 能正常打开。
+
+**根因**：分组的 `entity_group.configuration` 是 `NULL`。
+
+前端 `GroupConfigTableConfigService#prepareConfiguration` 里这样写：
+
+```ts
+const columns = config.entityGroup.configuration.columns.filter(...)
+```
+
+`configuration` 为 null → TypeError → Angular resolver 失败 →
+路由整页重定向。后端 `GET /api/entityGroup/{id}` 照样返回 200（它不校验这个字段），
+所以从接口侧完全看不出问题。
+
+**怎么查**：
+
+```bash
+docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+SELECT name, CASE WHEN configuration IS NULL THEN 'NULL ← 就是它' ELSE 'ok' END
+FROM entity_group WHERE type='DASHBOARD' ORDER BY name"
+```
+
+**怎么修**：不要手写 UPDATE，直接跑脚本（走正规入口，自动补默认列配置）：
+
+```bash
+python3 shiyongshouce/downloads/scripts/44-dashboard-groups.py --apply
+```
+
+脚本会打印 `补全「能耗查询」的列配置（原为空，会导致点不进去）`。
+
+**为什么会出现**：手写 `INSERT INTO entity_group` 时漏了 `configuration`。
+TB 原生的 `BaseEntityGroupService#saveEntityGroup` 本来会在
+`id == null && configuration == null` 时自动补默认值，裸 SQL 把这道保障绕过了。
+**以后建分组一律走 `entityGroupService.findOrCreateEntityGroup(...)`。**
+
+### 仪表板分组里有大量垃圾（2026-11-14 实测清理）
+
+三类，都来自「每客户一份看板」的旧机制：
+
+| 类型 | 实测数量 | 成因 |
+| --- | --- | --- |
+| 悬空关联 | 58 条 | `relation` 指向已删除的 dashboard（合并副本后遗留） |
+| 销户/压测/模板验证客户的空分组 | 7 个 | 测试客户删了，`<名字> Dashboards` 组没跟着删 |
+| 归属错位 | 4 条 | 看板提升为租户级后，它在客户分组里的关联还在 |
+
+```bash
+python3 shiyongshouce/downloads/scripts/44-dashboard-groups.py --audit   # 先看
+python3 shiyongshouce/downloads/scripts/44-dashboard-groups.py --apply   # 再清
+```
+
+> **⚠ 不要按后缀批量删 `* Dashboards`。** TB 的
+> `findOrCreateReadOnlyEntityGroupForCustomer` 给每个**活着的**客户都建了一个，
+> 删掉后下次开户又重建，反复抖动。判据必须是「customer 表里查不到这个客户名」。
+
 ## 三、部件与看板
 
 | 症状 | 判据 | 修 |

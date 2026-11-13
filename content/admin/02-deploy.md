@@ -303,6 +303,38 @@ bash docker-02-start.sh --admin-email you@example.com --admin-pass '你的密码
 | 删一级「平台自检」 | 同一方法里的 `items.add(url("平台自检", …))` | 客户菜单不再有这一项 |
 | 「仪表板」提到「组织」上面 | 把 `items.add(url("仪表板", …))` 移到组织那行之前 | 一级项倒数第二项 |
 
+#### 菜单只有一份，统一绑 ALL（2026-11-14）
+
+TB 保存新菜单时会把旧的降级成 `NO_ASSIGN` 而不是删除，于是库里会攒出
+「一条 ALL + 若干条 NO_ASSIGN」，每个客户各绑一条 —— 界面上看就是
+「菜单有好几份一样的」，改一份别的客户看不到。
+
+`EnergyMenuInstaller.purgeRetiredCustomerMenus` 每次启动自动处理：
+把客户统一绑到「业务导航（能源管理）+ ALL」那一份，再删掉已降级、无人引用的同名菜单。
+日志：`N 个客户已统一绑定到共享客户菜单` / `清理 N 条已降级的旧客户菜单`。
+
+#### 仪表板分组按菜单自动生成（2026-11-14）
+
+`/dashboards → 分组` 里那些分组（能耗查询 / 能耗分析 / 综合报表 / 能耗优化 /
+设备管理 / 空调管理）由 `EnergyMenuInstaller.ensureDashboardGroups` 每次启动生成：
+**菜单里哪个 section 挂了哪几块看板，就建同名分组挂进去**。口径只有菜单一处，
+加菜单项时分组自动跟上。
+
+> **⚠ 别用裸 SQL 建分组。** `configuration` 为 NULL 时前端
+> `entityGroup.configuration.columns.filter(...)` 会抛 TypeError，
+> resolver 失败 → **路由整页跳回首页、不报错**。要靠
+> `entityGroupService.findOrCreateEntityGroup` 这条正规入口（自动补默认列配置）。
+
+手工对齐/清理（幂等）：
+
+```bash
+python3 shiyongshouce/downloads/scripts/44-dashboard-groups.py --audit   # 只读：看分组现状与垃圾
+python3 shiyongshouce/downloads/scripts/44-dashboard-groups.py --apply   # 清理 + 按菜单建组
+```
+
+它会清三类垃圾：悬空关联（指向已删看板）、已销户客户的空分组、
+归属错位（租户级看板挂在客户分组）。**不会删活客户的 `<客户名> Dashboards` 只读组。**
+
 一键打补丁（幂等，带备份）：
 
 ```bash
