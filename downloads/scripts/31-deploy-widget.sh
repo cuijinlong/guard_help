@@ -213,6 +213,30 @@ done
 
 ok "${#RESOLVED[@]} 个文件语法与字段都合格"
 
+# ---------------------------------------------------------------- 2b. 生命周期作用域检查
+#
+# ★ 为什么加这一步（2026-11-13 事故）：
+#   controllerScript 里把变量误插进子函数，导致 self.onDestroy 引用不到
+#   （ReferenceError: onDocClick is not defined）。这种错误只在部件销毁时
+#   暴露，打开页面完全看不出来 —— 而且异常在 onDestroy 第一行，后面
+#   所有清理都不执行，定时器与订阅泄漏。
+#
+#   检查器只认「onDestroy 里的清理目标」，判据确定、零误报；
+#   详见 tools/check-widget-scope.mjs 的注释。
+SCOPE_CHK="$HERE/39-check-widget-scope.mjs"
+if [[ -f "$SCOPE_CHK" ]]; then
+  for cand in "${RESOLVED[@]}"; do
+    base=$(basename "$cand" .json)
+    if ! scope_out=$(node "$SCOPE_CHK" --only "$base" 2>&1); then
+      echo "$scope_out" >&2
+      die "$(basename "$cand")：生命周期作用域检查未通过（见上）"
+    fi
+  done
+  ok "生命周期作用域检查通过"
+else
+  warn "找不到 39-check-widget-scope.mjs，跳过作用域检查"
+fi
+
 if [[ "$CHECK_ONLY" == "true" ]]; then
   echo
   log "--check：只校验，未改动任何东西"
