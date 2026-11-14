@@ -5576,6 +5576,58 @@ node 88-remove-legacy-boards.mjs run
 
 ---
 
+## 界面规范：表格 / 分段选择 / 颜色（改页面必看）
+
+这三条是硬规矩（AGENTS.md C2/C3/C4），改任何自研页面都按它来，
+否则客户一眼就能看出「这块跟别处不是一套」。
+
+| 控件 | 用什么 | 不要用 |
+| --- | --- | --- |
+| 表格 | `<table class="tb-data-table tb-data-table--fill">` + `tb-num` / `tb-muted` | 自绘 `<table>` 加 `border-collapse` + 逐格描边（Excel 网格观感） |
+| 分段选择 | `<mat-button-toggle-group class="tb-segmented">` | 自绘 `<button>` 套 border、Material 默认灰底 |
+| 输入框 | `mat-form-field appearance="outline"` + `matInput` | 原生 `<input>` 自己画边框 |
+| 颜色 | `var(--tb-primary-*)` / `var(--tb-ink-*)` / `var(--tb-line)` | `#1565c0`、`#2e7d32` 这类硬编码 |
+
+`.tb-data-table` 与 `.tb-segmented` 都定义在 `ui-ngx/src/styles.scss`，
+是**全系统唯一一份**，动态部件与普通页面共用。组件自己的 scss 里
+**只能写列宽和间距**，写 padding / font-size / border 会盖掉统一规格
+（那两个规范全套了 `:where()`，特异性为 0）。
+
+### 两个实测坑
+
+**① 分段选择点「已选中」项会取消选中。** Material 20 没有 `allowDeselect`，
+点当前项 → value 变 null → 绑定的变量变 null → 下面整块内容消失。
+要用 `@ViewChild` 拿 group 引用并在 change 里设回去：
+
+```ts
+@ViewChild('kindGroup') kindGroup?: MatButtonToggleGroup;
+
+selectKind(code: string): void {
+  if (!code) {
+    if (this.kindGroup) { this.kindGroup.value = this.activeCode; }
+    return;
+  }
+  this.activeCode = code;
+}
+```
+
+**② `::ng-deep` 分两种场景，写错整条规则被浏览器丢弃。**
+
+- 全局 `styles.scss`：**不能写**（没有作用域封装，写了变无效伪元素）
+- 组件 `*.component.scss`：**必须写**（内部 DOM 带自己的 `_ngcontent`）
+
+症状：分段项里的多行文字挤成一行（`单相表1P2W23`）。
+
+### 改造过哪两页（2026-11-14）
+
+`运营配置 → 品种指标`（`/energy-dict`）与 `设备类型`（`/device-type`）：
+
+- 自绘表格 → `.tb-data-table`（竖线网格消失）
+- 原生 input → `mat-form-field`（36px，靠 CSS 变量压，不要只写 height）
+- 自绘按钮 → `.tb-segmented`
+- 硬编码色 → 主题变量（两页各 41 处），白标换色跟着变
+- 设备类型标题原来与描述重叠（flex 压缩），改成上下两行
+
 ## 放行防火墙
 
 容器端口映射只管**宿主机本机**。别的电脑访问、或云服务器，还要放行：
