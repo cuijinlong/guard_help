@@ -111,6 +111,66 @@ bash scripts/09-onboard-customer.sh \
 > 而 TB 不允许改 owner，最后两个客户互相污染。
 > 只有真实板子（`ED1-Gateway` 那套）用无后缀名 —— 名字在 `rtu/main.py` 里写死。
 
+### 1.3c 清除演示数据：客户列表行内「清除演示数据」（2026-11-14 实测）
+
+入口：**客户列表 → 行尾操作列 → 清除演示数据**（自检页也有同名按钮，同一个后端接口）。
+
+**它只删 `additionalInfo.demo=true` 的实体**，客户自己建的资产/设备一个不动。
+因此确认框里的数字会**小于**客户的总资产数 —— 这是正常的，不是漏算。
+
+实测（本环境「平台演示中心」）：
+
+```
+确认框：将删除「平台演示中心」的演示数据：资产 63 个、设备 10 台…
+库里  ：资产总数 88，其中 demo=true 63  ← 完全吻合
+        设备总数 35，其中 demo=true 10  ← 完全吻合
+未标记的 25 个：19 张账单 + 4 个维度根 + 1 个分项 + 1 个场站（自建，不会被删）
+```
+
+实测删除一个真实客户（zz客户B）的结果：
+
+```
+返回 {devices: 0, assets: 41, bills: 19}
+资产 64 → 4（只剩四个维度根）、账单 19 → 0
+```
+
+**它删得干净 —— 不要因为怕留垃圾而不敢用**：
+
+| 指标 | 删前 | 删后 |
+| --- | --- | --- |
+| 孤儿 `attribute_kv` | 98 | **98**（零增量）|
+| 孤儿 `relation` | 362 | **302**（反向减少 60）|
+
+代码里对每个实体先调 `deleteRelations` + `removeAttributes`，不靠数据库级联
+（本库没有任何非内部触发器）。
+
+#### ⚠ 它不会删什么（最重要）
+
+| 留下的 | 为什么 | 想真清则 |
+| --- | --- | --- |
+| 4 个维度根 `energy_*_library` | 客户级结构，没打 demo 标记；重建演示数据要靠它 | 随客户一起删（见第二节销户）|
+| 客户本身 | 这不是销户接口 | `DELETE /api/customer/{id}` 或销户脚本 |
+| 用户账号 | 同上 | 单独删或随客户级联 |
+
+> **「清除演示数据」≠「销户」。** 客户不合作/建错了要整个拿掉，用
+> [二、销户](#二销户连数据一起清) 的脚本；只是把演示数据换成真实数据，用本功能。
+
+#### ⚠ 手工调接口必须带 customerId
+
+```bash
+# 预览（不删）
+curl -s --noproxy '*' -H "X-Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8090/api/energy/demo-data?customerId=<客户id>"
+
+# 执行
+curl -s --noproxy '*' -X DELETE -H "X-Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8090/api/energy/demo-data?customerId=<客户id>"
+```
+
+**`customerId` 不传 = 全租户范围**（后端 `resolveCustomer` 返回 `null`，
+而 `ownedBy(owner, null)` 恒为 true）。不传会把**所有客户**的演示数据一起清掉。
+界面上走菜单不会踩到（它总是带 id），手敲 curl 时必须检查。
+
 ### 1.4 三个必须知道的坑
 
 **① 账号建完是「未激活」的**
@@ -205,6 +265,44 @@ bash scripts/10-cleanup-customer.sh --name '某某公司' --yes \
 | `custom_menu` | 该客户的菜单（确认无其他客户引用才删） |
 
 **不删**：租户、租户管理员、其他客户、租户级主数据（字典 / 档案 / 费率模板 / 分时方案）。
+
+> **还有一个容易漏的空分组**：TB 会为每个客户的看板建一个
+> `<客户名> Dashboards` 的 `entity_group`，它的 `owner_type` 是 **TENANT**
+> 而不是客户，所以 `deleteCustomer` 的 `deleteAllEntityGroups(tenantId, customerId)`
+> **碰不到它**，会留一个空壳分组在那里（2026-11-14 实测）。
+>
+> 它不是脏数据也不是故障 —— 只是个空分组。想去掉就单独删：
+>
+> ```bash
+> curl -s --noproxy '*' -X DELETE -H "X-Authorization: Bearer $TOKEN" \
+>   "http://127.0.0.1:8090/api/entityGroup/<分组id>"
+> ```
+>
+> 不要直接写 SQL 删 `entity_group` —— 应用层有缓存，绕过 API 会读到旧值。
+
+> **共享看板的客户分配会自动清理（2026-11-14 已修）**
+>
+> 租户级共享看板有一列 `assigned_customers`，记录「哪些客户能看到这块看板」。
+> 删客户时**它原先不会被清理** —— 每删一个客户就在每块共享看板里留一条
+> 指向已删客户 id 的死引用（实测删一个客户 → 29 块看板各留 1 条）。
+>
+> 而且删完就再也解绑不掉：`unassignDashboardFromCustomer` 开头校验客户存在，
+> 客户没了直接抛异常。所以只能在删客户时一并清。
+>
+> 已修（`CustomerServiceImpl.deleteCustomer` 里加了一行 native query），
+> 现在删客户后 `assigned_customers` 自动摘干净。**用旧版本删过客户的，
+> 库里可能已有残留**，检查方法：
+>
+> ```sql
+> -- 列出 assigned_customers 里指向不存在客户的看板
+> SELECT d.title,
+>        elem ->> 'title' AS stale_customer
+> FROM dashboard d,
+>      jsonb_array_elements(CAST(d.assigned_customers AS jsonb)) elem
+> WHERE elem -> 'customerId' ->> 'id' NOT IN (SELECT id::text FROM customer);
+> ```
+>
+> 有结果就说明是历史残留（不影响功能，只是脏数据），按同样逻辑清一遍即可。
 
 > **为什么必须单独清 `ts_kv`**：TB 删设备**不会**删遥测 ——
 > 数据按 `entity_id` 存在分区表里，设备没了数据还在，会一直占盘。
