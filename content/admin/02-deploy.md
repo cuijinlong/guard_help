@@ -190,13 +190,16 @@ bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
 
 ```bash
 ls ~/energy-app/guard-server-4.4.0.jar
-ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 31
+ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 30
 ls ~/energy-app/data/sql/*.sql | wc -l                   # 必须是 8
 ```
 
-31 和 8，对不上就是组装漏了东西，回第 2 步确认 jar 存在后重跑。
+30 和 8，对不上就是组装漏了东西，回第 2 步确认 jar 存在后重跑。
 
 > 2026-11-13：看板模板从 32 减到 31 —— 「参数报表」看板按客户要求删除。
+>
+> 2026-11-14：再看板模板 31 减到 30 —— 「电能质量数据集」按客户要求删除
+> （同时删掉它专用的 `energy_management.pq_dataset` 部件，「PQ数据集-验证」也一并删）。
 
 > **要装到「另一台机器」？** 这一步换成：
 > ```bash
@@ -302,6 +305,13 @@ bash docker-02-start.sh --admin-email you@example.com --admin-pass '你的密码
 | 删「综合报表 ▾ 参数报表」 | `installCustomerMenu` 的 `section("综合报表", …)` | 该分组只剩基础报表 / 手工填报 |
 | 删一级「平台自检」 | 同一方法里的 `items.add(url("平台自检", …))` | 客户菜单不再有这一项 |
 | 「仪表板」提到「组织」上面 | 把 `items.add(url("仪表板", …))` 移到组织那行之前 | 一级项倒数第二项 |
+
+> **2026-11-14 反转**：客户要求「客户用户左侧菜单中的仪表板功能都删除掉」，
+> 「仪表板」入口已从客户菜单删除。删的时候**必须连检测一起删** ——
+> 原来的 `needsDashboardsMenuUpgrade` 是「菜单缺这一项就重建」，
+> 只删菜单项不删检测 = 每次启动都判为缺项、反复重建菜单。
+> 现在改为：`containsRetiredMenu` 把「仪表板」识别为已下线项 → 存量菜单自动重建一次 → 该项消失。
+> 站内路由 `/dashboards` 本身保留（租户侧还在用），只是客户不再有入口。
 
 #### 菜单只有一份，统一绑 ALL（2026-11-14）
 
@@ -5603,8 +5613,8 @@ bash docker-02-start.sh --allinone --admin-email ... --admin-pass ...
 | --- | --- |
 | 库表 | 150 上下（`SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`） |
 | 系统部件（install 后 DB 行数） | 740 上下 |
-| 交付的部件文件 | 579 个 |
-| 客户看板模板 | 31 个 |
+| 交付的部件文件 | 578 个 |
+| 客户看板模板 | 30 个 |
 | 建表 SQL | 8 个 |
 | 能源参数字典 | 1 个资产，标准 key **155** 个（电能 140） |
 | 演示客户 | 10 台设备（8 台可模拟） |
