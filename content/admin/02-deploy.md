@@ -5648,7 +5648,7 @@ node 88-remove-legacy-boards.mjs run
 | 计数徽章 | 12px 字 / 20px 行高 / 圆角 10 |
 | 选中态 | 主色 14% 底 + 主色文字 + 500 字重 |
 | 表单 | 40px 高 |
-| 表单外框 | wrapper / flex 44px（总阀门） |
+| 表单外框 | wrapper / flex 47px（两者必须同高） |
 | 表单 infix | `height` / `min-height` 44px + `padding: 0` |
 | 表单内纯文本输入 | `input.mat-mdc-input-element` 44px（height + line-height 同值） |
 | 表单内下拉文字区 | `mat-mdc-select-trigger` 44px |
@@ -5671,21 +5671,22 @@ node 88-remove-legacy-boards.mjs run
 
 3. **行高与缩进要一起调**。只提行高不改缩进，层级差会被行高淹没，看着像平铺。
 
-4. **表单高度是「五处联立」**，改一个必须改五个：
-   `wrapper` / `flex` / `infix` / `select-trigger` / `input`。
+4. **表单高度分两层，各自内部必须一致**：
 
-   **现行全部 44px。**
+   - **外框层**：`wrapper` ═ `flex` —— 硬绑定，必须同高
+   - **内容层**：`infix` ═ `select-trigger` ═ `input` —— 必须同高，且 ≤ 外框
 
-   | wrapper | infix | trigger | input | 结果 |
-   | --- | --- | --- | --- | --- |
-   | 40 | 32 | 37 | 37 | ✗ 溢出 5px |
-   | 40 | 40 | 40 | 40 | ✓ 上一版 |
-   | 44 | 44 | 44 | 44 | ✓ 现行 |
-   | 40 | 44 | 44 | 44 | ✗ 内部被裁 |
+   **现行：外框 47px，内容 44px**（框变高、文字区不变、上下各留 1.5px）。
 
-   **wrapper / flex 是总阀门** —— 放大必须先改这两个再改内部，
-   反过来只改内部会溢出被裁，比不改更糟。
-   只改内部一部分（如只提 input）会让子控件贴顶、文字中心偏上。
+   | wrapper | flex | 内容层 | 结果 |
+   | --- | --- | --- | --- |
+   | 40 | 40 | 40/40/40 | ✓ 上一版 |
+   | 44 | 44 | 44/44/44 | ✓ 再上一版 |
+   | 47 | 47 | 44/44/44 | ✓ 现行 |
+   | 44 | 47 | 44/44/44 | ✗ flex 溢出 3px，外框视觉仍是 44 |
+
+   **只改 flex 等于没改**：边框是 wrapper 画的，flex 只决定内容层。
+   实测 flex 47 + wrapper 44 → 溢出 3px 画到框外，而框看起来还是 44。
 
    **测量注意**：`input` 的 value 不是文本节点，用 `Range` 量间距会
    fallback 到元素框、得出 `-6` 这种假数字。判 input 只能靠放大截图。
