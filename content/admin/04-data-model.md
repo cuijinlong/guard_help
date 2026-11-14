@@ -176,11 +176,15 @@
 #### 改完之后为什么数字没变
 
 场站 / 分项 / 区域 / 能耗概览读的是**资产上的 `energy_total`**，
-不是设备遥测。这个值由 `AssetTotalsScheduler` 每小时重算一次
-（`energy.asset-totals.refresh.enabled`，默认开，`matchIfMissing = true`）。
+不是设备遥测。**这个值不会自动更新** —— 必须手工触发重算。
 
-所以关掉一台表的「参与」，**要等下一次汇总**，看板合计才会少掉它。
-不想等就手工触发：
+> **2026-11-14 删除了 `AssetTotalsScheduler`**（原每小时自动重算）。
+> 原因是它**空转**：汇总按设备遥测的 `ts` 逐点算，设备没有新数据时
+> 它照样打印「刷新完成 N 个资产」，但一个新点也没写。
+> 实测日志连续报成功，而 `ts_kv_latest.energy_total` 停在 30 小时前不动 ——
+> 让人误以为汇总是活的，比没有这个任务更糟。
+
+所以关掉一台表的「参与」，**必须手工触发一次汇总**，看板合计才会变：
 
 ```bash
 curl -s --noproxy '*' -X POST -H "X-Authorization: Bearer $TOKEN" \

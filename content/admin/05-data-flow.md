@@ -22,9 +22,10 @@
 ④ 计算字段（挂在档案上，同档案设备自动继承）
    energy_day / load_rate / voltage_unbalance / carbon …
         ↓
-⑤ 资产汇总（AssetTotalsScheduler，每小时一轮）
+⑤ 资产汇总（**手工触发**，不再有定时任务）
    设备 energy → 资产 energy_total / energy_day / power_total
-   ★ 平台**不会**在每次上报时自动往资产汇总，这一步是独立任务
+   ★ 平台**不会**在每次上报时自动往资产汇总
+   ★ 2026-11-14 起也不再自动跑：AssetTotalsScheduler 已删除（空转）
         ↓
 ⑥ 部件取数
    读资产 energy_total（不是设备 energy）
@@ -84,13 +85,26 @@
 ### 3.1 谁写、何时写
 
 ```
-AssetTotalsScheduler（每 1 小时一轮，启动后延迟 5 分钟）
+POST /api/energy/asset-totals/rebuild   （手工触发，无定时任务）
   ↓
-rebuildAssetTotals(tenantId, customerId, backfillDays=2)
+rebuildAssetTotals(tenantId, customerId, backfillDays)
   ↓ 按「设备 → 场站 / 分项 / 区域 / 组织 / 维度容器」分组
   ↓ 组内同品种只取「拓扑根」（集合内没有父表的表）→ 避免总表+分表重复计电
   ↓ 按 ts 覆盖写各品种的 *_total / energy_day / power_total
 ```
+
+> **⚠ 2026-11-14 删除了 `AssetTotalsScheduler`（原每小时自动重算）。**
+>
+> 它看着在干活、实际上空转：汇总按设备遥测的 `ts` 逐点算，
+> 源头没有新点时它一个新点也不写，但日志照样打印
+> `资产汇总刷新完成：N 个资产，耗时 X ms`。
+> 实测连跑多轮，`ts_kv_latest.energy_total` 一直停在 30 小时前 ——
+> **比没有这个任务更糟**，因为它让人以为汇总链路是通的。
+>
+> 现在只有三个触发点，都需要显式调用：
+> 演示数据初始化 / `repair-init` / 上面的手工接口。
+>
+> **判断汇总是否真的更新了，看 `ts_kv_latest` 的时间戳，不要看日志。**
 
 **为什么用定时任务而不是规则链**：规则链逐条消息触发，一台表一小时一个点，
 一次汇总要读该场站下**全部**表的历史。逐条触发等于每点全量重算，
