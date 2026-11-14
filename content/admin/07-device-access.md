@@ -387,14 +387,39 @@ python3 scripts/23-demo-simulator.py \
 | ③ 本机 | `RTU_IP` | 与 ① 同网段；换网络不确定时设 `None` 用 DHCP |
 | ④ 设备名 | 4 个名字 | 必须与平台上**逐字一致** |
 
-#### 现场三个静默陷阱（都不报错，只表现为"没数据"）
+#### 现场四个静默陷阱（都不报错，只表现为"没数据"）
 
 1. **端口不一致**：固件写 11883、平台只开 1883（或反之）→ 探活通过、MQTT 连不上
 2. **缺 `ts`**：数据全落进 `values` 键（见「网关下挂多台表」）
 3. **缺 `gateway: true`**：消息被丢弃，日志报 `gatewaySessionHandler is null`
+4. **板子上没传 `meter_profiles.py`**：传感器、继电器都在报，**只有电表没数**
 
 新版固件对 1、2 都做了处理（端口回退、强制带 ts、时间不可信时拒发并提示）；
 3 是平台侧的数据，用上面的 `21-rtu-onboard.py` 一次配好。
+
+**第 4 条展开说**（2026-11-15 实测踩到）：
+
+串口日志长这样 —— 前面全是成功的，只有最后一行失败：
+
+```
+✅ 已连接 ThingsBoard 网关（192.168.31.198:11883）
+📤 温湿度已上报: {'humi': 68.6, 'temp': 22.7}
+📤 继电器状态已上报: {'relay1': 0, 'relay2': 0, …}
+❌ 电表读取/上报失败: meter_profiles 未加载，无法读表
+```
+
+原因是只往板子传了 `main.py`，**没传 `meter_profiles.py`**。
+主程序用 `try/except` 包住这个 import，缺文件时只是把变量置空、打一行警告，
+整块程序照样跑 —— 所以表现成「一切都正常，就电表是空的」。
+
+**看到这行就停，不用再查 Modbus / 波特率 / 从站地址。** 补传文件即可：
+
+| 板子上要有 | 本地对应 | 必需性 |
+| --- | --- | --- |
+| `main.py` | `rtu/main.py` | 必须 |
+| `meter_profiles.py` | `rtu/meter_profiles.py`（零依赖纯数据，16.8 KB） | **最易漏** |
+| `waveform_upload.py` | `rtu/waveform_upload.py`（只依赖 `gc`） | 可选，缺了只是不传录波 |
+| `lib/` 下的 `serial.py` 等 | `rtu/lib/` | 一般已在（温湿度能报就说明可用） |
 
 ## RTU 换电表型号 / 加新型号
 
@@ -517,6 +542,58 @@ PY
 厂家代号（`U` / `I` / `P` / `Ep`）要靠规则链的 `renameKeys` 转成标准名，
 否则数据进不了业务视图。判据与 SQL 见 [⑤ 数据流](/admin/data-flow#七厂家指标名不一样)。
 
+### 4. 温湿度这类传感器的键名：`measurePoints.deviceField` 必须以固件日志为准
+
+传感器不像电表那么多字段，它的映射是设备详情里的「测点管理」表，
+存为设备属性 `measurePoints`：
+
+```json
+[{"deviceField":"temp",  "standardField":"temperature", "standardName":"温度", "unit":"℃"},
+ {"deviceField":"humi",  "standardField":"humidity",    "standardName":"湿度", "unit":"%RH"}]
+```
+
+- `deviceField` = **设备侧实际上报的 key**
+- `standardField` = 平台标准 key
+
+#### ⚠ 一个很容易犯的错（2026-11-15 实际踩到）
+
+同一个设备在库里可能同时存在**三种** key 形态：
+
+```
+temp / humi             ← 真实固件上报的（正确，应映射到 temperature / humidity）
+T / H                   ← 别人用 MQTT 手工测试发进去的（不可信！）
+temperature / humidity  ← 映射生效后的产物
+```
+
+看到库里有 `T` / `H` 就断定「映射配错了」、把 `deviceField` 改成 `T` / `H` 是**错的** ——
+真实设备一上报就全失效（因为它发的是 `temp` / `humi`）。
+
+**判断依据的可靠度排序**：
+
+1. **RTU 串口日志的「已上报」行** —— 唯一权威，例如
+   `📤 温湿度已上报: {'humi': 68.6, 'temp': 22.7}`
+2. `rtu/main.py` 里构造上报内容的代码
+3. ~~数据库里出现过的 key~~ —— 可能来自测试数据，**不要拿它当依据**
+
+**验证映射是否生效**：用与固件相同的 key 发一条，然后查库看落到了哪个 key 下：
+
+```bash
+mosquitto_pub -h 127.0.0.1 -p 11883 -u "$TB_TOKEN" -t 'v1/gateway/telemetry' \
+  -m '{"Sensor-HZ8706":[{"ts":<毫秒时间戳>,"values":{"temp":22.7,"humi":68.6}}]}'
+```
+
+```sql
+SELECT k.key, coalesce(v.dbl_v, v.long_v)
+FROM ts_kv v JOIN key_dictionary k ON k.key_id = v.key
+JOIN device d ON d.id = v.entity_id
+WHERE d.name = 'Sensor-HZ8706'
+ORDER BY v.ts DESC LIMIT 4;
+-- 期望看到 temperature / humidity，而不是 temp / humi
+```
+
+**改映射要同时改两处才不丢**：设备属性（走 API，有缓存失效）+ 下次重装前
+同步到初始化数据；只用 SQL 改库可能被重启覆盖（同 `AGENTS.md` A1 的机制）。
+
 ---
 
 ## 验一条数据真的上来了
@@ -554,6 +631,15 @@ GROUP BY 1 ORDER BY 2 DESC LIMIT 10;"
 | 4 | 设备名是否与平台一致 | 网关模式下按**设备名**匹配，对不上会落到别的设备 |
 | 5 | 时间戳 | 设备时钟偏差 > 5 分钟会被丢弃 |
 | 6 | 键名 | 厂家代号能入库，但看板读不到（见上一节） |
+| 7 | **只有某一类设备没数** | 看串口日志有没有「`meter_profiles 未加载`」→ 板子缺依赖模块 |
+
+> **第 7 行要靠串口日志判断，不能靠查库**：库里只能看到「这台设备没数据」，
+> 看不出是硬件没接、寄存器读不到、还是模块压根没上传。
+> 日志里「温湿度已上报」与「电表读取失败」同时出现，就锁定是缺模块。
+>
+> **NTP 失败不是故障**：`⏳ NTP 失败: ETIMEDOUT` + `偏移 946684xxx ms` 是常态
+> （现场网络普遍封 UDP 123，板子 RTC 从 2000-01-01 起算）。
+> 只要落库时间对就行：`SELECT to_timestamp(max(ts)/1000) AT TIME ZONE 'Asia/Shanghai' FROM ts_kv WHERE entity_id='<id>';`
 
 **常见现场问题**：
 
