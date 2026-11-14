@@ -138,16 +138,57 @@ function svg({ size, pad, boltScale, shieldPx, withShield, comment }) {
 </svg>`;
 }
 
-/* 尺寸方案：小尺寸去掉盾牌、放大闪电；大尺寸用完整图形 */
+/*
+ * 尺寸方案：小尺寸去掉盾牌、大尺寸用完整图形。
+ *
+ * ★ boltScale 是怎么定的（2026-11-14 客户第二轮反馈后重定）
+ *
+ *   客户第一轮：「闪电没居中，往右偏」→ 修锚点。
+ *   客户第二轮：「闪电不偏了，但是太大了，又大又胖」→ 本节。
+ *
+ *   判据用**占比**而不是凭感觉。几何常量：
+ *     盾牌包围盒 24 × 27（x 4..28 / y 2.5..29.5）
+ *     闪电包围盒 14 × 19（x 9..23 / y 7..26）
+ *
+ *   带盾牌的尺寸，看「闪电宽 ÷ 盾牌宽」：
+ *     改前 32px = 71% / 48px = 64% / 64px = 61% / 128~256px = 58%
+ *     改后统一 48~52%（主体图形占容器 45~55% 是图标设计的常规区间）
+ *
+ *   不带盾牌的小尺寸，闪电就是整个图标，看「高占画布」：
+ *     改前 16px = 96%（顶满，像一块色块）/ 24px = 89%
+ *     改后 78% / 80% —— 四周留白，小尺寸才不会糊成一团色块
+ *
+ *   ★ 只调 boltScale，**不要改 BOLT 路径形状**。
+ *     路径与登录页 logo 同源，改形状就必须两处一起改，否则品牌图形不一致。
+ *     「胖」的观感缩小后自然缓解：同一形状占位越小，负空间越多，看着越瘦。
+ */
 const VERSIONS = [
-  { size: 16,  withShield: false, boltScale: 1.62, pad: 0.015, shieldPx: 1.00 },
-  { size: 24,  withShield: false, boltScale: 1.50, pad: 0.020, shieldPx: 1.00 },
-  { size: 32,  withShield: true,  boltScale: 1.22, pad: 0.045, shieldPx: 1.35 },
-  { size: 48,  withShield: true,  boltScale: 1.10, pad: 0.055, shieldPx: 1.55 },
-  { size: 64,  withShield: true,  boltScale: 1.04, pad: 0.060, shieldPx: 1.70 },
-  { size: 128, withShield: true,  boltScale: 1.00, pad: 0.065, shieldPx: 2.30 },
-  { size: 256, withShield: true,  boltScale: 1.00, pad: 0.070, shieldPx: 3.60 },
+  { size: 16,  withShield: false, boltScale: 1.314, pad: 0.015, shieldPx: 1.00 },
+  { size: 24,  withShield: false, boltScale: 1.347, pad: 0.020, shieldPx: 1.00 },
+  { size: 32,  withShield: true,  boltScale: 0.891, pad: 0.045, shieldPx: 1.35 },
+  { size: 48,  withShield: true,  boltScale: 0.857, pad: 0.055, shieldPx: 1.55 },
+  { size: 64,  withShield: true,  boltScale: 0.840, pad: 0.060, shieldPx: 1.70 },
+  { size: 128, withShield: true,  boltScale: 0.823, pad: 0.065, shieldPx: 2.30 },
+  { size: 256, withShield: true,  boltScale: 0.823, pad: 0.070, shieldPx: 3.60 },
 ];
+
+/*
+ * 自检：按上面的判据校验占比，改错立刻报错。
+ * 图标很小，靠肉眼复核不现实 —— 只能靠数字。
+ */
+for (const v of VERSIONS) {
+  const wRatio = (BOLT_BOX.w * v.boltScale) / 24;   // 闪电宽 / 盾牌宽
+  if (v.withShield) {
+    if (wRatio < 0.44 || wRatio > 0.54) {
+      throw new Error(`${v.size}px 闪电占盾牌宽 ${(wRatio * 100).toFixed(0)}%，应在 44~54%`);
+    }
+  } else {
+    const hFill = (BOLT_BOX.h * v.boltScale) / 32;  // 高占画布
+    if (hFill < 0.72 || hFill > 0.84) {
+      throw new Error(`${v.size}px 闪电高占画布 ${(hFill * 100).toFixed(0)}%，应在 72~84%`);
+    }
+  }
+}
 
 /* 用 Chrome 把每张 SVG 渲染成等尺寸 PNG（透明底） */
 async function renderPngs(dir) {
@@ -228,8 +269,19 @@ try {
   await renderPngs(tmp);
   const pngs = VERSIONS.map(v => join(tmp, `icon-${v.size}.png`));
   const n = buildIco(pngs, join(OUT, 'favicon.ico'));
+  /*
+   * favicon.svg 的闪电缩放**必须跟 32px 那个 ICO 条目一致**。
+   *
+   * ★ 2026-11-14 踩到：index.html 里 svg 在前、ico 在后，
+   *   支持 SVG favicon 的浏览器（Chrome / Safari / Firefox）**优先用 svg**。
+   *   上一版这里写死 boltScale: 1（占盾牌宽 58%），而 ico 已经缩到 48~52%，
+   *   于是「ico 改小了、浏览器里还是大」—— 客户看到的正是这一版。
+   *
+   *   所以不要写死，直接取 VERSIONS 里 32px 的值，改一处两处同步。
+   */
+  const svgBolt = VERSIONS.find(v => v.size === 32);
   writeFileSync(join(OUT, 'favicon.svg'), svg({
-    size: 32, pad: 0.0, boltScale: 1, shieldPx: 1.8, withShield: true,
+    size: 32, pad: 0.0, boltScale: svgBolt.boltScale, shieldPx: 1.8, withShield: true,
     comment: '能源卫士 · 与登录页 brand-logo 同源（绿色圆角方块 + 白色盾牌 + 白色闪电）',
   }));
 
