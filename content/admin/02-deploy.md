@@ -5648,9 +5648,9 @@ node 88-remove-legacy-boards.mjs run
 | 计数徽章 | 12px 字 / 20px 行高 / 圆角 10 |
 | 选中态 | 主色 14% 底 + 主色文字 + 500 字重 |
 | 表单 | 40px 高 |
-| 表单内下拉文字区 | `mat-mdc-select-trigger` 37px |
-| 表单内纯文本输入 | `input.mat-mdc-input-element` 37px（height + line-height 同值） |
-| 表单 infix | `height` / `min-height` 38px + `padding: 0` |
+| 表单内纯文本输入 | `input.mat-mdc-input-element` 40px（height + line-height 同值） |
+| 表单内下拉文字区 | `mat-mdc-select-trigger` 40px |
+| 表单 infix | `height` / `min-height` 40px + `padding: 0` |
 
 **三条硬约束：**
 
@@ -5670,18 +5670,20 @@ node 88-remove-legacy-boards.mjs run
 
 3. **行高与缩进要一起调**。只提行高不改缩进，层级差会被行高淹没，看着像平铺。
 
-4. **infix / trigger / input 是同一组数，必须联立**。
-   infix 是 `border-box`，可用内容 = `height − padding×2`，padding 恒为 0，
-   所以 **infix ≥ trigger/input**，留 1px 余量：
+4. **infix / trigger / input 必须三个一起改**。
+   infix 是 `border-box`、padding 恒为 0，可用内容 = infix height，必须 ≥ 子控件。
 
    | infix | trigger | input | 结果 |
    | --- | --- | --- | --- |
    | 32px | 37px | 37px | ✗ 溢出 5px |
-   | 38px | 37px | 37px | ✓ 现行 |
-   | 40px | 37px | 37px | ✓ 但余量 3px，居中偏下 |
+   | 38px | 37px | 37px | ✓ 但 input 比 trigger 矮 3px |
+   | 40px | 40px | 40px | ✓ 现行，全部填满 |
 
-   上限 40：wrapper / flex 仍是 40px，infix 超 40 会被裁。
-   **一行内所有控件必须同高** —— 只提下拉不提文本框，并排看就是一高一低。
+   **40 是硬上限**：wrapper / flex 都是 40px，超了会被裁。
+   想整体放大必须三处一起改。
+
+   只改一个会怎样：infix 是 `display:block`，37px 的 trigger 贴在 40px 顶部
+   （文字中心 18.5px），input 是 line-height 居中（20px）—— 差 1.5px，看得出来。
 
 5. **infix 变小 ≠ 表单变矮**。`mat-mdc-text-field-wrapper` 和
    `mat-mdc-form-field-flex` 还是 40px，infix 只在这 40px 里居中。
