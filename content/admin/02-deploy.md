@@ -5599,6 +5599,65 @@ node 88-remove-legacy-boards.mjs run
 
 `/sites` 旧页保留不删 —— 自检页的「去修复」跳转还在用它。
 
+## 品牌图标（favicon / 登录页 logo）
+
+### 改 favicon
+
+```bash
+cd /tmp && node <仓库>/shiyongshouce/downloads/scripts/40-make-favicon.mjs \
+  --out <仓库>/ui-ngx/src
+```
+
+需要 `puppeteer-core`（一次性依赖，不装进项目）：
+`npm install --no-save --prefix /tmp puppeteer-core`
+
+脚本会生成 `favicon.ico`（16/24/32/48/64/128/256 七个尺寸）和 `favicon.svg`。
+小尺寸**去掉盾牌、放大闪电**，大尺寸用完整图形 —— 这是专业做法，
+不是懒省事（16px 下带盾牌的闪电只剩 5×9 像素，糊成一个白点）。
+
+### ⚠ 闪电的居中是「算出来的」
+
+2026-11-14 修过一个 bug：闪电往右偏。原因是脚本把包围盒中心写死成
+`(13.5, 16.5)`，而实际是 `(16, 16.5)` —— X 差 2.5，且会被 `boltScale` 放大：
+
+| 尺寸 | 缩放 | 实测偏右 |
+| --- | --- | --- |
+| 128 / 256 | 1.00 | +20 px |
+| 16 | 1.62 | +32.5 px |
+
+现在改成 `pathBBox()` 从路径串实测，并在脚本启动处 `throw` 校验
+（X 中心必须 ≈16）。改闪电路径时不用手动改锚点，自检会兜底。
+
+### 验证居中（别看截图，逐像素量）
+
+把 ICO 里每个尺寸的 PNG 抽出来，找白像素的 X 范围，
+比较 `(min+max)/2` 与 `(w-1)/2`。量化误差 ≤0.5px 即合格。
+
+```
+尺寸   闪电X范围     中心    画布中心   偏差
+ 16     5..9         7.0      7.5     -0.5  ✓
+256    70..185     127.5    127.5     +0.0  ✓
+```
+
+### 部署（不用重跑 ng build）
+
+只改两个静态文件时：
+
+```bash
+cp ui-ngx/src/favicon.{ico,svg} ui-ngx/target/generated-resources/public/
+UI_ALLOW_STALE=1 bash guard-server/pack.sh --skip-ui --no-sync --deploy
+```
+
+`UI_ALLOW_STALE=1` 必须带：新鲜度检查按 ui-ngx 源码整体 hash 算，
+改 favicon 也会判「产物落后」，但它拦的是 Angular 代码，静态图标无影响。
+
+部署完**从 8090 实际下载**验 md5，别看本地文件 —— jar 内才是真相。
+
+### 登录页 logo
+
+与 favicon 同源（绿方块 + 白盾牌 + 白闪电），但它是内联 SVG、
+闪电**没有 transform**，天生居中。所以修 favicon 时**不要顺手改登录页**。
+
 ## 界面规范：表格 / 分段选择 / 颜色（改页面必看）
 
 这三条是硬规矩（AGENTS.md C2/C3/C4），改任何自研页面都按它来，

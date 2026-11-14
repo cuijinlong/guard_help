@@ -42,13 +42,80 @@ const RADIUS = 0.30;               // 圆角占方块边长比（登录页 14/46
 const SHIELD = 'M16 2.5 28 7v8.5c0 7.2-4.8 12-12 14-7.2-2-12-6.8-12-14V7l12-4.5Z';
 const BOLT = 'm18 7-9 12h7l-2 7 9-13h-7l2-6Z';
 
+/**
+ * 从 SVG 路径串算出包围盒（只支持本文件用到的 m/l/h/v/Z 相对指令）。
+ *
+ * ★ 为什么要有这个函数（2026-11-14）：
+ *   上一版把闪电包围盒中心写死成 (13.5, 16.5)，而实际是 (16, 16.5) ——
+ *   X 差 2.5，放大后闪电明显往右偏，客户直接看出来了。
+ *   写死的数字会错，而且错了没人会发现（图标很小）。所以改成**算出来的**，
+ *   并在下面 assert 校验，改路径时立刻报错。
+ */
+function pathBBox(d) {
+  const toks = d.match(/[a-zA-Z]|-?\d+\.?\d*/g) || [];
+  let x = 0, y = 0, cmd = null, nums = [];
+  const pts = [];
+  const flush = () => {
+    if (!cmd || !nums.length) return;
+    if (cmd === 'm' || cmd === 'l') {
+      for (let k = 0; k + 1 < nums.length; k += 2) {
+        x += nums[k]; y += nums[k + 1]; pts.push([x, y]);
+      }
+    } else if (cmd === 'h') {
+      for (const v of nums) { x += v; pts.push([x, y]); }
+    } else if (cmd === 'v') {
+      for (const v of nums) { y += v; pts.push([x, y]); }
+    }
+    nums = [];
+  };
+  for (const t of toks) {
+    if (/[a-zA-Z]/.test(t)) { flush(); cmd = t.toLowerCase(); }
+    else nums.push(parseFloat(t));
+  }
+  flush();
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  return { minX, maxX, minY, maxY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2,
+           w: maxX - minX, h: maxY - minY };
+}
+
+const BOLT_BOX = pathBBox(BOLT);
+/*
+ * 自检：闪电中心必须落在画布中心 (16, 16) 附近。
+ * 容差 0.6 —— Y 天生偏 0.5（包围盒 7..26，中心 16.5；画布中心 16），
+ * 这是图形本身的性质，不是错误；X 必须几乎精确等于 16。
+ */
+if (Math.abs(BOLT_BOX.cx - 16) > 0.01) {
+  throw new Error(`闪电 X 中心应为 16，实际 ${BOLT_BOX.cx}（包围盒 ${BOLT_BOX.minX}..${BOLT_BOX.maxX}）`);
+}
+if (Math.abs(BOLT_BOX.cy - 16) > 0.6) {
+  throw new Error(`闪电 Y 中心偏离过大：${BOLT_BOX.cy}（包围盒 ${BOLT_BOX.minY}..${BOLT_BOX.maxY}）`);
+}
+
+/** 闪电缩放锚点 = 实测包围盒中心，不写死。 */
+const BOLT_CX = BOLT_BOX.cx;
+const BOLT_CY = BOLT_BOX.cy;
+
 function svg({ size, pad, boltScale, shieldPx, withShield, comment }) {
   const inner = size * (1 - 2 * pad);
   const off = size * pad;
   const k = inner / 32;
   const rx = inner * RADIUS;
   /*
-   * 闪电原包围盒中心 (13.5, 16.5)，绕它放大后平移回视觉中心 (16, 16)。
+   * 闪电包围盒中心由 pathBBox() 实测得出（现为 (16, 16.5)），
+   * 绕它缩放后平移到画布中心 (16, 16)。
+   *
+   * ★★★ 2026-11-14 修：这里原本写 (-13.5, -16.5)，X 差了 2.5 个单位，
+   *     导致闪电整体**往右偏**（客户原话「中间的闪电没有居中，往右侧偏」）。
+   *
+   *     13.5 从哪来的：大概是「宽度 27 的一半」—— 但实测包围盒宽度是
+   *     14（X 从 9 到 23），不是 27。把 23-9 算成 27 会漏掉路径左右两端
+   *     的不对称，于是平移量少 2.5，放大后偏差 = 2.5 × boltScale：
+   *       16px 版 (scale 1.62) 偏右 4.05 个单位，肉眼非常明显。
+   *
+   *     验证办法（脚本已带自检）：包围盒中心 = (min+max)/2，
+   *     X = (9+23)/2 = 16，Y = (7+26)/2 = 16.5。直接算，不要猜。
    *
    * ★ 即使 boltScale === 1 也要应用这个 transform（2026-11-13 实测）：
    *   跳过它（"scale(1) 等于没做"）会让光栅化走另一条路径，
@@ -56,7 +123,7 @@ function svg({ size, pad, boltScale, shieldPx, withShield, comment }) {
    *   两次生成的 PNG 不再逐字节相同，破坏了「脚本可复现」这个前提。
    *   恒等变换的代价是零，保留它换来确定性。
    */
-  const boltTf = ` transform="translate(16,16) scale(${boltScale}) translate(-13.5,-16.5)"`;
+  const boltTf = ` transform="translate(16,16) scale(${boltScale}) translate(${-BOLT_CX},${-BOLT_CY})"`;
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
   ${comment ? `<!-- ${comment} -->` : ''}
   <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
