@@ -5633,6 +5633,40 @@ node 88-remove-legacy-boards.mjs run
 > 判据看 computed style，不要只看截图 —— 第一版就是"截图看着正常"但
 > `borderRadius` 实测仍是 `4px`（方框）。
 
+### 部件左侧导航树规格（2026-11-14 定稿）
+
+「组织与场站」等部件左侧那棵树的统一尺寸。改这块前先对照这张表，
+不然很容易只改一半（行高提了、缩进没提，看着还是挤）。
+
+| 项 | 值 |
+| --- | --- |
+| 面板宽 | 340px（min 300 / max 420） |
+| 行高 | 40px（+1px 行距） |
+| 字号 / 行图标 | 14px / 20px |
+| 展开箭头槽位 | 32px（叶子行 spacer 必须同宽） |
+| 层级缩进 | `8 + level × 20` |
+| 计数徽章 | 12px 字 / 20px 行高 / 圆角 10 |
+| 选中态 | 主色 14% 底 + 主色文字 + 500 字重 |
+| 表单 | 40px 高 |
+
+**三条硬约束：**
+
+1. **顶部只放两段**：客户下拉 + 搜索框。刷新按钮并进搜索框后缀
+   （没输入显示刷新、有输入显示清除），不要独占一行加分隔线 ——
+   那会把面板顶部切成四段，客户说的"排版不合理"就是这个。
+
+2. **表单高度必须和右侧页签一致**（都是 40px）。
+   `--mat-form-field-container-vertical-padding` 写 10px 会顶成 44px，
+   与右侧 40px 差 4px，左右两条边一眼看得出不齐。改完必须量：
+
+   ```js
+   // 浏览器 console
+   getComputedStyle(document.querySelector('.org-field .mat-mdc-text-field-wrapper')).height
+   getComputedStyle(document.querySelector('.org-detail-panel .mat-mdc-text-field-wrapper')).height
+   ```
+
+3. **行高与缩进要一起调**。只提行高不改缩进，层级差会被行高淹没，看着像平铺。
+
 ### 两个实测坑
 
 **① 分段选择点「已选中」项会取消选中。** Material 20 没有 `allowDeselect`，
