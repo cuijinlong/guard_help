@@ -895,6 +895,55 @@ python3 shiyongshouce/downloads/scripts/46-audit-assets.py --audit
 「zz客户B」，它名下全部资产名都带这个后缀，按包含匹配会误删 45 个带遥测的
 正常业务资产（实测 50 个命中里只有 5 个是真测试数据）。
 
+### 资源库里的 JavaScript 资源
+
+「资源 → JavaScript 资源」（`resource` 表 `resource_type='JS_MODULE'`）。
+本环境只有两条，**都是功能依赖，不要删**：
+
+| 资源 | 谁在用 | 删了的后果 |
+| --- | --- | --- |
+| `cytoscape.min.js` | 设备拓扑部件的画布引擎 | 拓扑页白屏 |
+| `gateway-management-extension.js` | 10 个 `gateway_widgets.*` 部件 | 网关页面全挂 |
+
+> ⚠ **不能看界面的「引用」提示决定删不删。** 设备拓扑是通过硬编码 URL
+> （`/api/resource/js_module/system/cytoscape.min.js`）加载的，而它的
+> `descriptor.resources` 是空数组 —— TB 认为它「没人用」。点删除不会拦你。
+
+清理前的验证步骤（三项都要过）：
+
+```sql
+-- ① 清单
+SELECT title, coalesce(resource_sub_type,'—'), pg_size_pretty(octet_length(data)::bigint)
+FROM resource WHERE resource_type='JS_MODULE' ORDER BY 3 DESC;
+```
+
+② 把资源名与它的**导出函数名**拿去全库反查（所有 text/jsonb 列，
+排除 `resource` 自身），确认 `widget_type` / `dashboard` / `rule_chain`
+/ `rule_node` / `asset` / `device` / `entity_group` 全部 0 命中。
+
+③ 代码侧用**词边界**搜（子串会误命中：`markerLabel` 会匹到 TB 原生的
+`markerLabelText`）：
+
+```bash
+grep -rnE '\\b(geoStatusToColor|markerLabel\\()' ui-ngx/src guard-server/src nenghaobao/widgets
+```
+
+删完不要只看数据库 —— 真验证是**两个刚需资源仍能加载、已删的返回 404**：
+
+```bash
+for k in cytoscape.min.js gateway-management-extension.js; do
+  curl -s --noproxy '*' -o /dev/null -w "$k → %{http_code} %{size_download}\n" \
+    -H "X-Authorization: Bearer $TOKEN" "http://127.0.0.1:8090/api/resource/js_module/system/$k"
+done
+```
+
+不需要重启容器：资源缓存按 id 键，列表查询走 DB，删后按 key 请求立即 404。
+
+> 2026-11-14 删过一条 `Mine site monitoring solution JS utils.js`（TB 官方
+> fleet_tracking 示例残留，9 个导出函数全库无引用）。备份在
+> `~/.energy-resource-bak/mine-site-utils.json`。
+> `01-install.sh` 已用 `loadDemo:false`，新装不会再有这类 demo 数据。
+
 ## 四、资产与设备的类型码
 
 `asset.type` 与 `device.type` 存的都是**中文类型名**，不是 code。
