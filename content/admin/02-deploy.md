@@ -5648,6 +5648,7 @@ node 88-remove-legacy-boards.mjs run
 | 计数徽章 | 12px 字 / 20px 行高 / 圆角 10 |
 | 选中态 | 主色 14% 底 + 主色文字 + 500 字重 |
 | 表单 | 40px 高 |
+| 表单内下拉文字区 | `mat-mdc-select-trigger` 31px（配 infix `padding: 4px 0`） |
 
 **三条硬约束：**
 
@@ -5666,6 +5667,11 @@ node 88-remove-legacy-boards.mjs run
    ```
 
 3. **行高与缩进要一起调**。只提行高不改缩进，层级差会被行高淹没，看着像平铺。
+
+4. **改 `select-trigger` 高度要同时看 infix padding**。
+   infix 是 `height: 40px` + `border-box`，可用内容高度 = 40 − padding×2。
+   `padding: 6px` 只有 28px，trigger 提到 31px 会溢出 3px；
+   `padding: 4px` 是 32px，正好装下。
 
 ### 两个实测坑
 
