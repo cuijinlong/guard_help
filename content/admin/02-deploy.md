@@ -5584,7 +5584,7 @@ node 88-remove-legacy-boards.mjs run
 | 控件 | 用什么 | 不要用 |
 | --- | --- | --- |
 | 表格 | `<table class="tb-data-table tb-data-table--fill">` + `tb-num` / `tb-muted` | 自绘 `<table>` 加 `border-collapse` + 逐格描边（Excel 网格观感） |
-| 分段选择 | `<mat-button-toggle-group class="tb-segmented">` | 自绘 `<button>` 套 border、Material 默认灰底 |
+| 分段选择 | `<mat-button-toggle-group class="tb-segmented">` | 自绘 `<button>` 套 border、Material 默认灰底、双层描边 |
 | 输入框 | `mat-form-field appearance="outline"` + `matInput` | 原生 `<input>` 自己画边框 |
 | 颜色 | `var(--tb-primary-*)` / `var(--tb-ink-*)` / `var(--tb-line)` | `#1565c0`、`#2e7d32` 这类硬编码 |
 
@@ -5592,6 +5592,23 @@ node 88-remove-legacy-boards.mjs run
 是**全系统唯一一份**，动态部件与普通页面共用。组件自己的 scss 里
 **只能写列宽和间距**，写 padding / font-size / border 会盖掉统一规格
 （那两个规范全套了 `:where()`，特异性为 0）。
+
+### 分段选择长什么样（2026-11-14 定稿）
+
+客户否掉了第一版：「外边框套内圆角边框的选项卡，太丑了」。
+定稿是**只有一层轮廓**：
+
+- 容器：淡灰胶囊（`border-radius: 100px`、**无边框**）
+- 未选中项：完全透明
+- 选中项：纯白底 + 一点阴影（**不描边**），文字主色
+
+> **⚠ 改样式前必读：特异性。** Material 自己的规则是
+> `.mat-button-toggle-group.mat-button-toggle-group-appearance-standard`（0,2,0），
+> 只写 `.tb-segmented`（0,1,0）会被压掉，**整段样式静默失效**。
+> `styles.scss` 里一律用三重复合选择器。
+>
+> 判据看 computed style，不要只看截图 —— 第一版就是"截图看着正常"但
+> `borderRadius` 实测仍是 `4px`（方框）。
 
 ### 两个实测坑
 
