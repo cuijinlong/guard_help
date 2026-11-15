@@ -18,6 +18,8 @@
 | 数据看着不对，想查库核实 | [⑧ 运维 SQL](/admin/ops-sql) |
 | 报错了、页面空了 | [⑨ 排障](/admin/troubleshoot) |
 | 改了代码要生效 | [⑩ 开发与构建](/admin/dev-build) |
+| **功能是我让 Agent 写的，想搞清代码在哪、数据怎么流** | [⑪ 架构导航](/admin/architecture) |
+| **想知道某个页面用了哪些接口、哪张表** | [⑫ 页面链路卡](/admin/page-map) |
 | 客户怎么用（不是运维看的） | [客户使用手册](/user/index) |
 
 ---

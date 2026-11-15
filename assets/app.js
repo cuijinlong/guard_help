@@ -239,6 +239,17 @@
   }
 
   function route() {
+    // 页内锚点（形如 #某个标题）不是路由，不能走下方「找不到就跳默认页」的逻辑。
+    // 之前所有 #xxx 都会被 resolveRoute 判为非法并跳回快速开始，
+    // 于是手册里「跳到本节」这类链接一点就飞走。有对应元素时滚动过去即返回。
+    if (location.hash && location.hash.indexOf('#/') !== 0) {
+      const anchorId = decodeURIComponent(location.hash.slice(1));
+      const el = anchorId && document.getElementById(anchorId);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return;
+      }
+    }
     const r = resolveRoute();
     if (!r) {
       // 默认落到快速开始

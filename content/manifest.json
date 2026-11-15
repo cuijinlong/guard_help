@@ -1,7 +1,7 @@
 {
   "title": "能源管理平台 · 使用手册",
   "version": "v2.0",
-  "updated": "2026-11-03",
+  "updated": "2026-11-15",
   "sections": [
     {
       "id": "user",
@@ -102,6 +102,16 @@
           "id": "dev-build",
           "title": "⑩ 开发与构建",
           "file": "admin/10-dev-build.md"
+        },
+        {
+          "id": "architecture",
+          "title": "⑪ 架构导航（代码在哪/数据怎么流）",
+          "file": "admin/11-architecture.md"
+        },
+        {
+          "id": "page-map",
+          "title": "⑫ 页面链路卡（26 个页面）",
+          "file": "admin/12-page-map.md"
         }
       ],
       "description": "给平台方的：怎么部署、开租户、导入数据、排障"
