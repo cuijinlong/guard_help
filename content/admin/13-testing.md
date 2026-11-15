@@ -548,6 +548,14 @@ git add tools/baseline/ && git commit -m '口径变更：<说明>，基线同步
 > `rehearse-meters.py` 要读型号定义 `vendor_models.json` → 在**仓库根**。
 > 写错目录会报「找不到设备」或「缺少 .env」。
 
+`47` / `48` 放在**手册下载区**（`downloads/scripts/`），部署目录里默认没有。
+首次使用先复制一次（脚本自己找 `.env`，复制不改任何配置）：
+
+```bash
+cp /path/to/iot-rule-engine/shiyongshouce/downloads/scripts/4[78]-*.sh ~/energy-app/scripts/
+chmod +x ~/energy-app/scripts/4[78]-*.sh
+```
+
 ```bash
 # ── ① 暂停真实设备上报（部署目录，否则每 3 秒的实时数据会混进来）
 cd ~/energy-app
