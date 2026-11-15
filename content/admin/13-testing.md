@@ -620,6 +620,20 @@ python3 tools/spread-meter-dims.py --dry-run
 python3 tools/spread-meter-dims.py
 ```
 
+### 页面上怎么分开看：数据来源下拉
+
+5 台表里有两台是**虚拟表**（手工填报，一个月一个数）。它们与实时表混在一起看时，
+月值会被摊成日均（800 ÷ 30 = 26.7）—— 所以顶部「数据来源」下拉要分开选：
+
+```
+实时设备（默认）  → 只有 RTU / 采集上来的真实表
+虚拟设备         → 只有手工填报的虚拟表，且粒度锁定「按年」
+```
+
+> 选「虚拟设备」时「按日 / 按月」会被自动收起，只剩「按年」。
+> 原因：手工填报本身是**月粒度**，没有日/小时分布；
+> 允许按日查看就只能靠「月值 ÷ 当月天数」编一个日值出来 —— 那是造数，不是统计。
+
 > **注意**：虚拟表的分项关系由**手工填报接口**决定 —— 保存时它会把设备挂到
 > 这次传的 `itemId` 下并解除旧关系。所以 `rehearse-meters.py` 里的
 > `VIRTUAL_PLAN.item` 必须与 `spread-meter-dims.py` 的分配一致，
@@ -1121,6 +1135,140 @@ python3 tools/rehearse-meters.py --clean false --continue
 ```
 
 ---
+
+
+### 9.9 分源键：实时设备 vs 虚拟设备
+
+**为什么有这一节**（2026-11-16 客户实测反馈）：
+
+> 「分项能耗里虚拟表『给排水』应该是 800 kWh 的月值，
+>  怎么每天都是 26.7？这样不合理。」
+
+根因不是算错，是**两种粒度被混在一起**：
+
+- 实时表（RTU / 采集）上报的是**小时级**表底，日、月、年都能算；
+- 虚拟表是**手工填报**，一个月只有一个数（月首 00:00 一个点 = 整月用量）。
+
+混在同一个 `energy_total` 里时，统计图为了让月点能画在日轴上，
+会把它按天数摊开：800 ÷ 30 = 26.7/天。数字看着像真曲线，其实是除出来的。
+
+现在后端按来源分别落键：
+
+```
+energy_total          全部（实时 + 虚拟，兼容旧看板）
+energy_total_real     只有实时表
+energy_total_virtual  只有虚拟表（月级）
+```
+
+功率与日累计同理：`power_total_real` / `power_total_virtual`、
+`energy_day_real` / `energy_day_virtual`。
+
+**按年合计对账（实测输出）**：
+
+```sql
+SELECT a.type AS 维度, a.name AS 节点,
+       round(sum(CASE WHEN k.key = 'energy_total'
+                      THEN coalesce(t.dbl_v, t.long_v::double precision) ELSE 0 END)::numeric, 1) AS 全部,
+       round(sum(CASE WHEN k.key = 'energy_total_real'
+                      THEN coalesce(t.dbl_v, t.long_v::double precision) ELSE 0 END)::numeric, 1) AS 实时设备,
+       round(sum(CASE WHEN k.key = 'energy_total_virtual'
+                      THEN coalesce(t.dbl_v, t.long_v::double precision) ELSE 0 END)::numeric, 1) AS 虚拟设备
+FROM asset a
+LEFT JOIN ts_kv t ON t.entity_id = a.id
+LEFT JOIN key_dictionary k ON k.key_id = t.key AND k.key LIKE 'energy_total%'
+WHERE a.type IN ('分项', '区域', '场站')
+  AND a.name LIKE '%平台演示中心%'
+GROUP BY a.type, a.name
+HAVING count(k.key) > 0
+ORDER BY a.type, a.name;
+```
+
+实测输出：
+
+```
+维度  节点                                全部     实时设备  虚拟设备
+分项  动力分项·生产园区                   10000.0  10000.0     0.0
+分项  插座分项·办公园区                     120.0      0.0   120.0
+分项  照明分项·办公园区                      10.0     10.0     0.0
+分项  照明分项·生产园区                     240.0    240.0     0.0
+分项  给排水分项·生产园区                   800.0      0.0   800.0
+区域  A栋办公区区域·办公园区                 10.0     10.0     0.0
+区域  公共区域区域·办公园区                 120.0      0.0   120.0
+区域  办公区区域·生产园区                   800.0      0.0   800.0
+区域  生产车间区域·生产园区               10000.0  10000.0     0.0
+区域  锅炉房区域·生产园区                   240.0    240.0     0.0
+场站  三相园区                            11040.0  10240.0   800.0
+场站  单相园区                              130.0     10.0   120.0
+```
+
+怎么读：
+
+- **场站「全部」= 实时 + 虚拟**：三相园区 11040 = 10240 + 800；单相园区 130 = 10 + 120。
+  这是「按年合计」，两个时间点相加本来就对 —— 一个是 11 月的月值，一个是 11-15 的日值；
+- **每个叶子节点只属于一个来源**：一台表要么是实时表、要么是虚拟表，
+  所以同级的「实时设备」与「虚拟设备」两列必有一列为 0。
+  两列同时非零说明该节点下混挂了两类表（本身合法，但要按来源分开看）；
+- 页面上的对应开关：分项能耗 / 区域能耗 / 能耗概览顶部的**「数据来源」下拉**。
+  选「实时设备」时统计图读 `_real` 键、粒度仍是按日/按月/按年；
+  选「虚拟设备」时读 `_virtual` 键，且**只允许按年**（虚拟表是月粒度，
+  按月/按日去查只能靠除法造数）。
+
+> **判据**：切到「虚拟设备 → 按年」，给排水分项应该只有 11 月一根柱 = **800**；
+> 切到「实时设备」，给排水分项应该是**空**（它下面只有虚拟表）。
+> 如果实时档下给排水还有 26.7/天，说明还在读旧的 `energy_total`。
+
+### 9.10 改了部件为什么不生效（两个必知的坑）
+
+改完 `guard-server/src/main/data/json/system/widget_types/*.json` 后，
+页面刷新看不到变化，通常是下面两个原因之一：
+
+**坑一：系统部件的真正来源是部署目录，不是 jar**
+
+启动时平台从 **`~/energy-app/data/json/system/widget_types/`** 导入系统部件
+（该目录 `data` 挂载到容器的 `/opt/energy/data`）。只改仓库里的 JSON、
+不复制到部署目录，重启也还是旧部件。
+
+```bash
+# 改完仓库里的部件后，必须同步一次
+cp guard-server/src/main/data/json/system/widget_types/<部件>.json \
+   ~/energy-app/data/json/system/widget_types/
+
+cd ~/energy-app && docker compose restart energy-server
+```
+
+**坑二：`check-widget-sync.mjs` 会真的写文件**
+
+它的用途是「检查源码生成脚本是否与线上部件一致」，
+但**执行时会真的运行构建脚本**。实测（2026-11-16）：
+跑一次它把 `energy_management_distribution_chart.json` 覆盖成了旧版源码，
+丢了 9 个函数（`pickable` / `batchSeries` / `loadBrief` …），
+而它自己的输出只是「会被改动：templateHtml, controllerScript」——
+看起来像只做了检查。
+
+> 要跑它，先 `cp` 一份 widget_types 目录；或者干脆别跑，
+> 用 `node --check` 校验脚本语法 + 页面实测。
+
+**怎么确认线上部件是新版**
+
+```bash
+TOK=$(curl -s -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+
+curl -s -H "X-Authorization: Bearer $TOK" \
+  "http://127.0.0.1:8090/api/widgetTypes?isSystem=true&bundleAlias=energy_management" \
+  | python3 -c "
+import json,sys
+for w in json.load(sys.stdin):
+    cs=(w.get('descriptor') or {}).get('controllerScript') or ''
+    print(w['fqn'], 'v' + str(w.get('version')), '长度', len(cs),
+          '含新逻辑' if 'sourceMode' in cs else '还是旧的')
+"
+```
+
+看板引用的是 `system.energy_management.*`（系统级），
+所以用租户账号 `POST /api/widgetType` 只会建出一个**租户级副本**，
+看板根本不会用它 —— 这一点也是实测踩出来的。
 
 ## 十、出问题时的第一反应
 
