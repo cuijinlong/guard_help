@@ -985,8 +985,13 @@ for parent, name, did in pages:
 
 ```bash
 python3 genpage.py > /tmp/gen.md
-# 再把 /tmp/gen.md 的表格替换 / 合并进本文件
+cp /tmp/gen.md shiyongshouce/content/admin/12-page-map.md   # 手册版（唯一权威）
+cp /tmp/gen.md docs/PAGE-MAP.md                              # 仓库内快照
+cd shiyongshouce && ./sync.sh                                # 同步到发布目录
 ```
+
+> 两份内容必须一致：手册版是给人看的权威版本，`docs/` 是仓库内快照。
+> 改完跑上面三行，不要只改一处。
 
 脚本干什么：
 
