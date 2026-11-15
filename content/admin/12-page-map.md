@@ -43,7 +43,922 @@
 | [空调管理 / 每日复盘报告](#每日复盘报告-空调管理) | 每日复盘报告 | 1 | 1 | EnergyRatePolicyController |
 | [组织](#组织) | 组织与场站 | 1 | 13 | DeviceDisplayNameController, EnergyDictionaryController, EnergyMetricParamController… |
 
-## 二、逐页链路卡
+## 二、七个基础设施接口（伪代码 + 可运行 SQL）
+
+这 7 个接口被 4~18 个页面共用，**搞懂它们，26 个页面通一半**。
+每条 SQL 都由实测跑通，`<tenant_id>` 换成你自己的租户 id 即可。
+
+```sql
+-- 先取租户 id（后面所有 SQL 都用它）
+SELECT id FROM tenant WHERE title = '星河能源集团';
+```
+
+### 2.1 `/api/energy/visible-sites` → `EnergyRatePolicyController.getVisibleSites:249`
+
+**用途**：当前用户能看到哪些场站/组织。18 个页面在调用，是权限入口。
+
+**伪代码**
+
+```text
+user = 当前用户; tenant = 当前租户
+targetCustomer = user 是客户用户 ? user.customerId : null       // 客户用户忽略入参，防越权
+if targetCustomer == null && 传了 customerId:
+    targetCustomer = customerId
+
+assetGroupIds = 客户用户 ? 该用户可见的资产组 : {}
+restricted    = 客户用户 && 资产组非空
+orgProfileIds = 组织类档案 id 集合                                // 只算一次，局部传参
+
+if !restricted:
+    候选 = targetCustomer 有值 ? 该客户的资产 : 全租户资产        // 租户不传客户 = 看全租户
+    collected = { 候选 中 isOrgOrSite 的 }
+else:
+    for 每个资产组:
+        collected += 组内资产 中 isOrgOrSite 的
+    BFS 沿 Contains 向上补齐组织链                                // 否则场站无处挂载
+
+return { restricted, sites: collected }
+
+isOrgOrSite(asset):
+    return asset.type ∈ {场站, 组织} || asset.asset_profile_id ∈ orgProfileIds
+```
+
+**关键 SQL**（等价于 `!restricted` 分支）
+
+```sql
+-- 场站 + 组织清单（18 个页面的下拉框数据源）
+SELECT a.id, a.name, coalesce(a.type, p.name) AS kind
+FROM asset a
+LEFT JOIN asset_profile p ON p.id = a.asset_profile_id
+WHERE a.tenant_id = '<tenant_id>'::uuid
+  AND (a.type IN ('场站', '组织') OR p.name IN ('场站', '组织'))
+ORDER BY kind, a.name;
+```
+
+实测输出：
+
+```
+三相园区·平台演示中心   type=场站
+单相园区·平台演示中心   type=场站
+质量示范·平台演示中心   type=场站
+总部·平台演示中心       type=组织
+```
+
+> ⚠️ **两个坑**：
+> 1. `asset.type` 会在「资产档案改名」时被 TB 同步回写，所以代码里同时看
+>    `type` 和 `asset_profile_id`（双保险）。SQL 里也要两个都判。
+> 2. 客户用户的可见范围不是 `customer_id` 一个条件就够 —— 还要叠加
+>    `entity_group` + `group_permission`。上面这条 SQL 只等价租户视角。
+
+---
+
+### 2.2 `/api/energy/metric-params` → `EnergyMetricParamController.getMetricParams:786`
+
+**用途**：能源品种与指标参数定义（单位/小数位/口径）。13 个页面在用。
+
+**伪代码**
+
+```text
+lib = 找 type='energy_type_library' 的资产                        // 回退按 name='能源参数字典'
+if lib == null: return { libraryId: null, kinds: [] }
+
+visible = 不按场站过滤 ? null : 该场站声明的能源品种集合            // null = 不过滤
+kindAssets = lib 的 Contains 子资产
+kindAttrs  = 批量读这些子资产的 SERVER_SCOPE 属性                  // 一条 SQL 查 attribute_kv
+
+for kind in kindAssets:
+    node = { code, name, unit, data_shape(缺省 cumulative),
+             is_energy(缺省 true), paramDict, device_types, ... }
+    if visible 非空 && node.code ∉ visible: skip
+    if energyOnly && node.is_energy == false: skip
+
+return { libraryId, siteId, filtered, kinds }
+```
+
+**关键 SQL**
+
+```sql
+-- 根字典资产
+SELECT id, name FROM asset
+WHERE tenant_id = '<tenant_id>'::uuid AND type = 'energy_type_library';
+
+-- 8 个能源品种及其属性
+SELECT k.name AS kind_name,
+       max(CASE WHEN kd.key='code' THEN ak.str_v END) AS code,
+       max(CASE WHEN kd.key='unit' THEN ak.str_v END) AS unit,
+       max(CASE WHEN kd.key='data_shape' THEN ak.str_v END) AS data_shape
+FROM asset lib
+JOIN relation r ON r.from_id = lib.id AND r.relation_type = 'Contains'
+JOIN asset k   ON k.id = r.to_id
+LEFT JOIN attribute_kv ak ON ak.entity_id = k.id AND ak.attribute_type = 2
+LEFT JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+WHERE lib.type = 'energy_type_library'
+  AND lib.tenant_id = '<tenant_id>'::uuid
+GROUP BY k.id, k.name
+ORDER BY k.name;
+-- 只数品种个数时用 count(DISTINCT k.id)，否则 JOIN relation 会重复计数
+```
+
+> **缓存**：控制器内有 `SITE_KINDS_CACHE`（`ConcurrentHashMap`，TTL 30 秒），
+> key 是 `tenantId|siteId`。品种属性本身不缓存（`CachedAttributesService.findAll`
+> 在 keys 未知时绕过缓存）。
+
+---
+
+### 2.3 `/api/energy/time-anchor` → `EnergyTimeAnchorController.getTimeAnchor:80`
+
+**用途**：所有「今天/本月」类时间窗的基准日。12 个页面在用。
+
+**伪代码**
+
+```text
+today = LocalDate.now(Asia/Shanghai)
+out   = { today, anchor: today, demo: false }
+
+cid = 当前用户是客户用户 ? 其 customerId : null
+if cid == null: return out                                        // 租户视角用真实今天
+
+attr = 读 CUSTOMER 的 SERVER_SCOPE 属性 'energyDemoWindow'
+if attr 不存在或为空: return out
+
+node = JSON.parse(attr.strValue)                                  // ★ 是 StringDataEntry，不是 Json
+if node.to 为空: return out
+
+out.anchor = node.to; out.demo = true
+out.windowFrom = node.from; out.windowTo = node.to; out.days = node.days
+return out
+```
+
+**关键 SQL**
+
+```sql
+-- 演示窗口锚点（客户实体上的 SERVER_SCOPE 属性）
+SELECT c.title AS customer, ak.str_v AS energy_demo_window
+FROM customer c
+LEFT JOIN attribute_kv ak
+  ON ak.entity_id = c.id
+ AND ak.attribute_type = 2                                        -- 2 = SERVER_SCOPE
+ AND ak.attribute_key = (SELECT key_id FROM key_dictionary WHERE key = 'energyDemoWindow')
+WHERE c.tenant_id = '<tenant_id>'::uuid;
+```
+
+实测输出：
+
+```
+平台演示中心 -> {"from":"2026-09-12","to":"2026-11-12","days":62,"generatedAt":1794470888165}
+```
+
+> ⚠️ 值是 **StringDataEntry**（JSON 字符串），不是 JsonDataEntry。
+> 用 `ak.json_v` 读会得到 NULL，必须用 `ak.str_v`。
+
+---
+
+### 2.4 `/api/energy/meters` → `EnergyMeterReadingController.meters`
+
+**用途**：电表清单（含档案、倍率、归属）。10 个页面在用。
+
+**伪代码**
+
+```text
+devices = 全租户设备分页拉取
+filter:
+    if 传了 deviceIds: 只留这些
+    if 客户用户: 只留 customer 归属匹配的
+    排除虚拟设备（MeteringMath.isVirtual）
+    排除网关（additionalInfo.gateway == true）
+
+for dev in devices:
+    属性 = 读 SERVER_SCOPE（meterNo / ctRatio / ptRatio / meterRatio / ratioApplied）
+    档案 = device_profile
+    最新表底 = timeseriesService.findLatest(dev, 'energy_reading')     // 单点，非区间
+    场站/组织 = 由 additionalInfo.siteId 反查 asset 及其父资产
+
+return [ { id, name, meterNo, ratio, siteId, siteName, lastReading, ... } ]
+```
+
+**关键 SQL**
+
+```sql
+-- 电表清单 + 最新表底 + 归属场站
+SELECT d.id, d.name,
+       max(CASE WHEN kd.key='meterNo'      THEN ak.str_v END) AS meter_no,
+       max(CASE WHEN kd.key='meterRatio'   THEN ak.str_v END) AS meter_ratio,
+       max(CASE WHEN kd.key='ratioApplied' THEN ak.bool_v::text END) AS ratio_applied,
+       l.dbl_v AS last_reading,
+       to_char(to_timestamp(l.ts/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS reading_at,
+       d.additional_info::jsonb->>'siteId' AS site_id
+FROM device d
+LEFT JOIN attribute_kv ak ON ak.entity_id = d.id AND ak.attribute_type = 2
+LEFT JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+LEFT JOIN ts_kv_latest l ON l.entity_id = d.id
+  AND l.key = (SELECT key_id FROM key_dictionary WHERE key = 'energy_reading')
+WHERE d.tenant_id = '<tenant_id>'::uuid
+  AND coalesce(d.additional_info::jsonb->>'gateway','false') <> 'true'   -- ★ varchar，必须 ::jsonb
+GROUP BY d.id, d.name, l.dbl_v, l.ts, d.additional_info
+ORDER BY d.name;
+```
+
+---
+
+### 2.5 `/api/energy/telemetry-series` → `EnergyTelemetryController.telemetrySeries`
+
+**用途**：取一组实体的时序数据（部件画图用）。7 个页面在用。
+
+**伪代码**
+
+```text
+实体 = 参数里的 entityIds（或按场站/分项解析出的集合）
+keys  = 参数里的遥测键
+时间窗 = [startTs, endTs]
+
+for 每个实体:
+    原始点 = timeseriesService.findAll(实体, keys, startTs, endTs)   // 明细，不做区间聚合
+    if 需要按间隔: 交给前端做分桶，或走 TB 的 aggregate 接口
+
+return { 实体id: { key: [{ts, value}] } }
+```
+
+**关键 SQL**（等价的明细查询）
+
+```sql
+-- 某设备某键的原始序列（示意：最近 1 小时）
+SELECT to_char(to_timestamp(kv.ts/1000) AT TIME ZONE 'Asia/Shanghai','HH24:MI:SS') AS t,
+       coalesce(kv.dbl_v, kv.long_v) AS value
+FROM ts_kv kv
+JOIN key_dictionary kd ON kd.key_id = kv.key
+WHERE kv.entity_id = '<device_id>'::uuid
+  AND kd.key = 'voltage_a'
+  AND kv.ts > (extract(epoch from now())*1000 - 3600000)
+ORDER BY kv.ts DESC
+LIMIT 20;
+```
+
+> **口径**：这个接口取的是**明细点**，不是聚合值。要「本月累计」得由调用方
+> 或前端算 —— 这和我们实测过的「TB 报表引擎不做区间聚合」是同一件事。
+
+---
+
+### 2.6 `/api/energy/entity-briefs` → `EnergyMetricParamController.entityBriefs:609`
+
+**用途**：批量取实体名称/类型（部件渲染前先拿名字）。5 个页面在用。
+
+**伪代码**
+
+```text
+ids = 参数里的实体 id 列表
+result = {}
+for 分批(ids):
+    批量查 asset → 填入 name
+    批量查 device → 填入 name + 档案
+    批量查 device_profile / asset_profile → 填入类型名
+return { id: { name, type, profileName } }
+```
+
+**关键 SQL**
+
+```sql
+-- 批量取实体名称（UNION 资产与设备）
+SELECT 'ASSET' AS kind, a.id, a.name, coalesce(p.name,'-') AS profile
+FROM asset a LEFT JOIN asset_profile p ON p.id = a.asset_profile_id
+WHERE a.id IN ('<id1>'::uuid, '<id2>'::uuid)
+UNION ALL
+SELECT 'DEVICE', d.id, d.name, coalesce(p.name,'-')
+FROM device d LEFT JOIN device_profile p ON p.id = d.device_profile_id
+WHERE d.id IN ('<id1>'::uuid, '<id2>'::uuid);
+```
+
+---
+
+### 2.7 `/api/energy/child-relations` → `EnergyMetricParamController.childRelations:478`
+
+**用途**：沿 `Contains` 取子节点（四棵树的下钻）。4 个页面在用。
+
+**伪代码**
+
+```text
+fromId = 当前节点
+relations = 查 fromId 出发的 Contains（COMMON 组）
+if relations 为空 && fromId 是实体组: 回退查实体组的成员
+
+children = [ findAssetById(r.toId) 或 findDeviceById(r.toId) ]
+按 additionalInfo 排序字段排序
+return [ { id, name, type, hasChildren } ]
+```
+
+**关键 SQL**
+
+```sql
+-- 某节点的直接子节点（资产 + 设备）
+SELECT r.to_type AS kind, r.to_id AS id,
+       coalesce(a.name, d.name) AS name,
+       coalesce(ap.name, dp.name) AS profile
+FROM relation r
+LEFT JOIN asset  a  ON r.to_type='ASSET'  AND a.id = r.to_id
+LEFT JOIN asset_profile ap ON ap.id = a.asset_profile_id
+LEFT JOIN device d  ON r.to_type='DEVICE' AND d.id = r.to_id
+LEFT JOIN device_profile dp ON dp.id = d.device_profile_id
+WHERE r.from_id = '<parent_asset_id>'::uuid
+  AND r.relation_type = 'Contains'
+ORDER BY name;
+
+-- 顺手看这个节点有几层子树（判断 hasChildren 用）
+WITH RECURSIVE tree AS (
+  SELECT id FROM asset WHERE id = '<parent_asset_id>'::uuid
+  UNION ALL
+  SELECT r.to_id FROM relation r JOIN tree t ON r.from_id = t.id
+  WHERE r.relation_type = 'Contains' AND r.to_type = 'ASSET'
+)
+SELECT count(*) AS subtree_size FROM tree;
+```
+
+> ⚠️ `relation` 表有 `Contains` 和 `SiteContains` 两套口径并存。
+> 下钻用 `Contains`；场站→设备汇总用 `SiteContains`。混用会得到不同结果。
+
+## 三、页面独有接口（伪代码 + 关键 SQL）
+
+> 只列「某页面专属」的接口。共用接口见第二章，不重复。
+
+### 3.1 组织（12 个接口）
+
+这一页管的是「组织树 + 费率下发」，是权限与定价的交汇点。
+
+#### `/api/energy/structure-settings` → `EnergyStructureController`
+
+**伪代码**
+
+```text
+settings = admin_settings[tenant].energyStructureSettings           // 不存在则默认
+result = {
+  orgProfileIds: 档案里 energyRole='org' 的 id 集合,                 // 自愈：缺失时写回
+  siteProfileIds: 同理 'site',
+  canManageOrg: 当前用户有租户级写权限
+}
+```
+
+**关键 SQL**
+
+```sql
+-- 组织/场站档案是怎么标记的
+SELECT ap.id, ap.name,
+       max(CASE WHEN kd.key='energyRole' THEN ak.str_v END) AS energy_role
+FROM asset_profile ap
+LEFT JOIN attribute_kv ak ON ak.entity_id = ap.id AND ak.attribute_type = 2
+LEFT JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+WHERE ap.tenant_id = '<tenant_id>'::uuid
+GROUP BY ap.id, ap.name
+HAVING max(CASE WHEN kd.key='energyRole' THEN ak.str_v END) IS NOT NULL;
+```
+
+> ⚠️ `energyRole` 是 2026-11-15 加的**自愈属性**：老库没有这条属性时，
+> 代码会按档案名推断一次并写回。这叫「档案改名不再失效」的修法。
+> 如果这里查出来是空的，说明自愈还没触发（需要访问一次相关接口）。
+
+#### `/api/energy/rate-policies` → `getRatePolicies:137`
+
+**伪代码**
+
+```text
+templates = 租户级 rate_template 资产                              // customerId 为 null 或 NULL_UUID
+schemes   = 租户级 tou_scheme 资产
+result.templates = [{ id, name, SERVER_SCOPE 属性, schemeIds=该模板 uses 的目标 }]
+result.schemes   = [{ id, name, 属性 }]
+
+if 传了 siteId:
+    site = 校验可访问（客户用户跨客户 → 403）
+    result.siteBindings    = site uses→ 模板
+    result.siteCustomRates = site 的 SERVER_SCOPE 'siteCustomRates'
+    owner = 沿父链找最近一个配了 energyRates 的组织
+    if owner: result.orgRates = owner.energyRates
+
+result.customerRates = 客户默认费率
+```
+
+**关键 SQL**
+
+```sql
+-- 租户级费率模板 + 分时方案
+SELECT a.type, a.id, a.name,
+       max(CASE WHEN kd.key='energy'  THEN ak.str_v END) AS energy,
+       max(CASE WHEN kd.key='rateType' THEN ak.str_v END) AS rate_type
+FROM asset a
+LEFT JOIN attribute_kv ak ON ak.entity_id = a.id AND ak.attribute_type = 2
+LEFT JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+WHERE a.tenant_id = '<tenant_id>'::uuid
+  AND a.type IN ('rate_template', 'tou_scheme')
+  AND (a.customer_id IS NULL OR a.customer_id = '13814000-1dd2-11b2-8080-808080808080'::uuid)
+GROUP BY a.type, a.id, a.name
+ORDER BY a.type, a.name;
+
+-- 某场站绑定了哪些模板（uses 关系）
+SELECT t.name AS template, t.type
+FROM relation r JOIN asset t ON t.id = r.to_id
+WHERE r.from_id = '<site_asset_id>'::uuid
+  AND r.relation_type = 'uses' AND r.to_type = 'ASSET';
+```
+
+> **优先级**（代码注释原文）：`场站自定义 > 场站绑定模板 > 客户默认绑定`。
+
+#### `/api/energy/org-rate` → `saveOrgRate`
+
+**伪代码**
+
+```text
+校验组织可访问（客户用户只能改自己名下组织）                          // 404 / 403
+rates = body.energyRates; 必须是对象 → 否则 400
+for (energy, rate) in rates: validateCustomerRate(energy, rate)
+写 SERVER_SCOPE JsonDataEntry 'energyRates' 到组织资产
+return { ok, energyRates }
+```
+
+**关键 SQL**
+
+```sql
+-- 组织上配的费率
+SELECT a.name AS org,
+       ak.json_v AS energy_rates
+FROM asset a
+JOIN attribute_kv ak ON ak.entity_id = a.id AND ak.attribute_type = 2
+JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+WHERE kd.key = 'energyRates'
+  AND a.type = '组织'
+  AND a.tenant_id = '<tenant_id>'::uuid;
+```
+
+> `validateCustomerRate` 很严：`rateType ∈ {tou, tier, flat, tier_tou}`，
+> `flat` 必须用 `fixedPrice`（不是 `prices.flat`）。旧版宽松校验存进去的错误结构，
+> 账单侧会静默算不出价。
+
+#### `/api/energy/site-rate-binding` → `bindSiteRate:409` / `unbindSiteRate:442`
+
+**伪代码**
+
+```text
+校验 site、template 都可访问；template.type 必须是 rate_template
+energy = template 的 SERVER_SCOPE 'energy'
+
+if energy 非空:
+    删掉该场站同能源品种的旧 uses 关系                            // 一个品种只留一份
+saveRelation(site → template, type='uses', group=COMMON)
+```
+
+**关键 SQL**
+
+```sql
+-- 一个场站每个能源品种绑了几份模板（应各为 1）
+SELECT s.name AS site,
+       max(CASE WHEN kd.key='energy' THEN ak.str_v END) AS energy,
+       count(*) AS bindings
+FROM relation r
+JOIN asset s ON s.id = r.from_id AND s.type = '场站'
+JOIN asset t ON t.id = r.to_id   AND t.type = 'rate_template'
+LEFT JOIN attribute_kv ak ON ak.entity_id = t.id AND ak.attribute_type = 2
+LEFT JOIN key_dictionary kd ON kd.key_id = ak.attribute_key AND kd.key = 'energy'
+WHERE r.relation_type = 'uses'
+  AND s.tenant_id = '<tenant_id>'::uuid
+GROUP BY s.name, t.id
+HAVING count(*) > 1;      -- 有结果 = 存在重复绑定
+```
+
+#### `/api/energy/site-rate-custom` → `saveSiteRateCustom:468` / `deleteSiteRateCustom:506`
+
+**伪代码**
+
+```text
+校验 site 可访问；energy 非空；custom 是对象
+validateCustomerRate(energy, custom)                              // 结构错当场拒
+all = site 的 SERVER_SCOPE 'siteCustomRates'（读不到 = {}）
+all[energy] = custom + { energy, updatedTime }
+写回
+```
+
+**关键 SQL**
+
+```sql
+-- 场站级自定义费率（覆盖模板）
+SELECT a.name AS site, ak.json_v AS custom_rates
+FROM asset a
+JOIN attribute_kv ak ON ak.entity_id = a.id AND ak.attribute_type = 2
+JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+WHERE kd.key = 'siteCustomRates'
+  AND a.tenant_id = '<tenant_id>'::uuid;
+```
+
+#### `/api/energy/customer-roles`、`/api/energy/device-display-name`、`/api/energy/gateway`、`/api/energy/topologies`、`/api/energy/vendor-models`
+
+| 接口 | 存储 | 一句话 |
+| --- | --- | --- |
+| `customer-roles` | `user_role` + `customer` | 客户下的角色清单（下拉框） |
+| `device-display-name` | `device.label` | 只改显示名，不动 `name`（name 是唯一键） |
+| `gateway` | `relation` + `device.additional_info` | 网关绑定：设备 `additionalInfo.gateway=true` |
+| `topologies` | `asset.type='topology'` + `attribute_kv.layout` | 拓扑图节点每次动态派生，只存坐标 |
+| `vendor-models` | 厂商/型号资产 + SERVER_SCOPE | 设备档案的可选项 |
+
+**拓扑的 SQL（看坐标存哪）**
+
+```sql
+SELECT a.name AS topology, a.additional_info::jsonb->>'siteId' AS site_id,
+       ak.json_v AS layout
+FROM asset a
+LEFT JOIN attribute_kv ak ON ak.entity_id = a.id AND ak.attribute_type = 2
+LEFT JOIN key_dictionary kd ON kd.key_id = ak.attribute_key AND kd.key = 'layout'
+WHERE a.type = 'topology' AND a.tenant_id = '<tenant_id>'::uuid;
+```
+
+---
+
+### 3.2 告警事件（8 个接口）
+
+> **先纠正一个常见误解**：本项目只有**两套**告警机制，不是三套。
+> `device_profile.profile_data.alarms` **全是 null**（实测 0 个非空），
+> 那只是 TB 的默认空字段。
+>
+> | 机制 | 存在哪 | 当前数量 | 谁评估 |
+> | --- | --- | --- | --- |
+> | ① 计算字段告警 | `calculated_field` type=ALARM，挂在 DEVICE_PROFILE | 7 条 | TB 原生 |
+> | ② 客户自建规则 | `alarm_rule` / `alarm_rule_state` 表 | 0 条 | 自研 `AlarmRuleEngine`（30s） |
+>
+> 两套最终都写 **`alarm` 表**（8638 条），所以确认/清除/通知/TTL 逻辑统一。
+
+#### `/api/energy/alarm-events` → `AlarmEventController.events:141`
+
+**伪代码**
+
+```text
+view = tab ∈ {device, limit, log, group, all} ? tab : 'device'
+scope = 按租户/客户/场站算出可见设备集合（空集合 → WHERE false）
+limitTypes = SELECT alarm_type FROM alarm_rule                      // 用来区分「客户规则告警」
+
+if view == 'group':
+    只按 cleared=false + scope 分组统计，忽略其他所有筛选            // 注意这个分支
+else:
+    按 view 决定：
+      limit   → a.type = ANY(limitTypes)
+      device  → a.type IS NULL OR a.type <> ALL(limitTypes)
+    再叠加 status / severity / 时间窗 / deviceId / deviceName
+    if view ∈ {limit, log}: additional_info.details 的 key/direction 过滤
+    count(*) 后分页，ORDER BY start_ts DESC
+```
+
+**关键 SQL**
+
+```sql
+-- 告警列表（等价常用筛选：按级别 + 时间窗 + 场站设备）
+SELECT a.id, a.type, a.severity,
+       to_char(to_timestamp(a.start_ts/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS started,
+       a.cleared, a.acknowledged,
+       d.name AS device,
+       a.additional_info::jsonb->'details'->>'key'       AS metric_key,
+       a.additional_info::jsonb->'details'->>'threshold' AS threshold
+FROM alarm a
+LEFT JOIN device d ON d.id = a.originator_id
+WHERE a.tenant_id = '<tenant_id>'::uuid
+  AND a.start_ts >= (extract(epoch from now())*1000 - 7*86400000)   -- 最近 7 天
+  AND a.severity IN ('CRITICAL','MAJOR')
+ORDER BY a.start_ts DESC
+LIMIT 50;
+
+-- 按「是否客户自建规则告警」区分
+SELECT source, cnt FROM (
+  SELECT CASE WHEN a.type = ANY(ARRAY(SELECT alarm_type FROM alarm_rule
+               WHERE tenant_id='<tenant_id>'::uuid AND alarm_type IS NOT NULL))
+              THEN '客户规则' ELSE '内置' END AS source,
+         count(*) AS cnt
+  FROM alarm a WHERE a.tenant_id = '<tenant_id>'::uuid
+  GROUP BY 1
+) t;
+```
+
+#### `/api/energy/alarm-events/ack` → `ack:466`
+
+**伪代码**
+
+```text
+ids = body.ids[]
+for raw in ids:
+    id = 解析 uuid，非法 → skipped++
+    originator = SELECT originator_id FROM alarm WHERE id=? AND tenant_id=?   // 不存在→skipped
+    if 不在可见设备集合 → skipped++                                // 逐条鉴权，防越权
+    alarmService.acknowledgeAlarm(tenant, DeviceId(originator), AlarmId(id))
+return { acknowledged: ok, skipped, errors }
+```
+
+**关键 SQL**
+
+```sql
+-- 确认告警（生产里走 TB 接口；这里只演示等价写法）
+-- ⚠️ 直接 UPDATE 会跳过 TB 的事件/通知链路，仅供核对
+SELECT id, originator_id, type, acknowledged, ack_ts
+FROM alarm
+WHERE tenant_id = '<tenant_id>'::uuid
+  AND acknowledged = false
+ORDER BY start_ts DESC LIMIT 10;
+```
+
+#### `/api/energy/alarms` → `SiteAlarmListController.alarms:153`
+
+另一套实现，走 TB `AlarmService.findAlarmDataByQueryForEntities`，按 SITE/CUSTOMER/TENANT 三级判定，
+originator 集合来自场站子树 BFS。
+
+**关键 SQL（场站子树）**
+
+```sql
+-- 某场站子树下的全部设备（供告警筛选）
+WITH RECURSIVE tree AS (
+  SELECT id FROM asset WHERE id = '<site_asset_id>'::uuid
+  UNION ALL
+  SELECT r.to_id FROM relation r JOIN tree t ON r.from_id = t.id
+  WHERE r.relation_type IN ('Contains','SiteContains') AND r.to_type = 'ASSET'
+)
+SELECT d.id, d.name
+FROM device d
+WHERE d.id IN (
+  SELECT r.to_id FROM relation r JOIN tree t ON r.from_id = t.id
+  WHERE r.to_type = 'DEVICE' AND r.relation_type IN ('Contains','SiteContains')
+);
+```
+
+#### 其余 5 个
+
+| 接口 | 作用 | 存储 |
+| --- | --- | --- |
+| `/alarm-events/clear` | 清除告警 | 走 TB `AlarmService.clearAlarm` |
+| `/alarm-events/assign` | 指派处理人 | `alarm.assignee_id` + `assign_ts` |
+| `/alarm-events/assignees` | 可指派人员清单 | `tb_user` + 租户/客户归属 |
+| `/alarm-events/sites` | 场站下拉 | `asset.type='场站'` |
+| `/alarm-rules` | 客户自建规则 CRUD | `alarm_rule` 表 |
+
+**自建规则的 SQL**
+
+```sql
+-- 客户自建告警规则（当前 0 条）
+SELECT r.name, r.alarm_type, r.severity, r.enabled,
+       r.site_ids, r.profile_ids,          -- ★ 是数组，不是 site_id / device_id
+       r.ts_key, r.direction, r.threshold, r.interval_secs, r.times
+FROM alarm_rule r
+WHERE r.tenant_id = '<tenant_id>'::uuid
+ORDER BY r.created_time DESC;
+
+-- 规则的运行状态
+SELECT s.rule_id, s.device_id, s.streak, s.active,
+       s.alarm_id, s.last_value, s.last_check
+FROM alarm_rule_state s ORDER BY s.last_check DESC NULLS LAST;
+```
+
+---
+
+### 3.3 抄表功能（5 个接口）
+
+#### `/api/energy/meter-reading/run` → `run:229`
+
+**伪代码**
+
+```text
+period = body.period ?: 当前月 'yyyy-MM'; dryRun/pull = false
+pullWaitMs = clamp(body.pullWaitMs ?: 15000, 0, 120000)
+meters = 候选设备（排除虚拟/网关/无权限）
+
+if !dryRun: batchId = 建 batch(status='running')
+if pull && meters 非空:
+    freshAfter = 下发时刻 - 2 分钟
+    online = 最近 10 分钟有数据的设备
+    逐台下发 RPC 'readMeterNow'
+    轮询 400ms 直到到齐或超时 pullWaitMs
+
+for dev in meters:
+    attrs   = SERVER_SCOPE（倍率等）
+    latest  = findLatest(dev, 'energy_reading')                   // 单点
+    if latest 为空            → state='missing'
+    else if latest.ts < freshAfter → state='stale'（记录离线时长）
+    else 基线 = 最近一条有效 meter_reading_record，否则设备属性 lastReading
+         if 基线为空          → state='first' 并建基线
+         else usage = (curr - baseline) × 倍率
+              负增量 → 跳过并记入 backwardSegments
+if !dryRun: 更新 batch 统计
+return { batchId, total, normal, missing, abnormal, items }
+```
+
+**关键 SQL**
+
+```sql
+-- ① 候选电表（排除网关和虚拟设备）
+SELECT d.id, d.name, d.additional_info::jsonb->>'siteId' AS site_id
+FROM device d
+WHERE d.tenant_id = '<tenant_id>'::uuid
+  AND coalesce(d.additional_info::jsonb->>'gateway','false') <> 'true';
+
+-- ② 每台设备最近的抄表基线（代码里的取法）
+SELECT DISTINCT ON (device_id)
+       device_name, curr_reading, quality,
+       to_char(to_timestamp(reading_time/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS read_at
+FROM meter_reading_record
+WHERE tenant_id = '<tenant_id>'::uuid
+  AND curr_reading IS NOT NULL
+  AND coalesce(quality,'') <> 'abnormal'
+ORDER BY device_id, reading_time DESC;
+
+-- ③ 本月抄表明细
+SELECT device_name, period, prev_reading, curr_reading, usage, ratio, quality,
+       to_char(to_timestamp(reading_time/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS read_at
+FROM meter_reading_record
+WHERE tenant_id = '<tenant_id>'::uuid AND period = '2026-11'
+ORDER BY device_name, reading_time;
+```
+
+实测 ② 输出：
+
+```
+PowerMeter-3P-SIM   reading=13965.1750  quality=normal  time=11-02 15:43
+正泰单相电表 DDSU666  reading=8.4100      quality=normal  time=11-02 17:42
+```
+
+> ⚠️ `reading_time` 是 **bigint 毫秒**，不能直接 `to_char`，必须
+> `to_timestamp(reading_time/1000)`。
+> 另外 `item.readingTime` 写的是**抄表时刻 now**，不是遥测 ts —— 两个概念别混。
+
+#### 其余 4 个
+
+| 接口 | 作用 | 关键表 |
+| --- | --- | --- |
+| `/meter-reading/batches` | 抄表批次列表 | `meter_reading_batch` |
+| `/meter-reading/records` | 批次内明细 | `meter_reading_record` |
+| `/meter-reading/retry` | 重试失败项 | 同上 + 重新下发 RPC |
+| `/meter-reading/run-plan` | 定时计划 | `scheduler_event` |
+
+```sql
+-- 批次概览
+SELECT id, status, period, total, normal_count, missing_count, abnormal_count,
+       to_char(to_timestamp(created_time/1000) AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS created
+FROM meter_reading_batch
+WHERE tenant_id = '<tenant_id>'::uuid
+ORDER BY created_time DESC LIMIT 10;
+```
+
+---
+
+### 3.4 用能账单（3 个接口）
+
+#### `/api/energy/billing/generate` → `EnergyBillingController.generate:73`
+
+**伪代码**
+
+```text
+period = body.period ?: null; dryRun = body.dryRun ?: false
+if 客户用户:
+    onlyCustomer = 自己的 customerId; 空 → 400
+else:
+    onlyCustomer = body.customerId ?: null
+
+out = billingService.generate(tenant, period, onlyCustomer, onlyDevices, dryRun)
+  逐台设备：
+    无 meterTrust 参与 / 无 energyTypeCode / 无客户归属 / 无匹配电价 / 电价生效日晚于账期 → skip
+    billOne() → usable=false → skip
+    dryRun ? 只计数 : upsertBill()（写成 energy_bill 资产）
+
+return { scope, deviceCount, created, updated, skipped }
+```
+
+**关键 SQL**
+
+```sql
+-- 账单列表（★ 金额存在 str_v，不是 dbl_v）
+SELECT a.name AS billing_no,
+       max(CASE WHEN kd.key='period'   THEN ak.str_v END) AS period,
+       max(CASE WHEN kd.key='energy'   THEN ak.str_v END) AS energy,
+       max(CASE WHEN kd.key='status'   THEN ak.str_v END) AS status,
+       max(CASE WHEN kd.key='usage'    THEN coalesce(ak.dbl_v::text, ak.str_v) END) AS usage,
+       max(CASE WHEN kd.key='amount'   THEN coalesce(ak.dbl_v::text, ak.str_v) END) AS amount,
+       max(CASE WHEN kd.key='deviceName' THEN ak.str_v END) AS device
+FROM asset a
+LEFT JOIN attribute_kv ak ON ak.entity_id = a.id AND ak.attribute_type = 2
+LEFT JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+WHERE a.type = 'energy_bill'
+  AND a.tenant_id = '<tenant_id>'::uuid
+GROUP BY a.id, a.name
+ORDER BY a.name DESC
+LIMIT 10;
+```
+
+实测输出（金额 `3950.73` 等）：
+
+```
+BILL-7CE48900-2026-10-elec-7E9434D0   status=draft  amount=3950.73
+BILL-7CE48900-2026-10-elec-7EF03780   status=draft  amount=1258.32
+```
+
+> ⚠️ **这是最容易踩的坑**：`centsToYuan()` 返回 **String**，进库走 `str_v`。
+> 而 `meterLevel` 是数字走 `dbl_v`，`details` 走 `json_v`。
+> 所以读金额必须 `coalesce(ak.dbl_v::text, ak.str_v)`，只读 `dbl_v` 会全是 NULL。
+
+**用量怎么算（不是 sum(energy)）**
+
+```text
+readUsage:
+    取 energy_reading 的**小时 MAX 序列**
+    usage = (末点 - 首点) × 倍率(CT/PT/meterRatio，仅 ratioApplied 为真时生效)
+    负增量 → 记入 backwardSegments 并跳过
+```
+
+**金额构成**
+
+```text
+amount = energyFee + powerFactorFee + basicFee + surchargeFee
+  TOU   : Σ usage[档位] × prices[档位]
+  阶梯  : tierFeeCents(usage.total, tiers)
+  单一制: usage.total × fixedPrice
+  力调  : 仅 meterLevel==1，PF 均值 vs 基准 0.9，按 rules 档位
+  基本  : meterLevel==1，demand（15 分钟最大平均）或 capacity
+```
+
+#### `/api/energy/billing/crosstab` → `EnergyAnalysisController.billingCrosstab()`
+
+交叉表：行=维度，列=期间。走 `ts_kv` 区间查询后聚合。
+
+#### `/api/energy/billing/delete` → 按 id 删 `energy_bill` 资产
+
+```sql
+-- 找出某账期的账单（删除前确认范围）
+SELECT a.id, a.name, a.customer_id
+FROM asset a
+WHERE a.type = 'energy_bill'
+  AND a.name LIKE 'BILL-%2026-10%'
+  AND a.tenant_id = '<tenant_id>'::uuid;
+```
+
+---
+
+### 3.5 手工填报（4 个接口）
+
+**存储口径**（实测确认）：
+
+```
+数值   → ts_kv 的 'energy' 键，写在该月 1 日 00:00（东八区）
+归属   → 设备 SERVER_SCOPE 属性 manualEntryItemId + Contains 关系
+快照   → 设备属性 manualEntryMonths
+年口径 → 资产属性 manualYearValueType
+```
+
+**伪代码（save）**
+
+```text
+校验类目、场站、期间
+数值 → 写 ts_kv(energy, 月首 00:00 Asia/Shanghai)
+归属 → 写设备 SERVER_SCOPE manualEntryItemId
+快照 → 更新 manualEntryMonths
+```
+
+**关键 SQL**
+
+```sql
+-- 手工填报写入的月度值
+SELECT d.name AS device,
+       to_char(to_timestamp(kv.ts/1000) AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD') AS month_start,
+       kv.dbl_v AS energy
+FROM ts_kv kv
+JOIN key_dictionary kd ON kd.key_id = kv.key
+JOIN device d ON d.id = kv.entity_id
+WHERE kd.key = 'energy'
+  AND d.tenant_id = '<tenant_id>'::uuid
+  AND d.name LIKE '%手工%'
+ORDER BY kv.ts DESC LIMIT 20;
+```
+
+### 3.6 其余页面接口速查
+
+| 页面 | 接口 | 存哪 / 算什么 |
+| --- | --- | --- |
+| 能耗概览 | `diagnosis/brief` 等 | `ts_kv` 区间 + 资产汇总 |
+| 峰谷分析 | `tou-analysis` | `ts_kv` + `tou_scheme` 资产分档 |
+| 闲时能耗 | `idle-analysis` / `idle-config` | 闲时区间 `ts_kv` + `idleConfig` 属性 |
+| 负载预测 | `forecast/predict` / `forecast/context` | 历史 `ts_kv` 序列 |
+| 用能质量 | `diagnosis/*` | `ts_kv` 电压/电流/功率因数 + 计算字段 |
+| 设备运维 | `device-config` / `device-profiles/meta` | `device` + `device_profile` SERVER_SCOPE |
+| 设备分组 | `topologies` / `child-relations` | `asset` + `relation` |
+| 盘查报告 | `audit-report/versions` | `audit_report_version` **资产** + SERVER_SCOPE |
+| 节能记录 | 无独有接口 | `saving_record` **资产** |
+| 空调管理 | 无独有接口 | 复用基础设施 |
+
+**盘查报告口径存储的 SQL**
+
+```sql
+SELECT a.name AS version,
+       max(CASE WHEN kd.key='dimension'    THEN ak.json_v::text END) AS dimension,
+       max(CASE WHEN kd.key='factors'      THEN ak.json_v::text END) AS factors,
+       max(CASE WHEN kd.key='prices'       THEN ak.json_v::text END) AS prices,
+       max(CASE WHEN kd.key='completeness' THEN ak.dbl_v::text END)  AS completeness
+FROM asset a
+LEFT JOIN attribute_kv ak ON ak.entity_id = a.id AND ak.attribute_type = 2
+LEFT JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+WHERE a.type = 'audit_report_version'
+  AND a.tenant_id = '<tenant_id>'::uuid
+GROUP BY a.id, a.name
+ORDER BY a.name DESC;
+```
+
+> 盘查报告存的是**口径元数据**（边界/因子/价格/完整率），不是 PDF。
+> 这正是它不能被 TB 报表引擎替代的原因 —— 报表只存文件与模板。
+
+## 四、逐页链路卡（看板 → 部件）
+
 
 
 ### 能耗概览
@@ -819,35 +1734,43 @@ TB 原生接口
         asset, relation（场站可见性）
 ```
 
-## 三、四个「基础设施接口」——先搞懂它们，一半页面就通了
+## 五、⭐ 告警只有**两套**机制（不是三套）
 
-实测统计：这 4 个接口被 10 个以上页面共用。它们不是业务逻辑，是公共前置。
-
-| 接口 | 用在几个页面 | Controller | 干什么 |
-| --- | --- | --- | --- |
-| `/api/energy/visible-sites` | 18 | EnergyRatePolicyController | 当前用户能看到哪些场站（客户权限过滤） |
-| `/api/energy/metric-params` | 13 | EnergyMetricParamController | 指标参数定义（单位/小数位/口径） |
-| `/api/energy/time-anchor` | 12 | EnergyTimeAnchorController | 时间窗的「今天」基准日 |
-| `/api/energy/meters` | 10 | EnergyMeterReadingController | 电表清单（含档案与关系） |
-
-> **理解顺序建议**：先读 visible-sites（权限），再读 metric-params（口径），
-> 再读 time-anchor（时间窗）。这三个懂了，剩下的页面只是「过滤 + 渲染」。
-
-## 四、⭐ 告警有三套机制并存（最容易搞混）
+> 这里纠正过一版错误说法。之前写「三套」，其中「设备档案告警」是误判：
+> `device_profile.profile_data.alarms` **实测 0 个非空**，那只是 TB 的默认空字段。
+>
+> ```sql
+SELECT count(*) FROM device_profile
+WHERE (profile_data->'alarms') IS NOT NULL
+  AND (profile_data->'alarms')::text <> 'null';   -- 实测 0 ```
 
 | 机制 | 存在哪 | 当前数量 | 谁评估 | 产出 |
 | --- | --- | --- | --- | --- |
-| ① 设备档案告警规则 | `device_profile.profile_data` 的 `alarms` | 15 个档案 | **TB 原生**（规则链/CF） | TB 原生 alarm |
-| ② 计算字段告警 | `calculated_field` 表，`type=ALARM` | 7 条 | **TB 原生** CF 引擎 | TB 原生 alarm |
-| ③ 客户自建规则 | `alarm_rule` 表（当前 0 行） | 0 条 | **自研** `AlarmRuleEngine`（定时 30s） | TB 原生 alarm |
+| ① 计算字段告警 | `calculated_field` type=ALARM，挂 DEVICE_PROFILE | **7 条** | TB 原生 CF 引擎 | TB 原生 alarm |
+| ② 客户自建规则 | `alarm_rule` / `alarm_rule_state` 表 | **0 条** | 自研 `AlarmRuleEngine`（30s 轮询） | TB 原生 alarm |
 
-三套都最终产出 **TB 原生 alarm**，所以确认/通知/看板/TTL 清理都照旧。
+两套最终都写 **`alarm` 表**（8,638 条），所以确认 / 清除 / 通知 / 看板 / TTL 清理全部统一。
 
-> 第 ③ 套就是「客户用户可以根据自身情况创建告警规则」的实现，
-> 见 `AlarmRuleCrudController` 类注释。现在 0 行说明还没有客户建过规则。
-> 当前 8,638 条告警中，8,593 条来自「功率因数偏低」——属于第 ①/② 套。
+**第 ① 套由 `AlarmRuleController` 直接对 `calculated_field` 做 CRUD** ——
+它 import 的就是 `com.guard.server.common.data.cf.CalculatedField`，
+不是独立的「告警规则表」。
 
-## 五、⚠️ 表名对得上，但数据不在那
+**第 ② 套就是「客户用户可以根据自身情况创建告警规则」的实现**，
+见 `AlarmRuleCrudController` 类注释。现在 0 行说明还没有客户建过规则。
+
+当前 8,638 条告警的构成：
+
+```sql
+SELECT type, count(*) FROM alarm GROUP BY type ORDER BY count(*) DESC;
+```
+
+```
+功率因数偏低        8593
+电压越限              33
+电压不平衡度超限        12
+```
+
+## 六、⚠️ 表名对得上，但数据不在那
 
 这是最容易误导人的地方。三种情况要分清：
 
@@ -865,7 +1788,7 @@ TB 原生接口
 >
 > **判据**：查数据前先 `SELECT count(*)`，别假设表名对就有数据。
 
-## 六、关键表速查
+## 七、关键表速查
 
 | 你要查什么 | 查哪 |
 | --- | --- |
@@ -913,7 +1836,7 @@ BILL-7CE48900-2026-10-elec-7E9434D0   energy       elec
 >   写 `= 'SERVER_SCOPE'` 会报 `invalid input syntax for type integer`。
 > - 数值列叫 `dbl_v`，不是 `double_v`。
 
-## 七、怎么重新生成这份索引
+## 八、怎么重新生成这份索引
 
 这份文档的全部数据都是脚本提取的，**改了看板或代码后请重跑，不要手改**。
 
