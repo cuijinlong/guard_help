@@ -1281,6 +1281,104 @@ for w in json.load(sys.stdin):
 所以用租户账号 `POST /api/widgetType` 只会建出一个**租户级副本**，
 看板根本不会用它 —— 这一点也是实测踩出来的。
 
+### 9.11 哪些部件分来源、哪些故意混算
+
+排查口径：**凡是对多台设备/多个资产做「求和」的部件，都要能回答「虚拟表算不算进去」**。
+逐部件扫过一遍（2026-11-16），结论如下 —— 这张表就是验收清单。
+
+**A. 已按来源分开（选「实时设备」读 `_real`，选「虚拟设备」读 `_virtual`）**
+
+```
+energy_management.analysis_bar          分析条件（下拉本身 + 下发 sourceMode）
+energy_management.asset_stats_chart     分项/区域/历史能耗统计图
+energy_management.distribution_chart    能耗分布（环形图）
+energy_management.ranking_list          排名（资产模式切键 + 设备模式按来源过滤设备）
+energy_management.overview_stats        概览 KPI
+energy_management.calendar_heatmap      日历热力图（虚拟档如实提示「无逐日数据」）
+energy_management.realtime_kpi          实时 KPI 的「今日电量」（资产级 energy_total）
+```
+
+**B. 已剔除虚拟表（这些页面本来就是「实时采集分析」，虚拟表不参与）**
+
+```
+energy_management.energy_overview       综合能耗 / 能耗洞察的主指标
+energy_management.sankey_flow           能源流向
+energy_management.audit_report          盘查报告
+energy_management.power_quality         电能质量
+energy_management.saving_records         节能记录
+```
+
+剔除是 `if (ED.isVirtual(ai)) { continue; }`（判定读 `additionalInfo.deviceVirtual`）。
+所以综合能耗页显示「当前 4 台计量点」—— 38 台设备里只有 4 台非虚拟的计量设备，
+两台 VirtualMeter 不在里面。**这不是漏了，是有意的**。
+
+**C. 只读功率，虚拟表天然不参与**
+
+```
+energy_management.power_load            负荷曲线（power_total）
+energy_management.realtime_trend        实时功率趋势（power_total）
+```
+
+虚拟表是手工填报的**电量**，没有瞬时功率点，所以这两个部件取不到它的数据。
+
+**D. 故意不分开**
+
+```
+energy_management.billing_workspace     账单
+```
+
+账单必须含手工填报的用量 —— 虚拟表是真实的用能户，漏掉会让合计小于应收。
+`energy_total`（实时 + 虚拟之和）正是出账该用的口径。
+
+**怎么自己复核这张表**
+
+```sql
+-- 场站下虚拟表与实时表的占比（按年）
+SELECT a.name AS 场站,
+       sum(CASE WHEN k.key = 'energy_total_real'
+                THEN coalesce(t.dbl_v, t.long_v::double precision) ELSE 0 END) AS 实时设备,
+       sum(CASE WHEN k.key = 'energy_total_virtual'
+                THEN coalesce(t.dbl_v, t.long_v::double precision) ELSE 0 END) AS 虚拟设备
+FROM asset a
+JOIN ts_kv t ON t.entity_id = a.id
+JOIN key_dictionary k ON k.key_id = t.key
+WHERE a.type = '场站' AND k.key LIKE 'energy_total%'
+  AND a.name LIKE '%平台演示中心%'
+GROUP BY a.name ORDER BY a.name;
+```
+
+实测：
+
+```
+三相园区·平台演示中心|10240|800
+单相园区·平台演示中心|10|120
+```
+
+**页面实测（Chromium，2026-11-16）**
+
+```
+分项能耗 · 生产园区 · 实时设备 · 按月
+  Y 轴 10.2k | 图例 动力 / 照明（2 根柱，都落在 11-15）
+  排名 正泰三相 10000.00 + 雅达三相 240.00（无虚拟表）
+
+分项能耗 · 生产园区 · 虚拟设备 · 按年
+  Y 轴 800 | 档位按钮 0 个 | 时间框「2026」
+  图例 动力 / 照明 / 给排水 / 蒸汽 / 锅炉 / 其他
+  排名 只有「虚拟三相表·动力 800.00」
+
+区域能耗 · 生产园区 · 虚拟设备 · 按年
+  Y 轴 800 | 排名 只有「办公区 800.00」
+
+区域能耗 · 生产园区 · 实时设备 · 按月
+  Y 轴 10.2k | 图例 生产车间 / 锅炉房
+  排名 生产车间 10000.00 + 锅炉房 240.00（无虚拟表）
+
+页面错误（pageerror）：无
+```
+
+> **判据**：虚拟档下的排名**只能出现虚拟表的名字**。
+> 如果看到正泰/雅达，说明该部件还在读 `energy_total`（两者之和）。
+
 ## 十、出问题时的第一反应
 
 | 现象 | 先看 |
