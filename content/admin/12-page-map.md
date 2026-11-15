@@ -430,8 +430,31 @@ if 传了 siteId:
     owner = 沿父链找最近一个配了 energyRates 的组织
     if owner: result.orgRates = owner.energyRates
 
-result.customerRates = 客户默认费率
+result.customerRates = 客户级费率（**已停用**，见下）
 ```
+
+> **客户级费率已停用（2026-11-14 客户定案，2026-11-15 实测复核）**
+>
+> 业务上只有**组织级费率**一个维护入口（「组织与场站 → 选中组织 → 能源费率」）。
+> 客户级这条链路：
+> - 前端入口已移除（`customers-table-config.resolver.ts:230-249`），组件保留未删
+> - 客户自己登录改的是组织级（`org-rate.component.ts`）
+> - 组织与场站部件 0 次调用 `customer-rate`
+> - 当前库里零个客户配过（`additionalInfo` 只有 `homeDashboardId` 等）
+>
+> **但后端 `POST /energy/customer-rate` 仍在，且能真实影响账单**：
+> 实测写入 `elec = 9999 元/度` 后，把组织费率临时置空，账单从
+> 502,209.64 元变成 **1,685,246,364.66 元**（16.8 亿）；组织费率恢复后回到正常值。
+> 也就是说它是「无入口但可达」的隐藏兜底层，不是死代码。
+>
+> 排查账单金额离谱时，先查这个属性：
+>
+> ```sql
+> SELECT title, (additional_info::jsonb -> 'energyRates')::text
+> FROM customer WHERE tenant_id = '<tenant_id>'::uuid;
+> ```
+>
+> 正确答案应为空（NULL 或 `{}`）。
 
 **关键 SQL**
 
