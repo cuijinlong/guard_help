@@ -956,7 +956,7 @@ print(int(d.timestamp()*1000), int((d+datetime.timedelta(days=1)).timestamp()*10
       T1=$(TAPI "/api/energy/tou-analysis?deviceId=$TOU_DEV&granularity=day&from=$F&to=$T" \
         | jget "print(round(sum(b['total'] for b in d.get('buckets',[])),2))" 2>/dev/null)
       DBV=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc \
-        "SELECT round((max(dbl_v)-min(dbl_v))::numeric,2) FROM ts_kv t
+        "SELECT round((max(coalesce(dbl_v, long_v::double precision))-min(coalesce(dbl_v, long_v::double precision)))::numeric,2) FROM ts_kv t
          JOIN key_dictionary k ON k.key_id=t.key
          WHERE t.entity_id='$TOU_DEV'::uuid AND k.key='energy_reading'
            AND t.ts >= $F AND t.ts <= $T" 2>/dev/null | tr -d ' ')
@@ -1079,7 +1079,7 @@ if [[ -f .env ]]; then
   set -a; . ./.env 2>/dev/null; set +a
   HIER=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc "
     WITH span AS (
-        SELECT v.entity_id, max(v.dbl_v) - min(v.dbl_v) AS delta
+        SELECT v.entity_id, max(coalesce(v.dbl_v, v.long_v::double precision)) - min(coalesce(v.dbl_v, v.long_v::double precision)) AS delta
         FROM ts_kv v JOIN key_dictionary k ON k.key_id = v.key AND k.key = 'energy_reading'
         GROUP BY v.entity_id
     ),

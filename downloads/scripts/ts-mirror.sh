@@ -6,7 +6,7 @@
 #
 # 验收脚本（03/04/06/08）里写了大量直查 SQL，例如：
 #
-#   SELECT d.name, k.key, t.ts, t.dbl_v
+#   SELECT d.name, k.key, t.ts, coalesce(t.dbl_v, t.long_v::double precision) AS v
 #     FROM ts_kv t
 #     JOIN key_dictionary k ON k.key_id = t.key
 #     JOIN device d ON d.id = t.entity_id

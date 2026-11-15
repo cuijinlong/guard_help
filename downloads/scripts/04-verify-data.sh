@@ -107,7 +107,9 @@ psql_q "SELECT d.name, COALESCE(av.str_v, av.long_v::text, ''), d.type
         ORDER BY d.name" > "$WORK/level.txt" || true
 
 # 遥测：只取验算需要的键
-psql_q "SELECT d.name, k.key, t.ts, t.dbl_v FROM ts_kv t
+# ★ 值必须 coalesce(dbl_v, long_v)：TB 按值本身选列，表底是整数（如 1000）就落 long_v。
+#   只读 dbl_v 会让「整数表底」的设备整个消失（2026-11-15 实测：2 个点查 dbl_v 得 0 条）。
+psql_q "SELECT d.name, k.key, t.ts, coalesce(t.dbl_v, t.long_v::double precision) AS v FROM ts_kv t
         JOIN key_dictionary k ON k.key_id = t.key
         JOIN device d ON d.id = t.entity_id
         WHERE k.key IN (

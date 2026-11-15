@@ -309,11 +309,14 @@ SELECT count(*) AS 数据点, min(ts) AS 最早, max(ts) AS 最新
 FROM ts_kv WHERE entity_id IN (SELECT id FROM device WHERE customer_id = '<CID>');
 
 -- 最近 24 小时的遥测（抽查上报是否正常）
-SELECT to_timestamp(ts/1000) AS 时间, key, dbl_v AS 值
-FROM ts_kv
-WHERE entity_id IN (SELECT id FROM device WHERE customer_id = '<CID>')
-  AND key = 'energy' AND ts > (extract(epoch from now()) - 86400) * 1000
-ORDER BY ts DESC LIMIT 20;
+-- ★ k.key 必须走字典 JOIN：ts_kv.key 是整数外键，直接比字符串会报类型错。
+-- ★ 值 coalesce(dbl_v, long_v)：整数表底落 long_v，只读 dbl_v 会查成空。
+SELECT to_timestamp(t.ts/1000) AS 时间, k.key, coalesce(t.dbl_v, t.long_v::double precision) AS 值
+FROM ts_kv t
+JOIN key_dictionary k ON k.key_id = t.key
+WHERE t.entity_id IN (SELECT id FROM device WHERE customer_id = '<CID>')
+  AND k.key = 'energy_reading' AND t.ts > (extract(epoch from now()) - 86400) * 1000
+ORDER BY t.ts DESC LIMIT 20;
 
 -- Cassandra 直查（不依赖镜像）：分区索引行数，粗看有没有数据
 -- docker exec energy-cassandra cqlsh -e "SELECT count(*) FROM thingsboard.ts_kv_partitions_cf

@@ -528,8 +528,9 @@ print(round(tot,2), round(sum(agg.values()),2), (d.get('scheme') or '-'))" 2>/de
     # 报表按「小时 MAX」聚合，末值取的是该小时最大值；库这里也必须取所有点的 max，
     # 否则会被真实存在的小时内上报拉开差距（实测差 0.5 kWh）。
     # 第 3 节注入的是 energy / power_total / voltage_a，不含 energy_reading，不会污染这里。
+    # ★ coalesce(dbl_v, long_v)：TB 按值选列，整数表底落 long_v；只读 dbl_v 会漏成 0。
     DBV=$(docker compose exec -T postgres psql -U "${DB_USER:-postgres}" -d "${DB_NAME:-thingsboard}" -tAc \
-      "SELECT round((max(dbl_v) - min(dbl_v))::numeric,2) FROM ts_kv t
+      "SELECT round((max(coalesce(dbl_v, long_v::double precision)) - min(coalesce(dbl_v, long_v::double precision)))::numeric,2) FROM ts_kv t
        JOIN key_dictionary k ON k.key_id=t.key
        JOIN device d ON d.id=t.entity_id
        WHERE d.id='$DEMO_ID'::uuid AND k.key='energy_reading' AND t.ts >= $FROM AND t.ts <= $TO" 2>/dev/null | tr -d ' ')

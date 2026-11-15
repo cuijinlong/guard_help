@@ -520,7 +520,146 @@ git add tools/baseline/ && git commit -m '口径变更：<说明>，基线同步
 
 ---
 
-## 八、出问题时的第一反应
+## 八、清空重测：从零核对每个数字
+
+调统计口径时，最麻烦的不是“算错”，而是**分不清这个数是这次改对了、还是上一轮留下的**。
+这一节把“清空 → 灌已知数据 → 核对”变成可重复的三步。
+
+### 为什么不能直接清库
+
+实测（2026-11-15）：现场 RTU **每 3 秒上报一轮**。只清库不停上报，
+清完 30 秒又有一千多条数据——“库里只有我灌的 2 条”这个前提根本不成立，
+于是没法手算、也就没法判断对错。
+
+更隐蔽的是：RTU 走 **MQTT 网关模式**（`v1/gateway/telemetry`），
+鉴权用的是**网关**的令牌。只改子设备令牌，数据照样进来 ——
+子设备令牌在这条路径上不参与鉴权。这一点是实测踩出来的，
+第一版只暂停子设备，验证时发现还在写。
+
+所以顺序必须是：**先暂停上报，再清库**。
+
+### 三步走
+
+```bash
+cd ~/energy-app
+
+# ① 暂停真实设备上报（令牌轮换，不动硬件、不断网）
+bash scripts/48-pause-rtu-reporting.sh --list     # 先看谁在上报
+bash scripts/48-pause-rtu-reporting.sh --pause    # 暂停（自动带上网关）
+
+# ② 清空该客户的演示数据（保留客户/设备/组织/看板）
+bash scripts/47-reset-customer-data.sh --customer '平台演示中心' --dry-run
+bash scripts/47-reset-customer-data.sh --customer '平台演示中心' --yes
+
+# ③ 灌 1~2 条已知数据（跨小时，否则差分不成立）
+python3 tools/post-exact-sample.py --device 'PowerMeter-DDSU666' \
+  --at 2026-11-15T10:00 --reading 1000 --next-reading 1010
+
+# 核对：用量应为 10
+# （见下方 SQL）
+
+# ④ 恢复真实上报
+bash scripts/48-pause-rtu-reporting.sh --resume
+```
+
+### 两个脚本的边界
+
+| 脚本 | 做什么 | 不做什么 |
+| --- | --- | --- |
+| `47-reset-customer-data.sh` | 清遥测/抄表/账单/告警/诊断/抄表基线 | 不删客户、设备、组织、看板、字典、费率 |
+| `48-pause-rtu-reporting.sh` | 轮换令牌暂停上报，`--resume` 原样恢复 | 不动硬件、不断网、不改网络配置 |
+
+`47` 的安全机制（每次都会跑，不是可选）：
+
+- 删前删后各取一次“非目标客户”的实体指纹（数量 + id md5），必须逐位相同；
+- 遥测总数必须满足「删后 = 删前 − 实删」；
+- 不清零就退出码 2，不会静默通过。
+
+### 为什么必须清“抄表基线”
+
+抄表把上次读数存在**设备属性** `lastReading` 里，不在遥测里。
+只清 `ts_kv` 不清基线，下一轮会拿旧基线（例如 12970）去减新种子值（例如 100）
+→ 判「表底倒走」→ `quality=abnormal`、用量为空。
+**症状看起来像统计坏了，实际是基线没清。**
+
+### 实测结果（可作对照）
+
+灌 2 条：`10:00 Ep=1000`、`11:00 Ep=1010`。
+
+```
+设备层   energy_reading: 1000 → 1010
+用量     10.0000（倒走 0 段）
+资产层   12 个维度（场站/区域/分项/组织/能耗类型）energy_total 全部 = 10.0000
+```
+
+12 个维度**各自等于 10**，不是 10×12 —— 说明汇总没有重复计电。
+
+### ⚠️ 一个会让数字凭空消失的坑：`dbl_v` 与 `long_v`
+
+时间序列的值在 `ts_kv` 里**分列存储**，TB 按值本身选列：
+
+| 上报的值 | 落在哪列 |
+| --- | --- |
+| `1010.5`（带小数） | `dbl_v` |
+| `1010`（整数） | **`long_v`** |
+
+所以 `SELECT ... max(t.dbl_v)` 对**整数表底的设备**会返回空。
+实测：某设备 2 个点，只查 `dbl_v` 得 **0 条**，加 coalesce 得 **2 条**。
+
+正确写法：
+
+```text
+coalesce(t.dbl_v, t.long_v::double precision)
+```
+
+> **这坑影响了哪些脚本**（2026-11-15 已全部修复）：
+> `04-verify-data.sh`、`06-verify-e2e.sh`、
+> `08-verify-release.sh`（两处）、`09-onboard-customer.sh`、
+> `tools/baseline-snapshot.mjs`。
+>
+> 后端 Java 不受影响 —— TB 的 `TsKvEntry.getDoubleValue()` 内部兼容两列。
+> 只有**直查 SQL 的脚本**会中招。
+
+这和铁律 E1 里「查属性不能只查一列」是同一类错误，只是从 `attribute_kv` 搬到了 `ts_kv`。
+
+### 核对 SQL
+
+```sql
+WITH hourly AS (
+  SELECT date_trunc('hour', to_timestamp(ts/1000)) AS h,
+         max(coalesce(dbl_v, long_v::double precision)) AS v
+  FROM ts_kv t JOIN key_dictionary k ON k.key_id = t.key
+  WHERE k.key = 'energy_reading'
+    AND t.entity_id = '<设备id>'
+    AND coalesce(dbl_v, long_v::double precision) IS NOT NULL
+  GROUP BY 1
+), diffed AS (
+  SELECT h, v - lag(v) OVER (ORDER BY h) AS d FROM hourly
+)
+SELECT round(sum(CASE WHEN d > 0 THEN d ELSE 0 END)::numeric, 4) AS usage,
+       count(*) FILTER (WHERE d < 0) AS backward_segments,
+       count(*) FILTER (WHERE d IS NOT NULL) AS segments
+FROM diffed WHERE d IS NOT NULL;
+```
+
+期望：`usage = 10.0000`、`backward_segments = 0`、`segments = 1`。
+
+### 资产汇总要手动触发一次
+
+设备数据不会自动流到资产维度（`energy_total` 是另写的汇总）。
+灌完数据后调一次：
+
+```bash
+curl -X POST "$BASE/api/energy/asset-totals/rebuild" \
+  -H "X-Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"customerId":"<客户id>","days":30}'
+```
+
+返回 `{"ok":true,"assetsWritten":12,...}`。然后再查资产 `energy_total` 是否为 10。
+
+---
+
+## 九、出问题时的第一反应
 
 | 现象 | 先看 |
 | --- | --- |
