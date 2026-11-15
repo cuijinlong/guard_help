@@ -538,29 +538,84 @@ git add tools/baseline/ && git commit -m '口径变更：<说明>，基线同步
 
 所以顺序必须是：**先暂停上报，再清库**。
 
-### 三步走
+### 一条命令：`rehearse-meters.py`
+
+现在不用手工拼四步。这个脚本一次做完：清历史 → 每块表发 2 条 → 填报虚拟表
+→ 重建汇总 → 打印对账清单 → 回读验证。
+
+> **两个脚本在不同目录跑**，因为依赖不同：
+> `47/48` 读 `.env` 找数据库 → 在**部署目录**；
+> `rehearse-meters.py` 要读型号定义 `vendor_models.json` → 在**仓库根**。
+> 写错目录会报「找不到设备」或「缺少 .env」。
 
 ```bash
+# ── ① 暂停真实设备上报（部署目录，否则每 3 秒的实时数据会混进来）
 cd ~/energy-app
+bash scripts/48-pause-rtu-reporting.sh --pause
 
-# ① 暂停真实设备上报（令牌轮换，不动硬件、不断网）
-bash scripts/48-pause-rtu-reporting.sh --list     # 先看谁在上报
-bash scripts/48-pause-rtu-reporting.sh --pause    # 暂停（自动带上网关）
+# ── ②③ 对账演练（仓库根）
+cd /path/to/iot-rule-engine
 
-# ② 清空该客户的演示数据（保留客户/设备/组织/看板）
-bash scripts/47-reset-customer-data.sh --customer '平台演示中心' --dry-run
-bash scripts/47-reset-customer-data.sh --customer '平台演示中心' --yes
+python3 tools/rehearse-meters.py --date 2026-11-15 --dry-run        # 只看清单
+python3 tools/rehearse-meters.py --date 2026-11-15 --clean true     # 清空→发数→验证
 
-# ③ 灌 1~2 条已知数据（跨小时，否则差分不成立）
-python3 tools/post-exact-sample.py --device 'PowerMeter-DDSU666' \
-  --at 2026-11-15T10:00 --reading 1000 --next-reading 1010
-
-# 核对：用量应为 10
-# （见下方 SQL）
-
-# ④ 恢复真实上报
+# ── ④ 测完恢复真实上报（部署目录）
+cd ~/energy-app
 bash scripts/48-pause-rtu-reporting.sh --resume
 ```
+
+`rehearse-meters.py` 用 `docker exec energy-postgres psql` 直连数据库清数据，
+所以**不需要 `.env`**；但它要读型号定义才能知道「该发哪些厂家代号」，
+那份文件在仓库里，所以必须在仓库根执行。
+
+参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--date YYYY-MM-DD` | 数据日期。**柱状图横轴选这一天**，只显示这一次的数据 |
+| `--at HH:MM` | 第一个时间点（默认 10:00） |
+| `--hours N` | 两点间隔小时（默认 1），第二个点因此是 11:00 |
+| `--clean true` | 清该客户全部设备遥测 + 资产汇总 + 抄表记录 + 抄表基线 |
+| `--clean meters-only` | 只清几块电表，不动其他设备 |
+| `--clean false` | 追加，不清 |
+| `--continue` | 接续库里最新表底（验证抄表用量时用） |
+| `--virtual true\|false` | 是否同时填报虚拟表（默认 true） |
+| `--dry-run` | 只打印计划与期望值 |
+
+### 每块表只发 2 条，为什么
+
+用量 = 相邻两个表底的差 × 倍率。**2 条 = 1 个差分区间 = 1 个用量值**，
+每个数字都能手算。3 条以上会拆出多个区间，反而要分辨「哪个区间归哪个时段」。
+
+时段归属是「用量记在**后一个点**所在时段」。第二个点定在 11:00 ——
+这个时刻在冬季工作日方案（08-11 平 / 11-13 峰）和周末方案里**都是峰**，
+所以峰一定有数、平/尖/谷为 0，不会出现「一半在峰一半在平」需要猜。
+
+### 5 台设备分别挂在不同维度，柱子才有层次
+
+分项能耗页、区域能耗页的柱子高度 = 该节点下所有表的合计。
+若两台表挂在同一个分项下，它们会被合并成一根柱子，看不出谁贡献多少。
+所以 5 台表**一个分项只放一台、一个区域只放一台、一个能耗类型只放一台**：
+
+```
+生产园区  动力分项 / 生产车间区域 / 生产用能   正泰三相 DTSD3366D   10000
+          照明分项 / 锅炉房区域 / 公共用能     雅达三相 YDPQ200-A      240
+          给排水分项 / 办公区区域 / 办公用能   虚拟三相                800
+办公园区  照明分项 / A栋办公区区域 / 办公用能  正泰单相 DDSU666         10
+          插座分项 / 公共区域区域 / 公共用能   虚拟单相                120
+```
+
+重排用的脚本：
+
+```bash
+python3 tools/spread-meter-dims.py --dry-run
+python3 tools/spread-meter-dims.py
+```
+
+> **注意**：虚拟表的分项关系由**手工填报接口**决定 —— 保存时它会把设备挂到
+> 这次传的 `itemId` 下并解除旧关系。所以 `rehearse-meters.py` 里的
+> `VIRTUAL_PLAN.item` 必须与 `spread-meter-dims.py` 的分配一致，
+> 否则每跑一次演练柱子就挪一次位置，看着像「分摊随机变了」。
 
 ### 两个脚本的边界
 
@@ -584,15 +639,54 @@ bash scripts/48-pause-rtu-reporting.sh --resume
 
 ### 实测结果（可作对照）
 
-灌 2 条：`10:00 Ep=1000`、`11:00 Ep=1010`。
+三块真实表各 2 条（10:00 / 11:00），两个虚拟表各填一个月用量：
 
 ```
-设备层   energy_reading: 1000 → 1010
-用量     10.0000（倒走 0 段）
-资产层   12 个维度（场站/区域/分项/组织/能耗类型）energy_total 全部 = 10.0000
+表           表底 10:00  表底 11:00  表底差  倍率   用量 kWh
+正泰单相          1000        1010      10     1        10
+正泰三相          2000        2005       5  2000     10000
+雅达三相          3000        3006       6    40       240
+虚拟单相             —           —       —     —       120（月）
+虚拟三相             —           —       —     —       800（月）
 ```
 
-12 个维度**各自等于 10**，不是 10×12 —— 说明汇总没有重复计电。
+按「日」查看（2026-11-15）—— 只有真实表：
+
+```
+峰谷 · 生产园区    峰 10240   平 0   合计 10240
+峰谷 · 办公园区    峰    10   平 0   合计    10
+峰谷 · 总部        峰 10250         合计 10250
+```
+
+按「自然月」查看（2026-11）—— 真实表 + 虚拟表：
+
+```
+场站 · 三相园区    10240 + 800 = 11040
+场站 · 单相园区       10 + 120 =   130
+场站 · 总部        10250 + 920 = 11170
+峰谷 · 总部        峰 10250   平 920（虚拟表无小时分布，全归平档）
+```
+
+三个维度各 5 根柱子（值相同，只是切法不同）：
+
+```
+10000 / 800 / 240 / 120 / 10
+```
+
+> **判据**：如果某个维度只有 2~3 根柱子，或某根柱子是两根表之和（例如 10800），
+> 说明设备还挂在同一个节点下 —— 跑 `spread-meter-dims.py` 重排。
+
+### 两个必须分开看的时间点
+
+上面的对账表里出现两种时间点，它们**不是重复计数**：
+
+| 时间点 | 来源 | 含义 |
+| --- | --- | --- |
+| `11-01 00:00` | 虚拟表 | 整月用量（月粒度） |
+| `11-15 11:00` | 真实表 | 当天这一小时的用量（小时粒度） |
+
+所以按「某一天」查时看不到虚拟表，按「自然月」查时两者都在。
+对账前先确认自己在哪个粒度上，否则会误判成「少了 800」。
 
 ### ⚠️ 一个会让数字凭空消失的坑：`dbl_v` 与 `long_v`
 
@@ -659,7 +753,368 @@ curl -X POST "$BASE/api/energy/asset-totals/rebuild" \
 
 ---
 
-## 九、出问题时的第一反应
+## 九、逐功能对账 SQL（复制即用）
+
+这一节的 SQL 回答一个问题：**页面上那个数字，库里到底是多少。**
+全部实测跑通 —— `check-docs.py` 会逐条执行，跑不通就算文档错误。
+
+在部署目录里这样调用（`-f -` 从标准输入读）：
+
+```bash
+cd ~/energy-app
+docker compose exec -T postgres psql -U postgres -d thingsboard -v ON_ERROR_STOP=1 < 查询.sql
+```
+
+或者交互式进去粘贴：
+
+```bash
+docker compose exec postgres psql -U postgres -d thingsboard
+```
+
+> **两条铁律，先记住再看 SQL**
+> 1. 值分列存储：小数在 `dbl_v`，**整数在 `long_v`**。所有取值一律
+>    `coalesce(t.dbl_v, t.long_v::double precision)`，只查 `dbl_v` 会把整数表底整个漏掉。
+> 2. `ts_kv.key` 是**整数外键**，必须 `JOIN key_dictionary k ON k.key_id = t.key`
+>    （字典表列是 `key` / `key_id`，没有 `id`）。
+
+### 9.1 设备层：表底与派生用量
+
+对账对象：抄表页的「当前表底」、峰谷分析的「用量」。
+
+```sql
+SELECT d.name AS 设备,
+       k.key AS 指标,
+       to_timestamp(t.ts/1000)::timestamp(0) AS 时间,
+       coalesce(t.dbl_v, t.long_v::double precision) AS 值
+FROM ts_kv t
+JOIN key_dictionary k ON k.key_id = t.key
+JOIN device d ON d.id = t.entity_id
+WHERE k.key IN ('energy_reading', 'energy')
+  AND d.name IN ('PowerMeter-DDSU666', 'PowerMeter-3P-CHINT·平台演示中心',
+                 'PowerMeter-3P-YADA·平台演示中心')
+ORDER BY d.name, k.key, t.ts;
+```
+
+实测输出（`rehearse-meters.py --date 2026-11-15` 之后）：
+
+```
+设备                             指标            时间                 值
+PowerMeter-3P-CHINT·平台演示中心 energy          2026-11-15 11:00:00  10000
+PowerMeter-3P-CHINT·平台演示中心 energy_reading  2026-11-15 10:00:00  2000
+PowerMeter-3P-CHINT·平台演示中心 energy_reading  2026-11-15 11:00:00  2005
+PowerMeter-3P-YADA·平台演示中心  energy          2026-11-15 11:00:00  240
+PowerMeter-3P-YADA·平台演示中心  energy_reading  2026-11-15 10:00:00  3000
+PowerMeter-3P-YADA·平台演示中心  energy_reading  2026-11-15 11:00:00  3006
+PowerMeter-DDSU666              energy          2026-11-15 11:00:00  10
+PowerMeter-DDSU666              energy_reading  2026-11-15 10:00:00  1000
+PowerMeter-DDSU666              energy_reading  2026-11-15 11:00:00  1010
+```
+
+怎么读：
+
+- `energy_reading` 是**表底**（两次上报的差就是用量）；
+- `energy` 是**平台算出的用量**（表底差 × 倍率），由重建汇总时派生写回；
+- 上面还有第 4 个点（脚本刷新 latest 的时刻），表底与 11:00 相同 → 差为 0 →
+  **不产生 `energy` 点**。这是设计：「表底没动」不等于「用了 0」。
+
+### 9.2 场站层：三个汇总键一起看
+
+对账对象：概览页的「今日用电」、实时功率。
+
+```sql
+SELECT a.name AS 场站,
+       k.key AS 指标,
+       to_timestamp(t.ts/1000)::timestamp(0) AS 时间,
+       round(coalesce(t.dbl_v, t.long_v::double precision)::numeric, 2) AS 值
+FROM ts_kv t
+JOIN key_dictionary k ON k.key_id = t.key
+JOIN asset a ON a.id = t.entity_id
+WHERE k.key IN ('energy_total', 'energy_day', 'power_total')
+  AND a.name IN ('三相园区·平台演示中心', '单相园区·平台演示中心', '总部·平台演示中心')
+ORDER BY a.name, k.key, t.ts;
+```
+
+实测输出：
+
+```
+场站                 指标          时间                 值
+三相园区·平台演示中心 energy_day    2026-11-01 00:00:00   800.00
+三相园区·平台演示中心 energy_day    2026-11-15 11:00:00 10240.00
+三相园区·平台演示中心 energy_total  2026-11-01 00:00:00   800.00
+三相园区·平台演示中心 energy_total  2026-11-15 11:00:00 10240.00
+三相园区·平台演示中心 power_total   2026-11-15 10:00:00 10240.00
+三相园区·平台演示中心 power_total   2026-11-15 11:00:00 10240.00
+单相园区·平台演示中心 energy_day    2026-11-01 00:00:00   120.00
+单相园区·平台演示中心 energy_day    2026-11-15 11:00:00    10.00
+总部·平台演示中心     energy_day    2026-11-01 00:00:00   920.00
+总部·平台演示中心     energy_day    2026-11-15 11:00:00 10250.00
+```
+
+怎么读：
+
+- **两个时间点是两种数据**：`11-01 00:00` 是虚拟表的**月点**（整月用量），
+  `11-15 11:00` 是真实表的**日用量**。它们不是重复计数，是不同粒度；
+- `energy_day` 与 `energy_total` 在这套数据里数值相同 —— `energy_total` 是该时刻的
+  区间用量，`energy_day` 是当日累计，单日数据下两者重合；
+- `power_total` 只有真实表有（虚拟表没有瞬时功率）。
+
+### 9.3 三个维度：分项 / 区域 / 能耗类型
+
+对账对象：分项能耗页、区域能耗页、综合能耗的图例与柱高。
+
+一条 SQL 把三个维度一起列出来：
+
+```sql
+SELECT a.type AS 维度,
+       a.name AS 节点,
+       round(sum(coalesce(t.dbl_v, t.long_v::double precision))::numeric, 2) AS 合计
+FROM ts_kv t
+JOIN key_dictionary k ON k.key_id = t.key
+JOIN asset a ON a.id = t.entity_id
+WHERE k.key = 'energy_total'
+  AND a.type IN ('分项', '区域', '能耗类型')
+  AND (a.name LIKE '%生产园区%' OR a.name LIKE '%办公园区%')
+GROUP BY a.type, a.name
+ORDER BY a.type, 合计 DESC;
+```
+
+实测输出（三个维度各 5 根柱子，值完全一致）：
+
+```
+维度     节点                                  合计
+分项     动力分项·生产园区·平台演示中心        10000.00
+分项     给排水分项·生产园区·平台演示中心        800.00
+分项     照明分项·生产园区·平台演示中心          240.00
+分项     插座分项·办公园区·平台演示中心          120.00
+分项     照明分项·办公园区·平台演示中心           10.00
+区域     生产车间区域·生产园区·平台演示中心    10000.00
+区域     办公区区域·生产园区·平台演示中心        800.00
+区域     锅炉房区域·生产园区·平台演示中心        240.00
+区域     公共区域区域·办公园区·平台演示中心      120.00
+区域     A栋办公区区域·办公园区·平台演示中心      10.00
+能耗类型 生产用能能耗类型·生产园区·平台演示中心 10000.00
+能耗类型 办公用能能耗类型·生产园区·平台演示中心   800.00
+能耗类型 公共用能能耗类型·生产园区·平台演示中心   240.00
+能耗类型 公共用能能耗类型·办公园区·平台演示中心   120.00
+能耗类型 办公用能能耗类型·办公园区·平台演示中心    10.00
+```
+
+> **三个维度必须数值一致**。同一台表只能挂一个分项、一个区域、一个能耗类型，
+> 所以三个维度是同一批用电的三种切法，合计必然相同。
+> 如果某维度多出柱子、或数值翻倍，就是设备被挂了两个同类节点 ——
+> 用 9.7 的「维度唯一性」SQL 能查出来。
+
+### 9.4 峰谷：按小时差分
+
+对账对象：峰谷分析页的峰/平/尖/谷/深谷。
+
+```sql
+WITH hourly AS (
+  SELECT t.entity_id,
+         date_trunc('hour', to_timestamp(t.ts / 1000)) AS 小时,
+         max(coalesce(t.dbl_v, t.long_v::double precision)) AS 表底
+  FROM ts_kv t
+  JOIN key_dictionary k ON k.key_id = t.key
+  WHERE k.key = 'energy_reading'
+    AND coalesce(t.dbl_v, t.long_v::double precision) IS NOT NULL
+  GROUP BY 1, 2
+), diffed AS (
+  SELECT entity_id, 小时,
+         表底 - lag(表底) OVER (PARTITION BY entity_id ORDER BY 小时) AS 表底差
+  FROM hourly
+)
+SELECT to_timestamp(extract(epoch FROM 小时))::timestamp(0) AS 时段,
+       count(*) FILTER (WHERE 表底差 > 0) AS 有增量表数,
+       round(sum(表底差) FILTER (WHERE 表底差 > 0)::numeric, 2) AS 表底差合计,
+       count(*) FILTER (WHERE 表底差 < 0) AS 倒走表数
+FROM diffed
+WHERE 表底差 IS NOT NULL
+  AND entity_id IN (SELECT id FROM device WHERE name IN
+      ('PowerMeter-DDSU666', 'PowerMeter-3P-CHINT·平台演示中心',
+       'PowerMeter-3P-YADA·平台演示中心'))
+GROUP BY 1 ORDER BY 1;
+```
+
+实测输出：
+
+```
+时段                 有增量表数 表底差合计 倒走表数
+2026-11-15 11:00:00          3      21.00        0
+2026-11-16 00:00:00          0                  0
+```
+
+怎么读：
+
+- `表底差合计 21` = 10 + 5 + 6（三块表的表底差之和，**未乘倍率**）；
+- 乘倍率后才是页面上看到的：`10×1 + 5×2000 + 6×40 = 10250`；
+- 时段归属规则是「用量算在**后一个点**所在时段」。两点是 10:00 和 11:00，
+  所以整段归 11:00 —— 11:00 在冬季工作日与周末方案里都是「峰」；
+- 第二行 `有增量表数 = 0` 是刷新 latest 产生的（表底未变），不产生用量。
+
+### 9.5 抄表：基线与用量
+
+对账对象：抄表页的「上次/本次读数」「用量」「倍率」。
+
+```sql
+SELECT device_name AS 设备,
+       period AS 账期,
+       prev_reading AS 上期表底,
+       curr_reading AS 本期表底,
+       usage AS 用量,
+       ratio AS 倍率,
+       quality AS 质量,
+       source AS 来源
+FROM meter_reading_record
+WHERE period = '2026-11'
+ORDER BY created_time DESC
+LIMIT 20;
+```
+
+实测输出（首次抄表只建基线，`usage` 为空是对的）：
+
+```
+设备                     账期    上期表底 本期表底 用量    倍率    质量   来源
+正泰三相电表 DTSD3366D   2026-11          2005.0000        2000.0 normal auto
+正泰单相电表 DDSU666     2026-11          1010.0000           1.0 normal auto
+雅达三相电表 YDPQ200-A   2026-11          3006.0000          40.0 normal auto
+```
+
+> **`device_name` 存的是设备 label，不是 name**。所以这里看到「正泰三相电表 DTSD3366D」，
+> 而 `device` 表里叫 `PowerMeter-3P-CHINT·平台演示中心`。按 name 查抄表记录会查不到 ——
+> 这不是数据丢了。
+
+想验证「抄表乘倍率」，再跑一次 `--continue` 让表底前进，然后对比：
+
+```
+正泰三相：表底 2005 → 2010，差 5，× 2000 = 10000
+雅达三相：表底 3006 → 3012，差 6，× 40   = 240
+```
+
+### 9.6 虚拟表：月首一个点
+
+对账对象：手工填报页、分项能耗里的虚拟表贡献。
+
+```sql
+SELECT d.name AS 虚拟表,
+       d.additional_info::jsonb->>'deviceVirtual' AS 虚拟标记,
+       to_timestamp(t.ts/1000)::timestamp(0) AS 时间,
+       coalesce(t.dbl_v, t.long_v::double precision) AS 月用量
+FROM ts_kv t
+JOIN key_dictionary k ON k.key_id = t.key
+JOIN device d ON d.id = t.entity_id
+WHERE k.key = 'energy'
+  AND d.additional_info::jsonb->>'deviceVirtual' = 'virtual'
+ORDER BY d.name, t.ts;
+```
+
+实测输出：
+
+```
+虚拟表                 虚拟标记 时间                月用量
+VirtualMeter-1P-Socket virtual  2026-11-01 00:00:00    120
+VirtualMeter-3P-Power  virtual  2026-11-01 00:00:00    800
+```
+
+> **虚拟表是月粒度**：一个点代表整月用量。所以按「某一天」查询时它不出现，
+> 只有查询范围包含当月 1 号、或按自然月统计时才看得到。
+> 这不是缺数据，是两种粒度共存 —— 对账时必须分开看（见 9.2 的两类时间点）。
+
+### 9.7 设备挂载检查：维度唯一性与标准 key 覆盖
+
+**维度唯一性**（每台表应各挂 1 个分项 / 区域 / 能耗类型）：
+
+```sql
+SELECT d.name AS 设备,
+       count(*) FILTER (WHERE ap.name = '分项') AS 分项数,
+       count(*) FILTER (WHERE ap.name = '区域') AS 区域数,
+       count(*) FILTER (WHERE ap.name = '能耗类型') AS 类型数
+FROM device d
+JOIN relation r ON r.to_id = d.id AND r.to_type = 'DEVICE'
+JOIN asset a ON a.id = r.from_id
+JOIN asset_profile ap ON ap.id = a.asset_profile_id
+WHERE ap.name IN ('分项', '区域', '能耗类型')
+GROUP BY d.name
+HAVING count(*) > 0
+ORDER BY d.name;
+```
+
+每个数字都应为 `1`。出现 `2` 就是同一台表挂在两个同类节点下 → 图上重复计数。
+
+**标准 key 覆盖**（声明的指标是否真的落库）：
+
+```sql
+SELECT d.name AS 设备,
+       count(DISTINCT mp.key) AS 声明指标数,
+       count(DISTINCT kk.key) FILTER (WHERE t.entity_id IS NOT NULL) AS 已落库指标数
+FROM device d
+JOIN attribute_kv ak ON ak.entity_id = d.id AND ak.attribute_type = 2
+JOIN key_dictionary kd ON kd.key_id = ak.attribute_key AND kd.key = 'measurePoints'
+JOIN LATERAL (
+  SELECT jsonb_array_elements(ak.json_v::jsonb) ->> 'standardField' AS key
+) mp ON true
+LEFT JOIN key_dictionary kk ON kk.key = mp.key
+LEFT JOIN ts_kv t ON t.key = kk.key_id AND t.entity_id = d.id
+WHERE d.name IN ('PowerMeter-DDSU666', 'PowerMeter-3P-CHINT·平台演示中心',
+                 'PowerMeter-3P-YADA·平台演示中心')
+GROUP BY d.name ORDER BY d.name;
+```
+
+实测输出：
+
+```
+设备                             声明指标数 已落库指标数
+PowerMeter-3P-CHINT·平台演示中心         60           34
+PowerMeter-3P-YADA·平台演示中心          61           45
+PowerMeter-DDSU666                      60            8
+```
+
+怎么读：
+
+- `声明指标数` 来自设备的 `measurePoints`，**含通用兜底**（单相表上也带着 Ub / Ic / Pa
+  这些三相代号），所以是 60 左右；
+- `已落库指标数` 是这台表实际报上来的 —— 正好等于该型号的寄存器条数
+  （正泰三相 34、雅达 45、正泰单相 8）；
+- 两者差距正常，**不是缺数据**。要判断「该报的有没有报」，看型号寄存器条数，不看 60。
+
+### 9.8 数据新鲜度：抄表前必查
+
+抄表只认「此刻」的读数，超过 10 分钟判陈旧、不出用量。所以抄表前先看这张表：
+
+```sql
+SELECT d.name AS 设备,
+       coalesce(t.dbl_v, t.long_v::double precision) AS 最新表底,
+       to_timestamp(t.ts / 1000)::timestamp(0) AS 上报时间,
+       round((extract(epoch FROM (now() - to_timestamp(t.ts / 1000))) / 60)::numeric, 1) AS 分钟前,
+       CASE WHEN extract(epoch FROM (now() - to_timestamp(t.ts / 1000))) <= 600
+            THEN '新鲜（可抄表）' ELSE '陈旧（需先补数据）' END AS 判定
+FROM ts_kv_latest t
+JOIN key_dictionary k ON k.key_id = t.key
+JOIN device d ON d.id = t.entity_id
+WHERE k.key = 'energy_reading'
+  AND d.name IN ('PowerMeter-DDSU666', 'PowerMeter-3P-CHINT·平台演示中心',
+                 'PowerMeter-3P-YADA·平台演示中心')
+ORDER BY d.name;
+```
+
+实测输出：
+
+```
+设备                             最新表底 上报时间             分钟前 判定
+PowerMeter-3P-CHINT·平台演示中心     2005 2026-11-16 00:28:28    1.4 新鲜（可抄表）
+PowerMeter-3P-YADA·平台演示中心      3006 2026-11-16 00:28:28    1.4 新鲜（可抄表）
+PowerMeter-DDSU666                 1010 2026-11-16 00:28:28    1.4 新鲜（可抄表）
+```
+
+判「陈旧」时的补救（不改任何统计值，只把 latest 时间戳推到当下）：
+
+```bash
+# 仓库根执行
+python3 tools/rehearse-meters.py --clean false --continue
+```
+
+---
+
+## 十、出问题时的第一反应
 
 | 现象 | 先看 |
 | --- | --- |
