@@ -1183,7 +1183,60 @@ TB 原生接口
         rate_template 资产
         rate_template / tou_scheme 资产
         厂商/型号资产 + SERVER_SCOPE 属性
+关键 SQL
+        -- 本页的组织/场站识别：按档案属性 energyRole，**不能**按 a.type 或 p.name
+        -- （TB 改档案名会把新名字回写 asset.type，两者会同时失效）
+        -- org = 组织层级（可写 energyRates）；site = 场站（价格写 siteCustomRates）
+        -- 实测输出：1 组织 + 3 场站 = 4 行，与 /energy/visible-sites 一致
+        SELECT a.name, a.type, p.name AS profile_name, ak.str_v AS energy_role
+        FROM asset a
+        JOIN asset_profile p ON p.id = a.asset_profile_id
+        JOIN attribute_kv ak ON ak.entity_id = p.id
+        JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+        WHERE a.tenant_id = '<tenant_id>'::uuid
+          AND kd.key = 'energyRole' AND ak.str_v IN ('org', 'site')
+        ORDER BY ak.str_v, a.name;
 ```
+
+**权限边界（2026-11-15 修）**
+
+本页写接口全部经 `requireAccessibleSite` / `requireOrgAccessible`，两层判定：
+客户归属 + 场站组授权。旧版只有前者，实测可越权：
+
+```
+授权「单相园区」的客户账号 → 对「三相园区」
+  POST /energy/site-rate-custom   → 200 且落库（0.01 元/度）
+  POST /energy/site-rate-binding  → 200 且写入 uses 关系
+  GET  /energy/rate-policies      → 200 可读该场站费率
+修复后三条全 403；已授权场站仍 200（无误伤）。
+
+组织级费率另有限制：POST /energy/org-rate → 403
+（组织费率是整个组织下所有场站的继承源，包括未授权给该账号的）
+```
+
+**身份判定（2026-11-15 修）**
+
+组织与场站必须分开，判据是资产档案：
+
+```
+energyRole=org   → 组织层级（organizationRootProfileIds）
+energyRole=site  → 场站（siteProfileIds）
+organizationProfileIds = org ∪ site（超集，给可见性与结构树排除用）
+```
+
+接口下发的身份信息：
+
+```
+GET /energy/structure-settings  → organizationProfileIds + siteProfileIds
+GET /energy/visible-sites       → 每个 asset 带 energyIsSite: true/false
+```
+
+> **为什么不能只看 `asset.type`**：TB 改档案名会回写 `asset.type`。实测只改后端时，
+> 「组织与场站」部件的树从 4 个节点变 1 个、场站图标变组织图标 ——
+> 因为部件读的是 `/api/customer/{cid}/assets`，那条路径不带后端算好的标记，
+> 必须在部件里同时按 `siteProfileIds` 判（已改成这一点）。
+>
+> 判定口径的完整清单与踩坑记录见铁律 D15。
 
 
 ### 实时能耗（能耗查询）

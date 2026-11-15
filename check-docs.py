@@ -181,11 +181,17 @@ def count_rate_templates(_repo) -> int:
 
 
 def count_org_tabs(_repo) -> int:
-    """组织节点右侧页签数：读 sites.component.html 里 type !== '场站' 的 tab 组"""
+    """组织节点右侧页签数：读 sites.component.html 里「非场站」的 tab 组。
+
+    2026-11-15：判定从 `selectedNode.type !== '场站'` 改成 `!selectedNode.isSite` ——
+    档案改名会回写 asset.type，按 type 判会在改名后失效。
+    两种写法都接受，避免下次修判定口径时又把这层门禁弄坏。
+    """
     src = _read(REPO / 'ui-ngx' / 'src' / 'app' / 'modules' / 'home' / 'pages' / 'sites'
                 / 'sites.component.html')
-    m = re.search(r"<mat-tab-group \*ngIf=\"selectedNode\.type !== '场站'\".*?</mat-tab-group>",
-                  src, re.S)
+    m = re.search(
+        r'<mat-tab-group \*ngIf="(?:selectedNode\.type !== \'场站\'|!selectedNode\.isSite)".*?</mat-tab-group>',
+        src, re.S)
     if not m:
         raise RuntimeError('sites.component.html: 找不到组织页签组')
     return len(re.findall(r'<mat-tab[ >]', m.group(0)))
