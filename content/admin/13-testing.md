@@ -216,11 +216,15 @@ node tools/baseline-snapshot.mjs --compare tools/baseline/window-2026-09-01_2026
 ### 为什么按「窗口」命名而不是按「运行日期」
 
 固定历史窗口 `[from, to)` 内的统计值**本应是常量**。
-所以文件名由窗口决定，重跑覆盖同一文件 —— `git diff` 里出现的任何数字变化
-都意味着**统计逻辑被改动**，而不是「今天又多了几条数据」。
+所以文件名由窗口决定，而脚本在**数字没变时根本不改写文件**：
 
-这个设计是整个工具的关键。按日期命名的话，每天都是新文件，
-基线永远和今天比，任何差异都会被「数据变多了」掩盖。
+- 数字没变 → 文件一字不动 → `git diff` 为空；
+- 数字变了 → 覆盖，`git diff` 里出现的**就是变化本身**（不会混入时间戳噪声）。
+
+这个设计是整个工具的关键。如果按日期命名，每天都是新文件，
+基线永远和今天比，任何差异都会被「数据变多了」掩盖；
+如果每次都刷新 `generated_at`，则即使数字一模一样也会产生 diff，
+「看到变化就是统计被改了」这个判断就不再成立。
 
 ### 怎么判读差异
 
@@ -228,6 +232,14 @@ node tools/baseline-snapshot.mjs --compare tools/baseline/window-2026-09-01_2026
 ✗ 发现 2 处差异：
   ~ 用量变化 三相园区/PowerMeter-1: 70847.41 → 70847.41（Δ 0）
   ~ key energy_reading: 159898 行/31 台 → 160021 行/31 台
+```
+
+`--compare` 与「生成」的区别：前者只比较、不影响文件；后者在发现数字变化时
+**会先打印变化清单再覆盖**，所以你可以直接看它打印了什么：
+
+```
+! 统计值有 1 处变化，将覆盖基线（请确认都是预期改动）：
+  ~ 用量变化 AHU-SIM·平台演示中心: 99.9 → null（Δ n/a）
 ```
 
 - **用量变化**：口径被改了。先确认是不是有意改的，再决定更新基线。
@@ -240,14 +252,24 @@ node tools/baseline-snapshot.mjs --compare tools/baseline/window-2026-09-01_2026
 只验「跑得通」不够 —— 一个什么都不检查的脚本也会「跑通」。
 
 ```bash
-# ① 可重复性：连跑两次，去掉时间戳后内容必须一致
+# ① 可重复性：删掉重建两次，两次从库算出的数字必须一致
+#    （不能只重跑一次 —— 数字没变时脚本不改写文件，那样测不出东西）
 f=tools/baseline/window-2026-09-01_2026-11-01.json
-node tools/baseline-snapshot.mjs >/dev/null
-cp "$f" /tmp/snap1.json
-node tools/baseline-snapshot.mjs >/dev/null
-diff <(python3 -c "import json;d=json.load(open('/tmp/snap1.json'));d['meta'].pop('generated_at');print(json.dumps(d,sort_keys=True))") \
-     <(python3 -c "import json;d=json.load(open('$f'));d['meta'].pop('generated_at');print(json.dumps(d,sort_keys=True))") \
-  && echo '✓ 可重复'
+cp "$f" /tmp/base-orig.json
+rm -f "$f" && node tools/baseline-snapshot.mjs >/dev/null && cp "$f" /tmp/snap-a.json
+rm -f "$f" && node tools/baseline-snapshot.mjs >/dev/null && cp "$f" /tmp/snap-b.json
+python3 -c "
+import json
+def s(p):
+    d=json.load(open(p)); d.pop('meta',None); return d
+print('✓ 可重复' if s('/tmp/snap-a.json')==s('/tmp/snap-b.json') else '✗ 不可重复')
+"
+cp /tmp/base-orig.json "$f"   # 恢复（内容应当与重建的完全一致）
+cat /tmp/base-orig.json | python3 -c "
+import json,sys
+def s(d): d.pop('meta',None); return d
+print('✓ 与出厂基线一致' if s(json.load(sys.stdin))==s(json.load(open('$f'))) else '✗ 不一致')
+"
 
 # ② 有效性：故意改坏一个数，必须报出来
 python3 - <<'EOF'
