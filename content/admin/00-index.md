@@ -20,6 +20,7 @@
 | 改了代码要生效 | [⑩ 开发与构建](/admin/dev-build) |
 | **功能是我让 Agent 写的，想搞清代码在哪、数据怎么流** | [⑪ 架构导航](/admin/architecture) |
 | **想知道某个页面用了哪些接口、哪张表** | [⑫ 页面链路卡](/admin/page-map) |
+| **改完之后怎么证明系统还是对的** | [⑬ 测试与验收](/admin/testing) |
 | 客户怎么用（不是运维看的） | [客户使用手册](/user/index) |
 
 ---
@@ -220,7 +221,7 @@ http://<平台地址>/self-check
 
 ```bash
 cd shiyongshouce
-./check-docs.py            # 14 项数字与代码一致性
+./check-docs.py            # 16 项数字与代码一致性
 ./sync.sh && ./sync.sh --check   # 双目录同步
 ```
 

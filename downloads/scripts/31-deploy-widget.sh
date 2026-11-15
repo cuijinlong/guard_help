@@ -63,6 +63,11 @@ if [[ -f "$HERE/../docker-01-install.sh" ]]; then
 fi
 DB_CONTAINER="energy-postgres"
 DB_NAME="thingsboard"
+#
+# TB 的系统租户 id —— 系统内置部件（system/widget_types）都落在它名下。
+# 前端查部件时是「租户级优先 → 系统级兜底」，所以我们维护的部件只应写系统级；
+# 不限租户的 UPDATE 会连租户级覆盖一起改写（已实测踩到）。
+SYS_TENANT_ID="13814000-1dd2-11b2-8080-808080808080"
 ALL="false"
 CHECK_ONLY="false"
 DO_RESTART="false"
@@ -268,10 +273,22 @@ for i in "${!RESOLVED[@]}"; do
   #   它们不是 descriptor 的一部分，只 UPDATE descriptor 的话，
   #   你把 JSON 里的显示名改掉、库里还是旧的 —— 前端按 fqn 加载时显示的
   #   就是库里的 name。实测踩过：只推 descriptor，name 改动完全不生效。
-  if ! python3 - "$file" "$fqn" > /tmp/deploy-widget.sql <<'PYEOF'
+  #
+  # ★ 必须限定 tenant_id = SYS（2026-11-15 修）
+  #
+  # 原来只写 `WHERE fqn = '…'`。实测 `energy_management.diagnosis_brief` 这个 fqn
+  # 在库里**同时存在两条**：系统租户 13814000-… 与本业务租户 —— 于是：
+  #   · 推库时 UPDATE 会同时改两条（把租户自定义版覆盖成系统版，静默数据污染）
+  #   · 回读验证时 SELECT 返回两行，拼起来不是合法 JSON → 误报 BADJSON
+  # 后者让本脚本退 1，进而让 pack.sh 的部件门禁卡住部署（门禁本身是对的）。
+  #
+  # 这里推的是「系统内置部件」（源码目录就叫 system/widget_types），
+  # 所以只应该落在系统租户下。租户级覆盖是 TB 的另一种机制，不由本脚本维护。
+  #
+  if ! python3 - "$file" "$fqn" "$SYS_TENANT_ID" > /tmp/deploy-widget.sql <<'PYEOF'
 import json, sys
 
-path, fqn = sys.argv[1], sys.argv[2]
+path, fqn, sys_tenant = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(path, encoding='utf-8') as f:
     d = json.load(f)
 
@@ -293,7 +310,7 @@ if d.get('tags'):
     arr = ', '.join(sql_str(t) for t in d['tags'])
     sets.append(f'tags = ARRAY[{arr}]')
 
-print(f"UPDATE widget_type SET {', '.join(sets)} WHERE fqn = '{fqn}';")
+print(f"UPDATE widget_type SET {', '.join(sets)} WHERE fqn = '{fqn}' AND tenant_id = '{sys_tenant}';")
 PYEOF
   then
     die "${name}：生成 SQL 失败"
@@ -337,7 +354,7 @@ for i in "${!RESOLVED[@]}"; do
   name="$(basename "$file")"
 
   docker exec -i "$DB_CONTAINER" psql -U postgres -d "$DB_NAME" -tA \
-    -c "SELECT descriptor FROM widget_type WHERE fqn = '$fqn';" > /tmp/deploy-widget-db.json 2>/dev/null
+    -c "SELECT descriptor FROM widget_type WHERE fqn = '$fqn' AND tenant_id = '$SYS_TENANT_ID';" > /tmp/deploy-widget-db.json 2>/dev/null
 
   # ★ 不能用 `python3 - <<EOF` 再叠加 `<<<` 输入：两个 heredoc 会抢同一个 stdin，
   #   实际读到的是脚本本身而不是库内容 —— 判定会永远走 DIFF 分支。
@@ -430,10 +447,32 @@ echo "============================================================"
 if [[ "${NO_VERIFY:-false}" != "true" ]] && [[ -f "$ROOT/tools/verify-deploy.mjs" ]]; then
   echo
   echo "---- 全链路自检（源码 / 部署物料 / 数据库）----"
-  node "$ROOT/tools/verify-deploy.mjs" 2>&1 | tail -18 || true
+  if node "$ROOT/tools/verify-deploy.mjs" 2>&1 | tail -18; then
+    VERIFY_OK=1
+  else
+    VERIFY_OK=0
+  fi
   echo
-  echo "  ↑ 上面若报「不一致」，先确认差异项是否都属于你正在改的那批；"
+  echo "  ↑ 若报「不一致」，先确认差异项是否都属于你正在改的那批；"
   echo "    不属于就是有别的改动被覆盖回去了，别直接忽略。"
+
+  #
+  # ★ 自检失败必须让本脚本失败（2026-11-15 修）
+  #
+  # 原来这里是 `node … | tail -18 || true` —— 自检能发现问题，但退出码永远是 0。
+  # 后果：全链路不一致时，脚本照样报「已部署 N 个部件」，调用方（pack.sh /
+  # sync-from-git）拿到的也是成功。这正是「同一个问题反复出现」的机制漏洞：
+  # 检测存在，但**不阻断**。
+  #
+  # 现在：只要源码 / 部署物料 / 数据库三段不一致 → 退出码 1。
+  # 确实只想快速看单个部件效果（不关心整体一致性）时，用 NO_VERIFY=true 跳过。
+  #
+  if [[ "$VERIFY_OK" != "1" ]]; then
+    echo >&2
+    echo "  ✗ 全链路自检未通过：三段不一致，不能当作部署成功" >&2
+    echo "    先按上面列出的差异项修好；确认可忽略时用 NO_VERIFY=true 显式跳过" >&2
+    exit 1
+  fi
 fi
 
 [[ "$FAIL" -eq 0 ]] || exit 1

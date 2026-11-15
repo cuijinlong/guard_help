@@ -478,6 +478,10 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
         # 客户手册「看懂分析页」也给了对照 SQL —— 客户/运营会直接复制执行，
         # 写错一条就等于教错核对方法，所以一并跑通。
         ('../user/03-pages.md', None),
+        # 测试页（2026-11-15）：这里的 SQL 是「页面数字与库对不上时」的核对方法，
+        # 且与账单/基线快照声称同一套口径。写错了会让人怀疑统计本身有问题，
+        # 所以必须和其他页一样逐条真跑。
+        ('13-testing.md', None),
     ]
     blocks: list[str] = []
     for fname, marker in sql_docs:

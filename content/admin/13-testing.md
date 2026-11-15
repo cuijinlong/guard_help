@@ -1,0 +1,511 @@
+# ⑬ 测试与验收（用例与判据）
+
+这一页回答一个问题：**改完之后，怎么证明系统还是对的。**
+
+素材全部来自本仓库已存在的可执行脚本与实测数据，每条用例都给出「不符时查哪里」，
+不写「应该没问题」这类无法判定的结论。
+
+---
+
+## 先说结论：不要给 26 个页面各写一个脚本
+
+这是最容易走错的一步。26 个页面 × 每页一个 E2E = 26 份维护负担，
+而且绝大多数页面共用同一批接口（见 [⑫ 页面链路卡](/admin/page-map) 的「七个基础设施接口」）。
+接口一改，26 个脚本全红，但真正坏的只有一处。
+
+正确做法是按**风险**分层，只给「算错了不会报错」的地方写自动化：
+
+| 层 | 验什么 | 出错的后果 | 工具 |
+| --- | --- | --- | --- |
+| **单元** | 倍率、用量、解析这类纯算法 | 静默算错，页面照常显示 | JUnit（本仓库） |
+| **结构** | 接口通不通、权限越不越界 | 报错或越权，能被发现 | `03-verify.sh` |
+| **数据** | 库里各表彼此对不对得上 | 数字自相矛盾 | `04-verify-data.sh` |
+| **闭环** | 客户建数据到报表出数 | 流程走不通 | `06-verify-e2e.sh` |
+| **发布内容** | 这一版的每项改动是否落地 | 装了旧版本 | `08-verify-release.sh` |
+| **回归** | 历史统计值变没变 | 口径被改了没人知道 | `baseline-snapshot.mjs` |
+
+页面长什么样、按钮在不在，靠下面的[手工用例](#六手工用例按业务链路不按页面)。
+这类东西用脚本守住成本极高、收益极低 —— 页面重构一次就全废。
+
+---
+
+## 一、四层自动化，各管一段
+
+前三层分工写在脚本头部注释里，是设计约束，不是巧合：
+
+```bash
+# 全部在部署目录内执行（scripts/ 与 data/ 同级）
+cd ~/energy-app
+
+# ① 结构：接口可用 + 权限正确
+bash scripts/03-verify.sh \
+  --base http://127.0.0.1:8090 \
+  --tenant tenant@example.com --tenant-pass '...' \
+  --customer customer@example.com --customer-pass '...'
+
+# ② 数据：库里的数彼此自洽（直连 psql，不走 REST）
+bash scripts/04-verify-data.sh
+bash scripts/04-verify-data.sh --site 单相园区 --verbose   # 只验一个场站
+
+# ③ 闭环：从客户自己建数据，到报表出数
+bash scripts/06-verify-e2e.sh \
+  --base http://127.0.0.1:8090 \
+  --tenant tenant@example.com --tenant-pass '...' \
+  --customer customer@example.com --customer-pass '...'
+
+# ④ 发布内容：这一版改的每一项是否真的落地
+bash scripts/08-verify-release.sh \
+  --tenant tenant@example.com --tenant-pass '...' \
+  --customer customer@example.com --customer-pass '...'
+```
+
+全部以 `0 = 通过 / 1 = 有失败项` 退出，可以直接串进发布流程：
+
+```bash
+set -e
+bash scripts/08-verify-release.sh ... || { echo '发布内容未到位，禁止上线'; exit 1; }
+bash scripts/04-verify-data.sh       || { echo '数据不自洽'; exit 1; }
+```
+
+### 各自到底覆盖什么
+
+`04-verify-data.sh` 的 9 个检查组（这是「统计准不准」的主力）：
+
+| # | 检查组 | 核心断言 |
+| --- | --- | --- |
+| 1 | 演示包规模 | 该有的设备、表计数量对得上 |
+| 2 | 电表计量层级 | 一级 / 二级 / 三级表都在，且挂了关系 |
+| 3 | 增量与表底守恒 | 逐点比对「表底差」与「上报增量」，偏差超阈值即失败 |
+| 4 | 上下级汇总 | 上级 ≥ 下级之和，差额 = 线损 + 未装表 |
+| 5 | 电气量物理自洽 | U×I×√3×PF ≈ P，功率因数在 (0,1] |
+| 6 | 水 / 燃气 / 蒸汽表 | 各品种表底单调、增量非负 |
+| 7 | 温湿度 | 量程合理 |
+| 8 | 数据覆盖 | 每台表最近 N 小时有点 |
+| 9 | 虚拟设备与手工填报 | 手工录入回填到正确位置 |
+
+`06-verify-e2e.sh` 的 9 个环节：组织管理、设备管理、数据上报（HTTP + MQTT）、
+标准指标化、计算字段、规则链、报警、报表可视化（看板 + 分时数值与原始遥测一致）、
+虚拟设备。
+
+> **为什么 04 直连 psql 而不是走 REST**：一次要拉 11 台表 × 336 点 × 20 个键 ≈ 7 万行，
+> REST 要几十秒且分页易漏；psql 一条聚合能直接算「表底差 vs 增量」这种跨行断言。
+> 非 PostgreSQL 部署才需要 REST 版。
+
+---
+
+## 二、单元测试：算法口径（这一层原来完全没有）
+
+### 为什么只有这几个类值得单测
+
+判据只有一条：**算错了页面照样正常显示**。
+
+| 类 | 位置 | 为什么危险 |
+| --- | --- | --- |
+| `MeteringMath` | `guard-server/src/main/java/com/guard/server/util/MeteringMath.java` | 倍率、表底差、解析全是纯函数，算错不抛异常，账单直接错钱 |
+
+反过来，Controller 里的逻辑不值得单测：它有 HTTP 状态码、有日志，
+04 / 06 两层能抓到，再包一层 mock 只是把同一件事测两遍。
+
+### 怎么跑
+
+```bash
+cd guard-server
+mvn -Dtest=MeteringMathTest test
+
+# 硬证据不看 exit code，看报告：
+cat target/surefire-reports/com.guard.server.util.MeteringMathTest.txt
+```
+
+正常输出：
+
+```
+Tests run: 29, Failures: 0, Errors: 0, Skipped: 0
+```
+
+> **为什么强调看报告不看 exit code**：`mvn -q` 会把统计一起静默掉，
+> `exit=0` 只能说明「没崩」，不能说明「断言真的跑了」。
+> 外层测试类如果全在 `@Nested` 里，`.txt` 会显示 `Tests run: 0` ——
+> **那也是正常的**，真实计数在 `TEST-*.xml` 的 `tests` 属性里。
+
+### 29 条断言覆盖什么
+
+| 分组 | 条数 | 覆盖的关键点 |
+| --- | --- | --- |
+| `parseRatio` | 5 | `200/5` → 40；空/null → 1；`5/200`、`0/5`、`abc` 必须抛异常（不许静默兜底成 1） |
+| `nameplateRatio` | 2 | `200/5 × 10000/100 = 4000`（黄金用例）；缺一侧按 1 |
+| `effectiveRatio` | 4 | `ratioApplied=true → 1`；变比优先于综合倍率；仅 CT/PT 全空才用 `meterRatio` |
+| `usageOfSegment` | 6 | `(1250.00 − 1234.50) × 4000 = 62000`；倒走 → `abnormal` 且不给用量；缺表底 → `estimated`；系数 null 按 1 |
+| `num` | 3 | 空串/非法 → `null` 而不是 `0` |
+| `isVirtual` | 4 | 只认 `device.additionalInfo.deviceVirtual`，不认 SERVER_SCOPE 属性 |
+| `participates` | 3 | **缺省即参与**，只有显式为假才排除 |
+| `truthy` | 2 | `t/true/1` 为真；与 `participates` 默认值相反，不许混用 |
+
+### 期望值是从哪来的（这条最重要）
+
+**不是照着 Java 实现反推的** —— 那是把 bug 写成断言。
+
+期望值来自 `nenghaobao/energy-config/lib/metering.mjs` 的**实际运行输出**。
+那是同一套算法的独立实现，可以当 oracle 交叉核对。
+
+复现 oracle：
+
+```bash
+node --input-type=module -e "
+import * as M from './nenghaobao/energy-config/lib/metering.mjs';
+console.log(M.usageOfSegment({from:1234.50, to:1250.00, ratio:4000}));  // 62000
+console.log(M.usageAcrossSegments([{from:1000,to:1880,ratio:1},{from:20,to:62,ratio:1}])); // 922
+"
+```
+
+### 三处与 Node 版的有意差异（别为了「同口径」改掉）
+
+| # | 差异 | 原因 |
+| --- | --- | --- |
+| ① | Java 的 `parseRatio` 接受纯数字字符串 `"1"` / `"40"` | 台账上可能只记综合倍率，写不进 `200/5` 这种形式 |
+| ② | Java 有 `meterRatio` 兜底 | Node 版只认 CT/PT，现场说不出变比时倍率会静默失效 |
+| ③ | Node 的 `usageAcrossSegments` / `allocateToPeriod` 在 Java **无对应实现** | 系统没有换表登记入口；账单走「自然月 + 小时表底差分」，比区间线性分摊更精确 |
+
+> 差异 ③ 不是缺陷。如果将来真要做换表登记，先加 `usageAcrossSegments` 再改账单，
+> 不要直接把 Node 的区间分摊搬过来 —— 那会把精度降下去。
+
+### 已知风险：CT/PT 填 `"1"` 会遮蔽综合倍率
+
+```java
+MeteringMath.effectiveRatio("1", "1", "40", false)  // → 1，不是 40
+```
+
+`nameplateRatio("1","1") = 1×1 = 1`，所以填了 `meterRatio=40` 也不生效。
+当前库里 35 台设备**倍率属性全部缺失**（都按 1 计算），不会触发；
+但现场若把表单默认值写成 `"1"` 而不是留空，就会踩到。
+
+这条已写成测试固化。**要改行为必须先改测试**，否则等于悄悄改口径。
+
+---
+
+## 三、统计基线快照：改了口径怎么知道数变没变
+
+### 它解决什么问题
+
+`04-verify-data.sh` 验的是「库里各表彼此自洽」，但验不了
+「和上个月比，这个场站的用电量有没有被改口径改掉」。
+
+页面上的数随实时数据一直在动，肉眼看不出来。
+「改了统计逻辑但没人发现」和「没改」在证据上无法区分 —— 这就是这个工具存在的理由。
+
+### 生成与比对
+
+```bash
+# 在仓库根目录（需要 energy-postgres 在跑）
+
+# 生成基线（默认窗口 2026-09-01 ~ 2026-11-01）
+node tools/baseline-snapshot.mjs
+
+# 换窗口
+node tools/baseline-snapshot.mjs --from 2026-10-01 --to 2026-11-01
+
+# 改了统计代码后，和基线比
+node tools/baseline-snapshot.mjs --compare tools/baseline/window-2026-09-01_2026-11-01.json
+```
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 同一历史窗口的统计值与基线一致 |
+| 1 | 有差异（逐条打印每处 Δ） |
+| 2 | 执行失败（基线不存在 / 连不上库） |
+
+### 为什么按「窗口」命名而不是按「运行日期」
+
+固定历史窗口 `[from, to)` 内的统计值**本应是常量**。
+所以文件名由窗口决定，重跑覆盖同一文件 —— `git diff` 里出现的任何数字变化
+都意味着**统计逻辑被改动**，而不是「今天又多了几条数据」。
+
+这个设计是整个工具的关键。按日期命名的话，每天都是新文件，
+基线永远和今天比，任何差异都会被「数据变多了」掩盖。
+
+### 怎么判读差异
+
+```
+✗ 发现 2 处差异：
+  ~ 用量变化 三相园区/PowerMeter-1: 70847.41 → 70847.41（Δ 0）
+  ~ key energy_reading: 159898 行/31 台 → 160021 行/31 台
+```
+
+- **用量变化**：口径被改了。先确认是不是有意改的，再决定更新基线。
+- **只 key 行数变**：数据在增长，窗口没锁住 → 说明 `--to` 落在了「现在」之后。
+  把 `--to` 设成明确的过去日期。
+- **设备增删**：`+ 新增设备` / `- 删除设备`，属于业务变更，更新基线。
+
+### 两条自检（换环境后必跑，证明它不是摆设）
+
+只验「跑得通」不够 —— 一个什么都不检查的脚本也会「跑通」。
+
+```bash
+# ① 可重复性：连跑两次，去掉时间戳后内容必须一致
+f=tools/baseline/window-2026-09-01_2026-11-01.json
+node tools/baseline-snapshot.mjs >/dev/null
+cp "$f" /tmp/snap1.json
+node tools/baseline-snapshot.mjs >/dev/null
+diff <(python3 -c "import json;d=json.load(open('/tmp/snap1.json'));d['meta'].pop('generated_at');print(json.dumps(d,sort_keys=True))") \
+     <(python3 -c "import json;d=json.load(open('$f'));d['meta'].pop('generated_at');print(json.dumps(d,sort_keys=True))") \
+  && echo '✓ 可重复'
+
+# ② 有效性：故意改坏一个数，必须报出来
+python3 - <<'EOF'
+import json
+p='tools/baseline/window-2026-09-01_2026-11-01.json'
+d=json.load(open(p))
+for dev in d['devices']:
+    if dev['usage'] is not None:
+        dev['usage'] += 123.4567
+        print('篡改:', dev['name'])
+        break
+json.dump(d, open('/tmp/snap-tampered.json','w'), ensure_ascii=False)
+EOF
+node tools/baseline-snapshot.mjs --compare /tmp/snap-tampered.json
+# 必须报 Δ -123.4567 且 exit=1；报不出来说明比对逻辑坏了
+```
+
+### 口径必须与账单一致
+
+每设备用量 = 相邻小时表底差 × 倍率，负差分（换表 / 归零 / 错值）跳过并计数 ——
+与 `EnergyBillingService#readUsage` 同一套算法。
+
+**基线通过 ≠ 账单对。** 两者口径不一致时，基线只能证明「和上次一样」，
+不能证明「算得对」。核对口径差异时看这两处：
+
+```bash
+grep -n "readHourlyMax\|backwardSegments" guard-server/src/main/java/com/guard/server/service/energy/EnergyBillingService.java
+grep -n "hourly\|lag(v)" tools/baseline-snapshot.mjs
+```
+
+---
+
+## 四、发布前跑什么（两档）
+
+### 15 分钟档：只改了业务代码 / 部件 / 字典
+
+```bash
+cd guard-server && mvn -Dtest=MeteringMathTest test && cd ..   # 30 秒
+node tools/baseline-snapshot.mjs --compare tools/baseline/window-2026-09-01_2026-11-01.json
+node tools/verify-deploy.mjs                                    # 源码/物料/库 三段一致
+bash guard-server/sync-data.sh                                  # 只读，看数据差异
+```
+
+### 1 小时档：发版 / 换了环境 / 动过统计口径
+
+在上面基础上加：
+
+```bash
+bash scripts/08-verify-release.sh ...    # 这一版每项改动是否落地
+bash scripts/03-verify.sh ...            # 结构 + 权限
+bash scripts/04-verify-data.sh           # 数据自洽（含表底守恒）
+bash scripts/06-verify-e2e.sh ...        # 业务闭环
+node tools/verify-org-module.mjs --with-permissions   # 组织模块 20+10 条
+node tools/verify-org-page.mjs --shot /tmp/org.png    # 页面渲染 12 条
+```
+
+---
+
+## 五、手工用例（按业务链路，不按页面）
+
+自动化守住的是「数对不对」，下面这些守住「用户能不能用」。
+每条给：**操作 → 期望 → 不符怎么查**。
+
+### A. 上报数据
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| A1 | 真实 RTU 上电，等 2 分钟 | `bash scripts/29-rtu-demo-up.sh --status` 显示真实表在报 | `scripts/34-rtu-diagnose.sh`；再看网关日志 |
+| A2 | `bash scripts/29-rtu-demo-up.sh --sim-only` | 模拟表开始出数，页面曲线在走 | 进程是否退出；MQTT 通道 `node tools/mqtt-gateway-check.mjs` |
+| A3 | 停掉模拟器 10 分钟后再开 | 抄表页把这台表标为「陈旧」，不是静默沿用旧值 | 设备属性 `lastConnectedGateway` / 抄表接口的 stale 字段 |
+| A4 | 断网 1 小时后恢复 | 数据补传，页面时间轴有缺口而不是整段平滑（不编数） | `ts_kv` 按小时 count，缺口应真实存在 |
+
+**判据是「不编数」**：缺就是缺、倒走就留痕。任何把缺口填成平滑曲线的实现都是错。
+
+### B. 标准 key
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| B1 | 开户脚本跑完 | 打印「标准 key 核对通过」 | 见 [③ 开户](/admin/onboard) 的核对小节 |
+| B2 | 查字典与设备属性是否对齐 | 电表需要的一级指标在 `key_dictionary` 里都有 | 下面的 SQL |
+| B3 | 看某台表实际报了哪些 key | 至少含 `energy_reading`；三相表含 `U/I/P/Q/S/PF/Freq` | 下面第二条 SQL |
+
+```sql
+-- B2：电表档案声明要的 key，逐个查是否已注册
+SELECT k.key FROM key_dictionary k WHERE k.key LIKE 'energy%' ORDER BY 1;
+
+-- B3：这台表窗口内实际报了什么（设备名换成实际名称）
+SELECT k.key, count(*) AS rows,
+       to_timestamp(min(t.ts)/1000)::date AS first_day,
+       to_timestamp(max(t.ts)/1000)::date AS last_day
+FROM ts_kv t
+JOIN key_dictionary k ON t.key = k.key_id
+JOIN device d ON d.id = t.entity_id
+WHERE d.name = 'PowerMeter-1P-SIM·平台演示中心'
+GROUP BY 1 ORDER BY 1;
+```
+
+**本仓库实测输出（2026-11-15）**，单相表报了 12 个 key：
+
+```
+energy_reading | 5473 | 2026-10-03 | 2026-11-15
+energy         | 5380 | 2026-10-03 | 2026-11-15
+voltage_a      | 5473 | ...
+current_a      | 5473 | ...
+power_total    | 5473 | ...
+power_factor_total | 5473 | ...
+frequency      | 5473 | ...
+carbon_emission    | 4635 | ...
+current_thd_a / voltage_deviation_a / power_a / power_factor_a | 97~758 | ...
+```
+
+> **两条容易搞反的判断**：
+> 1. **别把「字典里有」当成「设备报了」**。字典是期望，`ts_kv` 才是事实。
+> 2. **别把「只报了 energy_reading」当成故障** —— 但也有反面：
+>    实测这台**单相**表连 `current_a` / `power_total` / 谐波都有，
+>    所以「单相表只有总电量」这个预判是错的。以这台表实际档案要求为准。
+>
+> 返回空则先确认设备名（用 `SELECT d.name FROM device d WHERE d.name ILIKE '%Meter%'` 核对），
+> 再确认该时间窗内有没有数据 —— 新接入的表可能当月才开始报。
+
+### C. 统计准确率（客户最关心的一条）
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| C1 | 挑一台表，页面月用量 vs SQL 手算 | 两个数一致（差 < 0.01） | 用下面 C1 的 SQL 逐小时看，定位是哪个小时差 |
+| C2 | 上级表 vs 下级表之和 | 上级 ≥ 下级之和，差额能解释为线损 | `04-verify-data.sh` 第 4 组 |
+| C3 | 峰 / 平 / 谷三项相加 | 严格等于总量 | `EnergyBillingService#readUsage` 的 byType 累加 |
+| C4 | 账单金额 vs 用量 × 电价 | 分毫不差（金额走「分」运算，不走浮点） | `EnergyBillingService` 的 `centsToYuan` / `totalCents` |
+| C5 | 改一次倍率再出账 | 金额按倍数变化，不是不变 | 倍率来源见 [④ 数据模型](/admin/data-model)；`effectiveRatio` 三处差异见上文 |
+
+**C1 的验算 SQL**（与账单、基线快照同一套口径）：
+
+```sql
+WITH hourly AS (
+  SELECT date_trunc('hour', to_timestamp(t.ts/1000)) AS h,
+         max(t.dbl_v) AS v
+  FROM ts_kv t
+  JOIN key_dictionary k ON t.key = k.key_id
+  JOIN device d ON d.id = t.entity_id
+  WHERE k.key = 'energy_reading'
+    AND d.name = 'PowerMeter-1P-SIM·平台演示中心'
+    AND t.ts >= EXTRACT(EPOCH FROM TIMESTAMPTZ '2026-10-03 00:00:00+08') * 1000
+    AND t.ts <  EXTRACT(EPOCH FROM TIMESTAMPTZ '2026-11-01 00:00:00+08') * 1000
+  GROUP BY 1
+), diffed AS (
+  SELECT h, v - lag(v) OVER (ORDER BY h) AS delta FROM hourly
+)
+SELECT round(sum(CASE WHEN delta > 0 THEN delta ELSE 0 END)::numeric, 4) AS usage,
+       count(*) FILTER (WHERE delta < 0) AS backward_segments,
+       count(*) FILTER (WHERE delta IS NOT NULL) AS segments
+FROM diffed WHERE delta IS NOT NULL;
+```
+
+**本仓库实测输出（2026-11-15）**：
+
+```
+   usage   | backward_segments | segments
+-----------+-------------------+----------
+ 4633.6200 |                 1 |      695
+```
+
+这个 `4633.62` 与基线快照里「单相园区 / elec / 用量 4633.62 / 倒走 1」
+**逐位一致** —— 三者（本 SQL、账单口径、基线快照）互相印证。
+如果你跑出来的数与页面不一致，先看下面三个数怎么读。
+
+三个数怎么读：
+
+- `usage` 应与页面「本期用量」一致（未乘倍率；页面若已乘倍率，除以倍率再比）；
+- `backward_segments > 0` 说明这期间有表底倒走，页面上应该**有提示**，没有就是缺陷；
+- `segments` 太少（比如整月只有 3 个点）说明数据断过，页面数字不可信，
+  先去查 A3 / A4。
+
+### D. 组织与权限
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| D1 | 客户账号登录，看场站列表 | 只出现自己名下场站 | `visible-sites` 返回体；`EnergyScopeService` |
+| D2 | 给客户只授权 A 场站，然后改 B 场站费率 | 403，且库里没有新记录 | `node tools/verify-org-module.mjs --with-permissions` |
+| D3 | 改一个场站档案名 | 组织级费率接口仍按 id 工作，不因改名 404 | 同上脚本的改名回归项 |
+| D4 | 客户账号看左侧菜单 | 有「仪表板」且能进 `/dashboards/all` | 见 F1 |
+
+> D2 是真出过的漏洞：原实现只比 `customer_id`，同客户下的未授权场站可写。
+> 现在走场站组授权，验收必须覆盖「已授权 200 / 未授权 403」两侧。
+
+### E. 抄表与账单
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| E1 | 新表第一次抄表 | 只建基线，用量为空，不报 0 | 抄表记录里应有首抄标记 |
+| E2 | 人为把表底改小再抄 | `quality=abnormal`，不给用量，**基线不更新** | 抄表结果字段 `quality` / `reason` |
+| E3 | 表连续 2 小时无上报 | 标「陈旧」，不沿用旧值当新读数 | 抄表接口的 stale 字段 |
+| E4 | 出账前检查电价 | 未配电价的表在「跳过」清单里，并注明原因 | 出账返回的 `items[].reason` |
+| E5 | 虚拟表（手工填报）出账 | 全部归入「平」档，并标 `touAssumedFlat=true` | 页面应显示「按时段方案估算」提示 |
+
+### F. 看板与菜单
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| F1 | 客户账号进「仪表板」列表 | 只看到自己建的，**26 个能源套件一个都不出现** | 这是设计（铁律 D20）；出现即缺陷 |
+| F2 | 客户从左侧菜单进「仪表板」 | HTTP 200，不是空白页 | `EnergyMenuInstaller#customerItems` |
+| F3 | 租户账号看套件看板 | 26 个都在，能打开 | `DashboardController#ENERGY_TEMPLATE_DASHBOARDS` |
+| F4 | 重装后首次登录 | 菜单与看板自动就位（启动期自愈） | `SystemPatchApplier#syncWidgetTypesOnBoot`；`node tools/check-ui-freshness.mjs` |
+
+> F1 与 F3 是一对：客户看不到、租户看得到，才是对的。
+> 只验一侧会把「过滤过宽」当成正常。
+
+---
+
+## 六、明确不测什么（写下来避免反复讨论）
+
+| 不测 | 原因 |
+| --- | --- |
+| 每个页面的每个按钮 | 26 页面 × 全按钮，维护成本远高于收益；页面重构即全废 |
+| 第三方 TB 内核行为 | 不是我们的代码；升级时由上游回归 |
+| 性能 / 并发压测 | 当前规模（35 设备 / 千万级遥测）未到瓶颈；要做另开一次专项 |
+| 浏览器兼容矩阵 | 现场只用 Chrome / Edge |
+| 视觉像素比对 | 无基线图，且主题会变；靠人工看截图 |
+
+需要时再单独开专项，不要偷偷塞进日常验收 —— 那会让「全绿」失去意义。
+
+---
+
+## 七、改统计口径的固定流程（铁律 D21）
+
+任何会改变历史数字的改动（倍率、差分方式、峰谷归段、资产预汇总、单位换算），
+按这个顺序做，**不许跳步**：
+
+1. **先跑基线**，确认当前值与仓库里的基线一致（不一致先查清为什么）；
+2. **改代码**；
+3. **再跑 `--compare`**，逐条看 Δ —— 每一条差异都要能解释成「这次要改的目的」；
+4. 解释不了的那条 = 意外影响，修掉；
+5. 确认全部差异都可解释后，**重新生成基线并一起提交**（基线变更是改动的一部分，不是副作用）；
+6. 手册的对应页同步更新口径描述（见 [运维总览](/admin/index) 的维护表）。
+
+```bash
+# 完整一轮
+node tools/baseline-snapshot.mjs --compare tools/baseline/window-2026-09-01_2026-11-01.json
+# ...改代码...
+mvn -Dtest=MeteringMathTest test
+node tools/baseline-snapshot.mjs --compare tools/baseline/window-2026-09-01_2026-11-01.json
+# ...确认差异都能解释...
+node tools/baseline-snapshot.mjs          # 覆盖基线
+git add tools/baseline/ && git commit -m '口径变更：<说明>，基线同步'
+```
+
+**为什么要走这一套**：没有基线的口径改动，事后无法回答「这个数以前是多少」。
+真出争议时（客户说「上个月不是这个数」），只有能 diff 的基线是证据。
+
+---
+
+## 八、出问题时的第一反应
+
+| 现象 | 先看 |
+| --- | --- |
+| 验收脚本红了 | 脚本输出的失败项自带「缺什么、怎么修」；再看 [⑨ 排障](/admin/troubleshoot) |
+| 页面数字和 SQL 不一致 | 先确认口径（是否乘倍率、时区、窗口边界 `[from, to)`），再查 `04-verify-data.sh` 第 3 组 |
+| 单测红了 | 先判断是「预期变更」还是「真回归」；预期变更要**同时**改测试和口径注释（铁律 E1d） |
+| 基线 diff 出现无法解释的 Δ | 停下来查清再继续，不许「先合了再说」 |
+
+> 铁律 E1c：结论必须当时可验证。报告里写「全部通过」时，附上退出码或报告路径，
+> 不要只写结论。

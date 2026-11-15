@@ -112,6 +112,11 @@
           "id": "page-map",
           "title": "⑫ 页面链路卡（26 个页面）",
           "file": "admin/12-page-map.md"
+        },
+        {
+          "id": "testing",
+          "title": "⑬ 测试与验收（用例与判据）",
+          "file": "admin/13-testing.md"
         }
       ],
       "description": "给平台方的：怎么部署、开租户、导入数据、排障"
