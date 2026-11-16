@@ -1440,6 +1440,75 @@ energy_management.ranking_list        同上
 **改这条口径要注意**：`energyAnchor` 只影响**默认值**。
 客户手动选过的日期、以及 state 模式（分析条件下发）的时间窗都不受影响。
 
+### 9.13 部件里能调哪些接口（客户用户视角）
+
+**教训**（2026-11-16 客户当面指出）：给排名部件加虚拟表过滤时用了
+`/api/tenant/devices`，租户管理员测着一切正常，**客户账号直接 403**。
+更糟的是失败分支把集合留空 → 虚拟档全空、实时档混进虚拟表，
+界面上只表现为数字不对，不报任何错。
+
+**权限矩阵（实测）**
+
+```
+接口                                  租户管理员  客户用户
+/api/tenant/devices                       200       403
+/api/tenant/assets                        200       403
+/api/customer/{customerId}/devices        200       200
+/api/customer/{customerId}/assets         200       200
+/api/user/devices                         200       200   ← 推荐
+/api/user/assets                          200       200
+/api/energy/time-anchor                   200       200
+```
+
+**选型规则**
+
+| 场景 | 用什么 | 为什么 |
+| --- | --- | --- |
+| 只要「当前用户可见」的设备/资产 | `/api/user/devices`、`/api/user/assets` | 一个请求搞定，两种角色都 200 |
+| 要精确到某个客户的范围 | `/api/customer/{cid}/devices` | 需先 `/api/auth/user` 取 customerId（查询设置就是这么写的） |
+| 管理页（只有租户管理员会进） | `/api/tenant/...` | 客户根本进不去那些页面 |
+
+> **不要**在看板部件里用 `/api/tenant/...` —— 看板客户才是主要使用者。
+> 平台既有范式见 `energy_management.query_panel` 的 `devicesUrl()` / `assetsUrl()`：
+> `cid ? '/api/customer/' + cid + '/devices' : '/api/tenant/devices'`。
+
+**失败分支必须留痕**
+
+拉不到设备清单时的兜底不能静默。排名部件现在会打：
+
+```
+[ranking] 拉取设备清单失败，虚拟表过滤降级为「不过滤」。
+若当前是客户账号，请确认接口是 /api/user/devices 而不是 /api/tenant/devices
+```
+
+以前这里是空的，所以 403 时只能看到「数字不对」，完全无从排查。
+
+**后端写库查询要 fail-closed**
+
+`/api/energy/time-anchor` 的 `lastDate` 直接用 JDBC 查 `ts_kv_latest`，
+绕过了 TB 的实体级权限校验 —— 所以**边界必须自己守**：
+
+```java
+boolean isCustomerUser = user.getAuthority() == Authority.CUSTOMER_USER;
+boolean byCustomer = isCustomerUser && customerId != null && !customerId.isNullUid();
+if (isCustomerUser && !byCustomer) {
+    return null;   // 身份不完整 → 不查库，回退今天。绝不落到「按租户查」
+}
+```
+
+原写法在 customerId 缺失时会落到「按租户查」分支，客户能看到别的客户的数据。
+这种身份不该存在，但边界不能靠「不该发生」来保证。
+
+**验收方法**
+
+用客户账号跑一遍，抓 403：
+
+```js
+page.on('response', r => { if (r.status() === 403) console.log('403', r.url()); });
+```
+
+实测客户 `demo@126.com` 打五块看板：403 请求 **0 条**。
+
 ## 十、出问题时的第一反应
 
 | 现象 | 先看 |
