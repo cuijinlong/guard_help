@@ -1379,6 +1379,67 @@ GROUP BY a.name ORDER BY a.name;
 > **判据**：虚拟档下的排名**只能出现虚拟表的名字**。
 > 如果看到正泰/雅达，说明该部件还在读 `energy_total`（两者之和）。
 
+### 9.12 默认时间窗：为什么打开就有数据
+
+**问题**（2026-11-16 客户反馈）：能耗概览打开时，「分项用电量对比」「用电量排名」
+都显示「所选范围内无数据」，把日期改到 11-15 就全出来了。
+
+**根因**：默认窗口的右端取的是「今天」（11-16），而电量数据只到 11-15。
+11-16 那天确实有几条遥测 —— RTU 凌晨 00:28 还在报功率 —— 但**一条电量都没有**。
+
+**所以有两个不同的「最后一天」**，不能混用：
+
+```
+GET /api/energy/time-anchor
+
+{
+  "today": "2026-11-16",
+  "anchor": "2026-11-16",        ← 任意遥测的最后一天（RTU 凌晨还报功率）
+  "energyAnchor": "2026-11-15",  ← 电量键的最后一天  ★ 能耗看板用这个
+  "demo": false,
+  "source": "telemetry"
+}
+```
+
+- `anchor`：`max(ts)` 不限键。给「最近 N 天」这类窗口用，能容忍只有功率没有电量。
+- `energyAnchor`：只统计 `energy_total*` / `energy_day*` / `energy`，
+  覆盖 ASSET（资产汇总）与 DEVICE（设备用量）两张实体表 ——
+  只查设备会漏掉场站/分项上的汇总，只查资产会漏掉设备级用量。
+- 两者都只往**过去**对齐：如果 `max(ts)` 晚于今天（设备时钟错乱），保留今天。
+  否则窗口会被拽到未来，客户反而什么也看不到。
+
+**哪些部件用 `energyAnchor`**
+
+```
+energy_management.analysis_bar        默认时间窗（下发 timeRange/grain）
+energy_management.query_panel         历史能耗的起止日期
+energy_management.tou_summary         峰谷统计的周期
+energy_management.asset_stats_chart   自带日期（timeMode=own）时的默认日
+energy_management.distribution_chart  同上
+energy_management.ranking_list        同上
+```
+
+前端把结果缓存在 `window.__energyCalAnchorMs`（**不是** `__energyAnchorMs`）：
+两者要的不是同一天，共用一个键会串 —— 同页第一次加载谁先到就用谁的值。
+
+**实测（Chromium，租户与客户两个账号，pageerror 均无）**
+
+```
+能耗概览  分项用电量对比  2026-11-15 ~ 2026-11-15   总 10250.00（10000+240+10）
+          用电量排名      正泰单相 DDSU666 10.00 kWh
+分项能耗  2026-11-15    Y 轴 10.0
+区域能耗  2026-11-15    Y 轴 10.0
+历史能耗  2026-11-09 ~ 2026-11-15（近 7 天，右端对齐 11-15）
+峰谷分析  2026-11-09 起
+```
+
+**对真实客户无副作用**：RTU 持续上报时，`energyAnchor` 就是今天，
+与改造前完全等价；只有「电量停更、功率还在报」的场景才会往前对齐一天 ——
+而那正是需要对齐的情况。
+
+**改这条口径要注意**：`energyAnchor` 只影响**默认值**。
+客户手动选过的日期、以及 state 模式（分析条件下发）的时间窗都不受影响。
+
 ## 十、出问题时的第一反应
 
 | 现象 | 先看 |
