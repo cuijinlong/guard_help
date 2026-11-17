@@ -2306,7 +2306,137 @@ idle_energy.table    24×8   设备明细（可筛只看超标）
 >    闭包里可见，模板里的 `*ngIf="loading"` 读到 undefined ——
 >    部件会永远停在「正在加载…」且不报错，极难查。
 
-## 十四、出问题时的第一反应
+## 十四、综合能耗（折标煤）怎么验
+
+客户要求（2026-11-18）：「同样的方式把综合能耗功能开发和完整一下，尽量不要重复造轮子」。
+
+### 14.1 口径 —— 三处必须算出同一个数
+
+```
+用量 = (相邻小时桶差) × 倍率 + 首桶「最早原始点 → 首桶MAX」× 倍率
+tce  = 用量 × kgce / 1000      （kgce 读品种库字典，缺失才用国标默认）
+cost = 用量 × price
+co2  = 用量 × kgco2 / 1000
+```
+
+**用量口径由 `MeterUsageReader` 统一实现**，账单、闲时、综合能耗三处都调它。
+这是本次最重要的改动 —— 之前同一件事在仓库里有三套实现，
+前两套在 2026-11-17 先后踩了同样的坑（不乘倍率、首桶丢失）。
+
+### 14.2 一条命令验完
+
+```bash
+node tools/probe/comprehensive-verify.mjs --from 2026-11-01 --to 2026-12-01
+```
+
+实测输出（2026-11-18）：
+
+```
+范围 2026-11-01 ~ 2026-12-01（不含）　系数来源：品种库字典
+接口 KPI：tce 1.3728　cost 7260.5　co2 6.3703　设备 5
+
+  ✓ PowerMeter-DDSU666              elec  采集  用量 独立 10.000 / 接口 10
+  ✓ PowerMeter-3P-YADA              elec  采集  用量 独立 240.000 / 接口 240
+  ✓ VirtualMeter-3P-Power           elec  手工  用量 独立 800.000 / 接口 800
+  ✓ PowerMeter-3P-CHINT             elec  采集  用量 独立 10000.000 / 接口 10000
+  ✓ VirtualMeter-1P-Socket          elec  手工  用量 独立 120.000 / 接口 120
+
+  ✓ KPI tce　独立 1.372793 / 接口 1.3728
+  ✓ 序列可加　1.372793 / KPI 1.3728（差 -0.000007）
+```
+
+**四条判据**：
+
+- 逐设备用量 = 原始首尾表底差 × 倍率（唯一真值）
+- KPI = Σ(用量 × 系数)
+- 时间序列可加：小时点之和 ≈ KPI（差 < 千分之五）
+- 虚拟表（手工填报）用量 = 填报值，不乘倍率、不差分
+
+### 14.3 交叉核对：同一天在三处是否一致
+
+```bash
+# 闲时
+curl -s -H "X-Authorization: Bearer $TOK" \
+  "http://127.0.0.1:8090/api/energy/idle-analysis?granularity=day&from=<ms>&to=<ms>&siteId=<id>"
+# 综合
+curl -s -H "X-Authorization: Bearer $TOK" \
+  "http://127.0.0.1:8090/api/energy/comprehensive?granularity=day&from=<ms>&to=<ms>&siteId=<id>"
+```
+
+实测同一范围同一场站：闲时接口总电量 `10.0000 kW·h` =
+综合接口总用量 `10.0000 kW·h`。**对不上就说明有人又写了一套算法。**
+
+### 14.4 折标系数在哪改
+
+品种库资产的 `dictionaries.energyKinds[*]`，字段 `kgce` / `kgco2` / `price`：
+
+```sql
+SELECT json_v->'energyKinds' FROM attribute_kv
+WHERE entity_id = (SELECT id FROM asset WHERE name='能源参数字典')
+  AND attribute_type = 2
+  AND attribute_key = (SELECT key_id FROM key_dictionary WHERE key='dictionaries');
+```
+
+当前值（GB/T 2589-2020 当量值 + 常见参考价）：
+
+| 品种 | kgce | kgco2 | price |
+| --- | --- | --- | --- |
+| elec | 0.1229 | 0.5703 | 0.65 |
+| water | 0.2429 | 0.3440 | 3.50 |
+| gas | 1.3300 | 2.1620 | 3.20 |
+| steam | 94.300 | 110.0 | 260 |
+| heat | 34.120 | 110.0 | 90 |
+
+**系数是政策性参数**，各地各年都可能调。改字典即时生效，
+界面上「品种指标」页可改；`energy_library.json` 的 version 11→12 已把这些字段
+写进 seed，新租户初始化直接带系数。
+
+> 服务端读字典用的是 `attributesService.findAll` 而不是
+> `find(…, Set.of("dictionaries"))` —— 后者实测读不到 json_v，
+> 表现为「字典明明有 kgce，服务读回 null 静默用默认值」。
+> 排查时看响应里的 `byKind[*].kgce`：显示 0 或默认值就说明没读到。
+
+### 14.5 接口参数名（踩过）
+
+```
+GET /api/energy/comprehensive?granularity=day&from=<ms>&to=<ms>&siteId=<id>
+```
+
+**粒度参数名是 `granularity`，不是 `gran`**（后端两个都收，`granularity` 优先）。
+踩过的现象：前端一直发 `granularity`、后端只认 `gran`，粒度恒为默认 day ——
+参数没生效也不报错，表现是「按小时查却按天出数」，只看图才发现不对。
+
+实测三档：`hour` → 23 点、`day` → 1 点、`month` → 1 点（单日范围）。
+
+### 14.6 看板结构（已拆成 4 个小部件）
+
+```
+system.energy_management.analysis_bar   24×1   标准「分析条件」（复用，不自造）
+system.comprehensive.kpi               24×3   折标煤 / 费用 / 碳排 / 计量台数 / 品种数
+system.comprehensive.share             10×8   按品种 / 分项 / 区域 三种口径看构成
+system.comprehensive.trend             14×8   折标煤按日 / 按月 / 分时
+system.comprehensive.table             24×9   逐设备用量 / 折标 / 费用 / 维度归属
+```
+
+改文案：改 `tools/gen-comprehensive-widgets.py` → 跑它 →
+`python3 tools/install-idle-widgets.py` 的同款安装逻辑（写成同样两条命令）。
+
+### 14.7 维度怎么来的
+
+设备在 Contains 关系里同时挂四类父资产：
+
+```
+场站 / 分项 / 区域 / 能耗类型
+```
+
+- **场站** → 筛选条件（不算维度）
+- **分项、区域** → 维度，分别出现在 `byDimension.item` / `byDimension.area`
+- **能耗类型** → 暂不参与（与「品种」重叠）
+
+同一份用量同时计入「分项」和「区域」两个口径，**不会重复计入总量** ——
+总量是逐设备累加的，维度只是同一批数字的另一种切法。
+
+## 十五、出问题时的第一反应
 
 | 现象 | 先看 |
 | --- | --- |
