@@ -1901,6 +1901,44 @@ ranking_list(单元排名)  按天    energy                limit=10
 
 两条都通，守卫才算合格。
 
+### 11.7 全站九块看板的扫描结果（2026-11-17）
+
+用 11.1 的脚本逐块跑，每块 22 秒。**分组键必须带 pathname** ——
+`sankey_flow` 用的是 `/values/timeseries`，设备 id 在 **path** 里而不是 query：
+只按 query 分组，会把「24 台设备各取一次」误判成「同一条被取 24 次」。
+
+| 看板 | 请求数 | 多余 | 结论 |
+| --- | --- | --- | --- |
+| 分项能耗 | 3 | 0 | 已修（3 个部件各一次） |
+| 区域能耗 | 4 | 0 | 已修（4 个部件各一次） |
+| 能耗概览 | 16~17 | 1 | 已修；剩 1 组是 calendar_heatmap 与 overview_stats 各一次 |
+| 历史能耗 | 0 | 0 | 数据走 `basic_report_workspace`，无重复 |
+| 实时能耗 | 16 | 1 | **设计行为**：实时图按时钟定时刷新，不能去重 |
+| 综合能耗 | 6 | 0 | — |
+| 能源流向 | 24 | 0 | 已修；4 组各 2 次是同部件两条取数路径（见下） |
+| 峰谷分析 | 0 | 0 | — |
+| 电能质量 | 10 | 0 | — |
+
+**修复清单（共 6 个部件）**：
+
+```
+energy_management.asset_stats_chart     统计图        输入指纹 + 实体指纹
+energy_management.distribution_chart    占比图        输入指纹 + 实体指纹
+energy_management.ranking_list          排名表        输入指纹 + 实体指纹
+energy_management.calendar_heatmap      日历热力图    输入指纹（含 monthOffset/weekStart）
+energy_management.overview_stats        概览卡片      输入指纹
+energy_management.sankey_flow           桑基图        apply 去重（2 秒窗口）
+```
+
+**两种「看着像重复、其实不是」的情况**，遇到不要乱改：
+
+1. **两个部件取同一份数据** —— 区域能耗的「占比图」与「区域排名」看的是同一批资产、
+   同一个时间窗，`limit` 都是 10，请求参数一模一样。判据：这类请求**稳定出现在每一轮**，
+   数量等于挂载的部件数。
+2. **同一部件内两条取数路径** —— 桑基图一条 `loadValues` 取全部 24 台设备，
+   另一条 `fetchCum` 只为算 KPI 合计再取 4 台计量点。两次都在同一次渲染内完成，
+   视觉上不会重绘。真重复的特征是**轮次之间数量抖动**。
+
 ## 十二、出问题时的第一反应
 
 | 现象 | 先看 |
