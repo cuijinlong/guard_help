@@ -1939,7 +1939,251 @@ energy_management.sankey_flow           桑基图        apply 去重（2 秒窗
    另一条 `fetchCum` 只为算 KPI 合计再取 4 台计量点。两次都在同一次渲染内完成，
    视觉上不会重绘。真重复的特征是**轮次之间数量抖动**。
 
-## 十二、出问题时的第一反应
+## 十二、账单的用量与峰谷核算怎么验
+
+客户问题（2026-11-17）：「生成账单里面的数据是否准确，里面用量/金额，
+这里面还考虑的尖峰平谷的用量的核算是否正确」。
+
+**只看账单自己是循环论证** —— 必须用另一条链路重算。这一节给的 SQL
+直接读原始遥测，不经过 `EnergyBillingService`，两边的数能对上才算过。
+
+### 12.1 账单口径（先记住这一条，再看数字）
+
+```
+用量 = Σ(相邻小时桶差) × 倍率  +  首桶「最早原始点 → 首桶 MAX」× 倍率
+分时 = 每段差额按**后一个桶覆盖的那一小时**归入尖/峰/平/谷/深谷
+电费 = Σ(各档用量 × 该档单价)      ← 以「分」为单位算，不用浮点
+```
+
+三个关键细节，都是踩过的：
+
+- **桶的 ts 是桶中心，不是桶起点**。TB 聚合返回 `00:30 / 01:30 / …`，
+  「00:30 那一点」代表 `[00:00, 01:00)` 的 MAX。拿它当桶起点去取基线，
+  会整整偏半小时（实测少算 112 kW·h）。
+- **首桶必须单独补**。桶 MAX 代表该小时**末**的表底，相邻相减得到后一小时用量，
+  但首桶没有前一个桶可减 —— 从首桶 MAX 起算就丢了「首桶起点 → 首桶 MAX」那段。
+- **差额归入后一个桶**。`桶 i` 减 `桶 i-1` 反映的是 `桶 i` 那一小时的用量。
+
+### 12.2 本次修掉的两个边界 bug
+
+2026-11-17 实测（演示数据，账期 2026-11 只有 11-15~16 两天 48 小时）：
+
+| 表 | 真实用量 | 修复前账单 | 修复后 |
+| --- | --- | --- | --- |
+| 正泰三相 CHINT (×2000) | 5.000 × 2000 = **10000** | 9806（少 194） | **10000** |
+| 雅达三相 YADA (×40) | 6.000 × 40 = **240** | 235.32（少 4.68） | **240** |
+| 正泰单相 DDSU666 (×1) | 10.000 | 9.89 | **10** |
+
+两个 bug：
+
+1. `readHourlyMax` 的过滤写成 `ts > from + HOUR_MS`，
+   把账期**头两个小时**的桶全丢了（`from` 与 `from+1h` 都不满足 `> from+1h`）。
+2. 首桶只当差分基线，桶内前段从未计入。
+
+> 修第 2 条时又踩了一个：把聚合桶 ts 当桶起点，基线偏 30 分钟，
+> 数字只回到 9888 而不是 10000。**判断桶边界前先打一次接口看返回的 ts**。
+
+### 12.3 一条 SQL 验完全部（复制即用）
+
+```sql
+-- 用法：把 :dev 换成设备 id，:from/:to 换成账期毫秒（上海时区自然月）
+-- 输出：用量 + 各档用量 + 原始点数 + 桶数
+WITH p AS (
+  SELECT 'a5df94f0-e107-11f1-9a18-2d4be759e238'::uuid AS dev,   -- ← 改这里
+         1793462400000::bigint AS ts_from,                        -- 2026-11-01 00:00+08
+         1796054399999::bigint AS ts_to                           -- 2026-11-30 23:59:59.999+08
+),
+-- 倍率：meterRatio 优先，其次 ctRatio × ptRatio（SERIALIZED 属性 = attribute_type 2）
+r AS (
+  SELECT coalesce(
+    max(CASE WHEN kd.key='meterRatio' THEN
+      coalesce(ak.str_v, ak.long_v::text, ak.dbl_v::text)::numeric END),
+    coalesce(max(CASE WHEN kd.key='ctRatio' THEN
+      coalesce(ak.str_v, ak.long_v::text, ak.dbl_v::text)::numeric END), 1)
+    * coalesce(max(CASE WHEN kd.key='ptRatio' THEN
+      coalesce(ak.str_v, ak.long_v::text, ak.dbl_v::text)::numeric END), 1)
+  ) AS ratio
+  FROM p, attribute_kv ak
+  JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
+  WHERE ak.entity_id = p.dev AND ak.attribute_type = 2
+    AND kd.key IN ('ctRatio','ptRatio','meterRatio')
+),
+-- 原始点：★ 必须 coalesce(dbl_v, long_v)，整数表底落在 long_v
+raw AS (
+  SELECT t.ts, coalesce(t.dbl_v, t.long_v::double precision) AS v
+  FROM ts_kv t JOIN key_dictionary k ON k.key_id = t.key, p
+  WHERE t.entity_id = p.dev AND k.key = 'energy_reading'
+    AND t.ts >= p.ts_from AND t.ts <= p.ts_to
+),
+-- 小时桶：桶中心 = from + k*1h + 30min（与 TB 聚合一致）
+bucketed AS (
+  SELECT p.ts_from + (floor((raw.ts - p.ts_from) / 3600000.0)::bigint * 3600000 + 1800000) AS center,
+         max(raw.v) AS v
+  FROM raw, p
+  GROUP BY 1
+),
+ordered AS (
+  SELECT center, v,
+         lag(v) OVER (ORDER BY center)  AS prev_v,
+         lag(center) OVER (ORDER BY center) AS prev_center
+  FROM bucketed
+),
+-- 首桶前段：账期起点（或桶中心前 1h）→ 首桶中心 之间的最早原始点
+head AS (
+  SELECT (SELECT v FROM ordered ORDER BY center LIMIT 1)
+       - (SELECT raw.v FROM raw, p
+          WHERE raw.ts >= greatest(p.ts_from,
+                  (SELECT center FROM ordered ORDER BY center LIMIT 1) - 3600000)
+            AND raw.ts <= (SELECT center FROM ordered ORDER BY center LIMIT 1)
+          ORDER BY raw.ts LIMIT 1) AS head_delta,
+         (SELECT center FROM ordered ORDER BY center LIMIT 1) AS head_center
+),
+segs AS (
+  SELECT o.center, o.v - o.prev_v AS delta FROM ordered o WHERE o.prev_v IS NOT NULL
+),
+allsegs AS (
+  SELECT center, delta FROM segs
+  UNION ALL
+  SELECT head_center, head_delta FROM head WHERE head_delta > 0
+),
+-- 分时判定：把桶中心换算回桶起点，再按季节/工作日匹配 tou_scheme
+-- 这里内联 2026-11（春秋季）的规则；跨月/跨季先按 12.4 查方案再改这里
+typed AS (
+  SELECT s.delta,
+    CASE
+      WHEN d.is_weekend THEN
+        CASE WHEN hh < 6  THEN 'deep'
+             WHEN hh < 8  THEN 'valley'
+             WHEN hh < 11 THEN 'flat'
+             WHEN hh < 13 THEN 'peak'
+             WHEN hh < 17 THEN 'flat'
+             WHEN hh < 21 THEN 'peak'
+             WHEN hh < 22 THEN 'flat'
+             ELSE              'valley' END
+      ELSE
+        CASE WHEN hh < 6  THEN 'deep'
+             WHEN hh < 8  THEN 'valley'
+             WHEN hh < 11 THEN 'flat'
+             WHEN hh < 13 THEN 'peak'
+             WHEN hh < 17 THEN 'flat'
+             WHEN hh < 22 THEN 'peak'
+             ELSE              'valley' END
+    END AS tou
+  FROM allsegs s
+  CROSS JOIN LATERAL (
+    SELECT (s.center - 1800000) AS bucket_start     -- 中心 → 起点
+  ) b
+  CROSS JOIN LATERAL (
+    SELECT extract(hour FROM to_timestamp(b.bucket_start/1000) AT TIME ZONE 'Asia/Shanghai')::int AS hh,
+           extract(isodow FROM to_timestamp(b.bucket_start/1000) AT TIME ZONE 'Asia/Shanghai') IN (6,7) AS is_weekend
+  ) d
+)
+SELECT round(sum(CASE WHEN delta > 0 THEN delta * r.ratio ELSE 0 END)::numeric, 4) AS usage,
+       round(sum(CASE WHEN delta > 0 AND tou='tip'    THEN delta * r.ratio ELSE 0 END)::numeric, 4) AS tip,
+       round(sum(CASE WHEN delta > 0 AND tou='peak'   THEN delta * r.ratio ELSE 0 END)::numeric, 4) AS peak,
+       round(sum(CASE WHEN delta > 0 AND tou='flat'   THEN delta * r.ratio ELSE 0 END)::numeric, 4) AS flat,
+       round(sum(CASE WHEN delta > 0 AND tou='valley' THEN delta * r.ratio ELSE 0 END)::numeric, 4) AS valley,
+       round(sum(CASE WHEN delta > 0 AND tou='deep'   THEN delta * r.ratio ELSE 0 END)::numeric, 4) AS deep,
+       (SELECT count(*) FROM raw)    AS raw_points,
+       (SELECT count(*) FROM bucketed) AS buckets
+FROM typed, r;
+```
+
+**本仓库实测输出（2026-11 账期，正泰三相 CHINT）**：
+
+```
+   usage   |   tip   |  peak   |  flat   | valley  |  deep   | raw_points | buckets
+-----------+---------+---------+---------+---------+---------+------------+---------
+ 10000.0000|  0.0000 | 2708.0000| 3128.0000| 1678.0000| 2486.0000|        721 |      48
+```
+
+与账单逐项一致（账单：usage 10000、peak 2708、flat 3128、valley 1678、deep 2486，
+电费 6625.50 = 2708×1.15 + 3128×0.72 + 1678×0.38 + 2486×0.25）。
+
+**怎么读这张表**：
+
+- `usage` = 原始首尾表底差 × 倍率。**这是唯一的真值**，
+  721 个点、表底 2000 → 2005，差 5.000，×2000 = 10000。
+- `usage` 对了但分时构成不对 → 查 `tou_scheme` 的 `blocks`，
+  或者季节/工作日判定（见 12.4）。
+- `raw_points` 只有几个、`buckets` < 2 → **数据本身有缺口**，不是算错。
+- 五项之和不等于 `usage` → 有差额落在 `delta <= 0`（表底倒走 / 归零），
+  账单里会记 `backwardSegments`。
+
+### 12.4 峰谷判定读的是哪张表
+
+时段方案是资产 `tou_scheme`，按 `season` × `dayType` 各一套：
+
+```sql
+SELECT a.name,
+       (SELECT ak.str_v FROM attribute_kv ak JOIN key_dictionary kd ON kd.key_id=ak.attribute_key
+         WHERE ak.entity_id=a.id AND ak.attribute_type=2 AND kd.key='season')  AS season,
+       (SELECT ak.str_v FROM attribute_kv ak JOIN key_dictionary kd ON kd.key_id=ak.attribute_key
+         WHERE ak.entity_id=a.id AND ak.attribute_type=2 AND kd.key='dayType') AS day_type,
+       -- ★ blocks 是 JSON 数组，落在 json_v，不在 str_v
+       (SELECT coalesce(ak.str_v, ak.json_v::text) FROM attribute_kv ak
+          JOIN key_dictionary kd ON kd.key_id=ak.attribute_key
+         WHERE ak.entity_id=a.id AND ak.attribute_type=2 AND kd.key='blocks') AS blocks
+FROM asset a WHERE a.type = 'tou_scheme' ORDER BY a.name;
+```
+
+季节划分（与 `EnergyBillingService#seasonOf` 一致）：
+**7~9 月 = summer，12/1/2 月 = winter，其余 spring_autumn**。
+
+> 取属性一律 `coalesce(str_v, json_v::text, long_v::text, dbl_v::text)`。
+> 只取 `str_v` 会把 `blocks` 读成空 —— 实测导致对账脚本报「方案 0 套」，
+> 分时全算 0，白查一轮。
+
+### 12.5 一条命令验完（推荐）
+
+```bash
+node tools/probe/billing-verify.mjs --period 2026-11
+```
+
+它做的事就是 12.3 的逻辑，但会逐台比对「账单 vs 独立重算」，
+打印用量差、五个档位逐个对照、电费差，退出码说话。
+
+实测输出（2026-11-17）：
+
+```
+  ✓ PowerMeter-3P-CHINT·平台演示中心　倍率 2000　原始点 721　桶 48
+      用量  账单 10000.0000　独立 10000.0000　差 +0.0000
+      分时  peak 账2708.00/独2708.00　flat 账3128.00/独3128.00
+            valley 账1678.00/独1678.00　deep 账2486.00/独2486.00
+      电费  账单 6625.50　独立 6625.50
+  ✓ VirtualMeter-1P-Socket　手工填报 120　全部归平 120
+  ✓ VirtualMeter-3P-Power　手工填报 800　全部归平 800
+
+━━ 结论
+  ✓ 用量、分时构成、电费全部与独立重算一致
+```
+
+### 12.6 虚拟表（手工填报）不参与本对账
+
+虚拟表一个月只有**一个数**，没有小时分布，`readManualUsage` 直接取月首那个点
+× 倍率，整月归「平」档并在账单上标 `touAssumedFlat=true`。
+
+**这不是偷懒，是唯一诚实的做法**：硬按固定比例拆峰谷等于编数，
+而账单是给客户付钱用的。要精确分时，只能上自动采集。
+
+判据：`usageSource=manual` 的账单，`detail.flat` 必须等于 `usage`，其余四档为 0。
+
+### 12.7 出账前先 dryRun
+
+```bash
+TOK=$(curl -s -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+curl -s -X POST -H "X-Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d '{"period":"2026-11","dryRun":true}' \
+  http://127.0.0.1:8090/api/energy/billing/generate
+```
+
+`dryRun=true` 只算不写。注意参数在 **body** 里，不是 query ——
+放 query 会被忽略（`dryRun` 默认 false），**实测会直接落库**。
+
+## 十三、出问题时的第一反应
 
 | 现象 | 先看 |
 | --- | --- |
