@@ -1766,7 +1766,142 @@ Y 轴刻度   0.1  0.15  0.2  0.25  0.3  0.35               （6 档均匀）
 - 用绝对容差还是相对容差？量级可能是 1e-3 也可能是 1e6，只能**相对**；
 - 退化后画成什么？空白、归零、还是居中？要有明确选择，不能让它算出 `NaN` 或 `-280%`。
 
-## 十、出问题时的第一反应
+## 十一、首屏重复取数：进页面就「刷新两次」怎么查
+
+**客户现象**（2026-11-17）：分项能耗、区域能耗、能耗概览刚进页面时图表闪一下、
+数字变一次，像刷新了两次。
+
+**它不是「渲染慢」，是同一份数据被取了多次。** 判断只看一条：
+**参数完全相同的请求，在一次首屏里出现了几次。**
+
+### 11.1 一步定位：按参数分组数重复
+
+```js
+// 存成 /tmp/pwtest/dupcount.mjs，npm i playwright-core 后 node 跑
+import { chromium } from 'playwright-core';
+const exe = process.env.HOME + '/Library/Caches/ms-playwright/chromium-1181/chrome-mac/Chromium.app/Contents/MacOS/Chromium';
+const browser = await chromium.launch({ executablePath: exe, headless: true });
+const page = await browser.newPage({ viewport:{width:1600,height:1000} });
+let calls = [];
+page.on('request', r => {
+  const u = r.url();
+  if (/api\/energy\/telemetry-series/.test(u)) calls.push({ t: Date.now(), q: new URL(u).search });
+});
+await page.goto('http://127.0.0.1:8090/login', { waitUntil:'networkidle', timeout:90000 });
+await page.fill('input[formcontrolname="username"]','tenant@126.com');
+await page.fill('input[formcontrolname="password"]','12345678');
+await page.click('button[type="submit"]');
+await page.waitForTimeout(6000);
+
+const t0 = Date.now();
+await page.goto('http://127.0.0.1:8090/dashboards/7412d840-d2bd-11f1-b794-31725d9e3862',
+                { waitUntil:'domcontentloaded', timeout:120000 });   // 分项能耗
+await page.waitForTimeout(26000);
+
+const g = {};
+calls.forEach(c => { (g[c.q] = g[c.q] || []).push(((c.t - t0)/1000).toFixed(1) + 's'); });
+Object.entries(g).filter(([, v]) => v.length > 1).forEach(([q, v]) => {
+  const p = new URLSearchParams(q);
+  console.log(`${v.length} 次 @${v.join(',')}  keys=${p.get('keys')} iv=${p.get('interval')} limit=${p.get('limit')}`);
+});
+await browser.close();
+```
+
+**必须看完整 query 参数**（`ids` / `keys` / `startTs` / `endTs` / `interval` / `limit`），
+只看 `keys` 会把「不同部件取同一份数据」误判成重复。`limit` 是现成的部件指纹：
+
+| `limit` | 发它的部件 |
+| --- | --- |
+| `3000` | `asset_stats_chart`（统计图，走分段批量 `fetchChunkedMany`） |
+| `10` | `distribution_chart`（占比）与 `ranking_list`（排名），两者都可能发 |
+
+### 11.2 修复前的实测
+
+```
+分项能耗   8 个请求，energy_total_real 被请求 5 次（4.8 / 4.9 / 5.1 / 6.0 / 6.1 秒）
+区域能耗  13 个请求，同一条被请求 12 次（13.2 ~ 17.5 秒，4 秒内）
+```
+
+### 11.3 根因：`render()` 没有输入去重，三个触发源都合法
+
+```
+① firstRender()            初始化时自己渲一版
+② analysis_bar 发布状态    stateChanged → 150ms 去抖 → 再渲一版
+                           （它还会发多版：先无 treeNode，再带 treeNode）
+③ 800ms 轮询兜底           按对象引用比较状态参数，引用被替换时也触发
+```
+
+**为什么不在上游堵**：③ 的存在理由是「编辑部件保存 / 重载后旧订阅会静默失效」，
+是必需通道；② 的多版发布也有它的时序理由。逐个堵既脆弱又会漏，
+所以在**取数之前**按「影响结果的输入」统一去重。
+
+### 11.4 两道闸 + 三个命中条件
+
+**第一道 · 输入指纹**（`lastFingerprint`）：
+`node.id` / `node.type` / `tf`（粒度）/ `tr.fromTs` / `tr.toTs` / `srcMode`（实时/虚拟档）。
+
+**第二道 · 实体指纹**（`sameEntitiesAsLast`）：
+把 `resolveChildren` / `collectLeafAssets` 展开后的**实体 id 集合**排序拼起来再比一次。
+必须有这道：analysis_bar 先发「品种节点」、再发「维度根」时 `node.id` 不同，
+第一道闸放行，但两者展开后落到同一批实体，参数一模一样。
+
+**命中条件**除「指纹相同」外，还要满足其一，否则不挡：
+
+```js
+if (fp === lastFingerprint && (scope.loading || 已有数据 || now - lastFpAt < 2000)) return;
+```
+
+三条各有理由，**缺一条就会漏**：
+
+- `loading` —— 第一次已发出、响应未回
+- `已有数据` —— 上一次画完了，同参数再画纯属浪费
+- **`2 秒时间窗` —— 这条最容易漏**：`finish()` 先把 `loading` 置 false，
+  数据要等 **260ms 最小渲染延迟**才写进 `scope`。这一瞬 `loading=false`、
+  数据为空，0.3 秒内到达的第二次 render 就从这里漏过去（实测 6.9s 与 7.2s 各发一次）。
+
+窗口只 2 秒，不会挡住用户操作：切时间范围、切实时/虚拟档都会改变指纹。
+
+### 11.5 修复后的实测（各 3 轮，每轮 26 秒）
+
+```
+分项能耗  请求 3/3/3 条，多余 0/0/0
+区域能耗  请求 4/4/4 条，多余 0/0/0
+能耗概览  请求 3/3/3 条，多余 0/0/0
+```
+
+**区域能耗那 4 条不是重复**，是 4 个部件各取一次：
+
+```
+asset_stats_chart      按小时  energy_total_real   limit=3000
+distribution_chart     按天    energy_total_real   limit=10
+ranking_list(区域排名)  按天    energy_total_real   limit=10   ← 与上一行参数恰好相同
+ranking_list(单元排名)  按天    energy                limit=10
+```
+
+前两者参数一样，是因为「区域占比」和「区域排名」看的是同一批资产、同一个时间窗 ——
+两个图表各自的职责，不是同一个部件重取一遍。
+**判据**：这类请求在任何一轮里都稳定出现、且数量等于挂载的部件数；
+真重复的特征是**同一轮里同一参数出现 2 次以上，且轮次之间数量抖动**。
+
+### 11.6 回归：守卫不能挡住合法刷新
+
+守卫最容易犯的错不是漏挡，是**挡过头** —— 用户切了范围却不刷新。改完必测两条：
+
+```
+① 切时间粒度   点「按年」→ 必须发出新请求，interval 变成 31536000999，图上柱数变化
+② 切数据来源   选「虚拟设备」→ 必须发出新请求，keys 变成 energy_total_virtual
+```
+
+实测（2026-11-17）：
+
+```
+按日 → 按年           新请求 3 条，svg rect 从 24 变 1
+实时设备 → 虚拟设备    新请求 3 条，keys=energy_total_virtual
+```
+
+两条都通，守卫才算合格。
+
+## 十二、出问题时的第一反应
 
 | 现象 | 先看 |
 | --- | --- |
