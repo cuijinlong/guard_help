@@ -2183,7 +2183,130 @@ curl -s -X POST -H "X-Authorization: Bearer $TOK" -H 'Content-Type: application/
 `dryRun=true` 只算不写。注意参数在 **body** 里，不是 query ——
 放 query 会被忽略（`dryRun` 默认 false），**实测会直接落库**。
 
-## 十三、出问题时的第一反应
+## 十三、闲时能耗的分配怎么验
+
+客户问题（2026-11-17）：「这个功能我感觉算的不对，还是假数据啊？」
+「根据时间段的各种配置都可以把能耗精准的分配是否归属闲时能耗」。
+
+### 13.1 口径
+
+```
+用量 = (相邻小时桶差) × 倍率  +  首桶「最早原始点 → 首桶MAX」× 倍率
+归属 = 差额记在**后一个桶覆盖的那一小时**
+闲/工 = 该小时起点落在生产时段内 → 工作，否则闲时
+生产时段 = 工作日 08:00~17:00（idleConfig.workStart / workEnd）
+           非工作日全天闲时，除非 calendar 把它标成 workday / makeup
+```
+
+### 13.2 修掉的三个缺陷（2026-11-17）
+
+| # | 缺陷 | 实测症状 |
+| --- | --- | --- |
+| ① | 表底差从未乘倍率 | CHINT（×2000）真实 10000 → 页面 **4.9** |
+| ② | 首桶桶内前段未计入 | 9806 而非 10000（差 194 = 0.097×2000） |
+| ③ | 合计被错误去重成 0 | 明细有 10 kWh，合计 **0**（上层表本期无数据却被用来定层） |
+
+① 最要命：数字小三个数量级，客户一眼判定「假数据」。
+`energy_reading` 存的是**二次侧表底**，必须乘 `meterRatio`（或 `ctRatio × ptRatio`）。
+
+③ 的机制：去重是为了避免「上级表含下级」重复计量。
+定层原来取全场最小 `meterLevel`，但若那张表**本期没有遥测**，
+有数据的下级表就会被当成「已被包含」而剔除。改为**只有有数据的表才参与定层**。
+
+### 13.3 一条命令验完（推荐）
+
+```bash
+node tools/probe/idle-verify.mjs --site <场站id> --from 2026-11-15 --to 2026-11-17
+```
+
+它用 psql 直读原始遥测自己重算，与接口逐台比对。实测（2026-11-17）：
+
+```
+  ✓ PowerMeter-3P-CHINT·平台演示中心　倍率 2000
+      真值(首尾表底差×倍率) 10000.0000
+      重算 总 10000.0000 = 工作 1876.00 + 闲时 8124.00
+      接口 总 10000.0000 = 工作 1876.00 + 闲时 8124.00　闲时占比 81.24%
+  ✓ PowerMeter-3P-YADA·平台演示中心　倍率 40
+      真值 240.0000 = 工作 45.00 + 闲时 195.00
+```
+
+**判据**：`总用量` 必须等于「原始首尾表底差 × 倍率」（唯一真值），
+且 `工作 + 闲时` 严格等于总用量（不重不漏）。
+
+### 13.4 时段配置的精准性（同一份数据，只改配置）
+
+```
+基线 08:00~17:00（2026-11-15 周日不工作）    工作 1876.00
+calendar 把 11-15 标成 workday               工作 3752.00   ← 精确 +1876（正好 9 小时）
+daySchedules 11-16 自定义 00:00~24:00 全天     工作 5014.00
+恢复原配置                                    工作 1876.00   ← 可逆
+```
+
+三档都是同一份遥测量，只有配置不同 —— 这才能证明「分配」是对的，
+而不是「数字恰好看着合理」。
+
+改配置并验证的完整命令：
+
+```bash
+TOK=$(curl -s -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# 读当前配置
+curl -s -H "X-Authorization: Bearer $TOK" \
+  "http://127.0.0.1:8090/api/energy/idle-config?siteId=<场站id>"
+
+# 改配置（覆盖式写入场站 asset 的 idleConfig）
+curl -s -X POST -H "X-Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d '{"siteId":"<场站id>","config":{"workStart":"00:00","workEnd":"23:59"}}' \
+  http://127.0.0.1:8090/api/energy/idle-config
+
+# 看结果
+curl -s -H "X-Authorization: Bearer $TOK" \
+  "http://127.0.0.1:8090/api/energy/idle-analysis?siteId=<场站id>&granularity=day&from=<ms>&to=<ms>"
+```
+
+### 13.5 时段的四种配置方式（优先级从高到低）
+
+```
+① daySchedules[date]       单日排班，人工例外。mode: inherit/template/custom/shutdown
+② batchRules               批量规则，按 priority 降序取首条命中的
+③ calendar[date]           逐日日历。workday / holiday / makeup
+④ 星期默认                  周六周日闲时，周一~周五按 workStart~workEnd
+```
+
+跨午夜班次（22:00→次日 06:00）会自动把次日凌晨那段算成生产时段 ——
+`IdleSchedule#carryOverFromPrevDay` 处理，不需要额外配置。
+漏了这一步时，夜班次日凌晨 6 小时会被记成闲时浪费。
+
+### 13.6 虚拟表（手工填报）不参与逐时分配
+
+虚拟表一个月一个数，没有小时分布，无法推峰谷或闲时构成。
+它的用量就是填报值，不参与按小时分配 —— 硬拆等于编数。
+
+### 13.7 看板已拆成 6 个部件
+
+```
+idle_energy.filter   24×2   时间范围 + 粒度，发布 idleRange 到仪表板状态
+idle_energy.kpi      24×3   6 个指标卡片
+idle_energy.share     8×7   工作 vs 闲时环形
+idle_energy.trend    16×7   每日/分时堆叠柱
+idle_energy.curve    24×7   负荷曲线（闲时时段填充）
+idle_energy.table    24×8   设备明细（可筛只看超标）
+```
+
+改文案不必手改 JSON：改 `tools/gen-idle-widgets.py` 里的模板 →
+`python3 tools/gen-idle-widgets.py` → `python3 tools/install-idle-widgets.py`。
+
+> 写部件脚本的两个坑（都踩过）：
+> ① **顶层不能访问 `self.ctx`** —— TB 会先「不带 ctx」执行一遍读 `typeParameters`，
+>    那一刻 `self.ctx` 是 undefined。逻辑一律写在 `self.onInit` 里。
+> ② **模板要用的状态必须挂 `$scope`**。写成 `var loading = false` 只在 onInit 的
+>    闭包里可见，模板里的 `*ngIf="loading"` 读到 undefined ——
+>    部件会永远停在「正在加载…」且不报错，极难查。
+
+## 十四、出问题时的第一反应
 
 | 现象 | 先看 |
 | --- | --- |
