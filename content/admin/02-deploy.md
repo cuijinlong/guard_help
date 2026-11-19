@@ -190,7 +190,7 @@ bash shiyongshouce/downloads/deploy/docker-00-prepare.sh
 
 ```bash
 ls ~/energy-app/guard-server-4.4.0.jar
-ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 30
+ls ~/energy-app/data/json/tenant/dashboards/ | wc -l     # 必须是 29
 ls ~/energy-app/data/sql/*.sql | wc -l                   # 必须是 8
 ```
 
@@ -5866,7 +5866,7 @@ bash docker-02-start.sh --allinone --admin-email ... --admin-pass ...
 | --- | --- |
 | 库表 | 150 上下（`SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`） |
 | 系统部件（install 后 DB 行数） | 740 上下 |
-| 交付的部件文件 | 587 个 |
+| 交付的部件文件 | 585 个 |
 | 客户看板模板 | 30 个 |
 | 建表 SQL | 8 个 |
 | 能源参数字典 | 1 个资产，标准 key **155** 个（电能 140） |

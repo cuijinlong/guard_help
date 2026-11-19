@@ -449,7 +449,7 @@ FROM diffed WHERE delta IS NOT NULL;
 | D1 | 客户账号登录，看场站列表 | 只出现自己名下场站 | `visible-sites` 返回体；`EnergyScopeService` |
 | D2 | 给客户只授权 A 场站，然后改 B 场站费率 | 403，且库里没有新记录 | `node tools/verify-org-module.mjs --with-permissions` |
 | D3 | 改一个场站档案名 | 组织级费率接口仍按 id 工作，不因改名 404 | 同上脚本的改名回归项 |
-| D4 | 客户账号看左侧菜单 | 有「仪表板」且能进 `/dashboards/all` | 见 F1 |
+| D4 | 客户账号看左侧菜单 | **没有「仪表板」入口**；能耗概览等业务看板照常能进 | 2026-11-19 客户要求下线该入口，见 F2 |
 
 > D2 是真出过的漏洞：原实现只比 `customer_id`，同客户下的未授权场站可写。
 > 现在走场站组授权，验收必须覆盖「已授权 200 / 未授权 403」两侧。
@@ -468,13 +468,195 @@ FROM diffed WHERE delta IS NOT NULL;
 
 | # | 操作 | 期望 | 不符怎么查 |
 | --- | --- | --- | --- |
-| F1 | 客户账号进「仪表板」列表 | 只看到自己建的，**26 个能源套件一个都不出现** | 这是设计（铁律 D20）；出现即缺陷 |
-| F2 | 客户从左侧菜单进「仪表板」 | HTTP 200，不是空白页 | `EnergyMenuInstaller#customerItems` |
+| F1 | 客户手输 URL 进「仪表板」列表 | 只看到自己建的，**26 个能源套件一个都不出现** | 这是设计（铁律 D20）；出现即缺陷。入口已于 2026-11-19 从客户菜单下线，只能手输 `/dashboards/all` 验 |
+| F2 | 客户左侧菜单里找「仪表板」 | **找不到**（菜单 空调管理 之后直接是 组织） | `EnergyMenuInstaller#containsRetiredMenu` 的 `RETIRED_DASHBOARDS_TITLE` 判定 |
 | F3 | 租户账号看套件看板 | 26 个都在，能打开 | `DashboardController#ENERGY_TEMPLATE_DASHBOARDS` |
 | F4 | 重装后首次登录 | 菜单与看板自动就位（启动期自愈） | `SystemPatchApplier#syncWidgetTypesOnBoot`；`node tools/check-ui-freshness.mjs` |
 
 > F1 与 F3 是一对：客户看不到、租户看得到，才是对的。
 > 只验一侧会把「过滤过宽」当成正常。
+
+### G. 设备建档：扁平表与测点映射
+
+> 客户 2026-11-19：「场站的设备表格还是树形结构」「设备库选择的厂商和型号不能选」
+> 「测点管理无论哪种添加方式都要映射，设备库选择应按型号自动映射不用手填」。
+> 验收对象是**看板里的部件** `energy_org.sites_page`（客户实际走这里），
+> 不是 Angular 路由 `/sites`。
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| G1 | 进场站 → 设备管理 | 普通表格 + 分页器（每页 10/20/50/100），**没有折叠三角、没有缩进** | 部件 `templateHtml` 里不该再有 `devIsCollapsed` / `padding-left.px` |
+| G2 | 看设备总数与行数 | 行数 = 场站设备数 − 网关数（`additionalInfo.gateway=true` 不进列表） | `API.siteDevices` 返回后 `load` 里过滤；`select count(*)` 对一遍 |
+| G3 | 找一台挂在网关下的表 | 「上级设备」列显示网关名，不是「—」 | `deviceParentMap` 必须传**含网关的全集 id**，只传非网关 id 会全部解析失败 |
+| G4 | 清除筛选后翻页 | 第 1 页 10 行、第 2 页余下，页码/首末页可用 | 分页是纯前端切片；`filteredCount` 与 `length` 必须同源 |
+| G5 | 新建 → 设备库选择 → 厂商 | 下拉有主数据（当前 19 项）；选正泰后型号下拉解禁，含 DDSU666 | 主数据为空看 `/api/energy/vendor-models` 是否 200 |
+| G6 | 选 DDSU666 | 一级类型自动填「电能」；测点表顶部提示「8 个测点已由型号技术档案自动映射，本机无需填写」；来源列 8 行「型号」+ 55 行「内置」 | 来源由 `defaultMeasureRows` 标；`loadModelVendorKeys` 必须等 `ensureBuiltinKeyMap` 就绪 |
+| G7 | 看覆盖度提示 | 显示「型号映射已覆盖本类型要求的 8 个标准字段」，**不是**「还缺 36 个」 | 口径：二级类型 params > 型号 vendorKeys > 候选全集 |
+| G8 | 点「逐行修改」→「新增字段」 | 新行自动滚进视野；选标准字段后来源变「本机」 | `devAddMeasurePoint` 的 `setTimeout(...scrollIntoView)` |
+| G9 | 保存后查属性 | `measurePoints` 落库（当前 63 行），**不含 `source` 字段** | `saveDeviceForm` 的 map 只留 deviceField/standardField/standardName/unit/ratio/freq |
+| G10 | 保存后查关系 | `DEVICE --ModeledBy--> ASSET(型号)` 存在 | `POST /api/energy/devices/{d}/model/{m}`；前端直连 `/api/relation` 会 403（客户对租户级型号无写权限） |
+
+> G10 原来必错：客户账号建不了租户级型号的关系，设备存好了却弹
+> 「关联型号失败（型号映射不会生效）」。服务端代建之后不应该再出现这句红字。
+
+### H. 设备运维抽屉：只读
+
+> 客户 2026-11-19：「点击设备右侧抽屉去掉下面的计量配置，实时和历史选项卡上方
+> 有一个空的测点参数也去掉」。改的是部件 `energy_device.ops_page` 的模板。
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| H1 | 设备运维 → 点任意设备卡片 | 抽屉里只有「设备参数」+ 实时/历史两个页签，**底部没有「计量配置」** | 模板里不该再有 `ops-metering-wrap` / `ops.meter` |
+| H2 | 看页签上方 | **没有「测点参数」标题栏**（它只有标题 + 截止时间 + 刷新，不承载信息） | `.ops-measure-head` 应为 0；截止时间看概要条的「最后上报」 |
+| H3 | 有遥测的设备看实时页签 | 表格正常：分组/测点名称/当前值/单位/更新时间 五列 | 无行先确认该设备是否真没上报（离线设备是空态） |
+| H4 | 切历史页签 | 指标下拉 + 日期 + 画布都在 | `#ops-chart-host`；`ops-history-tools` |
+| H5 | 想改倍率 / 计量层级 | 去「组织 › 场站 › 设备管理 › 编辑设备」，运维页**不再提供**入口 | `opsSaveMetering` / `API.meterConfig` 已删；倍率单一入口 |
+
+> H5 是这次改动的口径：台账属性只在一个地方维护。运维页放第二份入口时，
+> 客户改完不知道哪份为准，而且两边字段名还不一致（层级 vs 倍率 tab）。
+> 自动验收：`TB_USER=demo@126.com TB_PASS=demo123456 node tools/probe/device-ops-verify.mjs`
+
+### I. 设备分组：左树与工具栏
+
+> 客户 2026-11-19：「左侧的树一点不丝滑，好像不是标准的树形组件」
+> 「上面的筛选条件要去掉场站的定位，因为右上角都有了」。
+> 改的是部件 `energy_device.group_page` 的模板 / 脚本 / 样式。
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| I1 | 打开设备分组 | 左树是 `mat-tree`（`role=tree` + `mat-nested-tree-node`），不是一堆 `div` | 模板里应有 `[childrenAccessor]`，**没有** `*ngFor="let row of grp.rows"` |
+| I2 | 点分类箭头展开/收起 | 行不闪、hover 不丢；**收起不销毁 DOM** | 给行打 `data-probe` 标记，收起后标记仍在 = 视图被复用 |
+| I3 | 看箭头 | 同一个 chevron 旋转 90°（`transform: rotate(90deg)`），不是换字形 | `.grp-caret-open .mat-icon` 的 computed transform |
+| I4 | 收起一个分类时看右栏 | 右栏设备表**不重算**（展开只影响左树） | 给右栏行打标记，展开/收起后标记应还在 |
+| I5 | 树变深 | 每层缩进 16px，带一条浅色层级引导线 | `.grp-children { padding-left: 16px }` + `::before` |
+| I6 | 键盘 ↓↑←→ | 能在节点间移动、左右键展开收起（标准树行为） | 树节点的 `[isExpanded]` 与 `grpOnExpanded` 双向同步 |
+| I7 | 搜索「锅炉」 | 只剩命中节点 + 祖先链（当前 12 行），**不是** 70 行 | ★ 不能加 `trackBy`：CDK 嵌套节点只在创建时订阅子数据流，同 id 副本复用视图会画出旧子节点 |
+| I8 | 拖设备到叶子分类 | 落点有绿色虚线高亮，松手可归入；拖到设备行/含子分类的分类上无高亮 | `canDrop` 判据；`dragover` 只在目标变化时 detect（连续事件不能每帧重绘） |
+| I9 | 看顶部工具栏 | **没有场站 chip**（场站看右上角全局选择器）；分组维度 / 搜索 / 展开全部 / 刷新仍在 | 模板里不该再有 `.grp-scope-chip` |
+
+### J. 设备分组：添加设备（左右穿梭框）
+
+> 客户 2026-11-19：「『添加设备』的右侧抽屉中做成左右选择的『待选区』和『已选择』，
+> 而不是单个选择的树形，而且这里要仿照仪表板『查询设置』部件的『按设备层级』的树形结构」
+> 「为了防止右侧抽屉宽度不够，影响左右选择的树形框，你可以把右侧抽屉变宽」。
+> 改的是部件 `energy_device.group_page` 的抽屉模板 / 脚本 / 样式。
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| J1 | 选末端分类 → 添加设备 | 抽屉内是**左右两栏**：「待选设备」在左、「已选择」在右，中间一列穿梭箭头 | 模板里不该再有 `.grp-add-box` / `.grp-add-dev`（旧勾选列表） |
+| J2 | 看左栏 | 是树：场站根（`business` 图标，不可勾选）→ 设备；设备按**计量层级**给图标（power / account_tree / cable / straighten） | 与「查询设置 › 按设备层级」同一套图标语义 |
+| J3 | 勾一台设备 | 只出现在「待移动」状态（底部「已勾 N 台」），**右栏不变**、提交按钮仍 disabled | 勾选与提交清单是两个集合（`checked` / `selected`） |
+| J4 | 点 → 箭头 | 该设备从左栏消失、出现在右栏；按钮变「添加（1）」 | 移过去的设备从待选里撤掉才是穿梭框语义 |
+| J5 | 点右栏行上的 × | 该台回到左栏，右栏计数减 1 | `.grp-add-remove` |
+| J6 | 点 ← 箭头 | 右栏全部移回左栏 | 提交按钮回到 disabled |
+| J7 | 看两栏排序 | 都按名称排（`localeCompare`），移过去之后顺序不变 | 右栏若按点击顺序/候选顺序排，同一批设备两个顺序会让人以为选错 |
+| J8 | 看抽屉宽度 | **980px**（笔记本 1366 上不溢出，左边界 ≥ 0）；两栏各约 451px，设备名不截断 | 改宽前 760px 时每栏只有 340px，名称被截成三四个字 |
+| J9 | 关掉抽屉再打开 | 勾选与已选择清空，展开态保留 | `grpAddCancel` / `grpAddConfirm` 都要清 `checked` + `selected` |
+| J10 | 真提交一台 | 抽屉关闭、右栏设备表 +1、树上的「N 台」+1 | 落库是 `ASSET -Contains-> DEVICE`；验收后记得解绑恢复 |
+
+### K. 设备分组：树行细节（对齐 / 收起 / 无阴影）
+
+> 客户 2026-11-19：「数节点的箭头图标名称三者水平不齐，而且点名称只能展开不能缩回，
+> 还有箭头和后面三个点鼠标指向有阴影」。
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| K1 | 看树行 | 箭头 / 类型图标 / 名称 / 更多 四个元素中心线同一像素（极差 < 1px） | `mat-icon` 默认 `line-height:24px` 会把图标推偏，需在样式里显式收紧 |
+| K2 | 鼠标指向箭头或「更多」 | **不出现圆形灰底**（只有整行变浅灰） | `--mat-icon-button-hover-state-layer-opacity` 必须为 0 |
+| K3 | 量按钮尺寸 | 箭头与「更多」= 26×34（等于行高），padding 0，`.mat-mdc-button-touch-target` 为 none | 只写单类选择器压不住，Material 的 `.mat-mdc-icon-button.mat-mdc-button-base` 权重更高 |
+| K4 | 点分类**名称** | 展开 ↔ 收起都能切换（原来只能展开） | `grpSelect` 里不能硬编码 `expanded = true`；且搜索态下要同步副本与真实节点 |
+| K5 | 点箭头 | 只切换展开，不改变选中 | `$event.stopPropagation()` |
+
+### L. 设备运维：历史视图、导出、测点跨品种去重
+
+> 客户 2026-11-19 连续提的四条：
+> 「历史参数选项卡的日期选择没有用时间选择器组件」
+> 「加一下历史参数的图表和表格的切换同时可以下载表格，实时监测的表格也要支持导出」
+> 「图表和表格切换的样式参考实时能耗，默认图表，鼠标移上去右上角才显示切换」
+> 「雅达三相电表 YDPQ200-A 实时监测的遥测中和标准 kW·h 不一样，还有用水量用气量」
+
+| # | 操作 | 期望 | 不符怎么查 |
+| --- | --- | --- | --- |
+| L1 | 历史参数 → 看日期控件 | 是 TB 的 `tb-datetime`（带日历弹层），**不是**浏览器原生 `input[type=date]` | 工具条里 `input[type=date]` 应为 0 个 |
+| L2 | 历史参数 → 鼠标移入 | 图表 / 表格切换**默认隐藏**，移入才在右上角浮现，移走消失 | `.ops-history:hover .eq-view-tools`；默认 `opacity:0; pointer-events:none` |
+| L3 | 点「表格」图标 | 渲染宽表：时间 + 每测点一列；表头列数 = 每行单元格数 | 动态列写成「一个 columnDef 里 ngFor」会让表头与数据错位 |
+| L4 | 表格视图 → 导出 | 下载 CSV，含 BOM（Excel 不乱码），行数 = 表格行数 + 表头 | 无 BOM 时 Excel 中文乱码 |
+| L5 | 实时监测 → 导出表格 | 同上，列：分组 / 测点名称 / 当前值 / 单位 / 更新时间 | 无数据时不显示按钮 |
+| L6 | 生产园区 → 雅达三相电表 YDPQ200-A | 实时表 **82 行**（= 该设备原始 key 数），无重名；单位只有 kW·h / kVar·h / V / A / kW / kVar / kVA / Hz / % / ° / — | 出现 m³ / t / GJ 就是跨品种串了 |
+| L7 | 同上看「用电量」 | `用电量 0.32 kW·h`，**不是**「用水量 0.32 m³」 | 见下方根因 |
+
+### M. 指标 key 跨品种隔离（根治）
+
+> 承 L6/L7。2026-11-19 按客户要求「根治，不要拆东墙补西墙」做的完整修复。
+> 铁律见 `铁律.md` D1b。
+
+| # | 检查项 | 期望 | 怎么验 |
+| --- | --- | --- | --- |
+| M1 | 后端 `.metric-params` 不传 kindCode | 8 个品种（行为不变，向后兼容） | `curl /api/energy/metric-params` |
+| M2 | `?kindCode=elec` | 只回 1 个（电能），响应 `kindCode='elec'` | 同上加参数 |
+| M3 | `?kindCode=nope` | 回 0 个，不报 404/500 | 同上 |
+| M4 | `?kindCode=env&energyOnly=true` | 0 个（交集：env 不是用能品种） | 同上 |
+| M5 | 看板部件 `energy_device.ops_page` 选雅达电表 | 82 行、0 重名、单位全是电参量、顶部标「品种：电能」 | `node tools/probe/device-ops-verify.mjs`（⑦ 组） |
+| M6 | Angular `/device-management` 选同一台 | 40 个分组、82 行、同样零污染 | 手工或 `/tmp/shots/devmgmt_measure.mjs` |
+| M7 | 品种识别不出（无 type1 且档案名推断不出） | 所有测点进「其它测点」+ 原始 key 名 + 顶部琥珀提示 | 逻辑验证见下 |
+| M8 | 字典新增品种（租户自建「氧气」） | `kindCodeOfKind` 按 name 自动命中，不需要改代码 | 建一个品种看设备建档下拉 |
+
+**结构怎么改的（不是打补丁）**
+
+```
+旧：kindParams = 全量 kinds[].params[] 拍平成一维数组
+    → key 查找在全局命名空间 → 后到的品种覆盖先到的
+
+新：paramsByKind[code] = 该品种的 params[]
+    → 先定设备品种、再取那一组，key 查找天然被品种隔离
+```
+
+**品种判定权威性**：设备属性 `type1`（elec/water/…）优先，
+档案名推断兜底。存量 38 台里 5 台缺 type1，走兜底。
+
+**两处前端都改了**（缺一处就是拆东墙）：
+- 看板部件 `energy_device.ops_page`（客户实际走这个）
+- Angular 路由 `/device-management`（租户用）
+
+另外三个用字典的地方检查过，本来就是对的：
+`param-report`（三层遍历，key 始终带 kind 上下文）、
+`meter-reading`（同上）、`query_panel`（按品种建 source，一次只取当前品种）。
+
+> 逻辑验证脚本（从部件里抠真实函数跑，不重写）：
+> `node tools/probe/metric-kind-isolation-test.mjs`
+> —— 5 个品种零污染零重名 + 6 条品种判定 + 未知品种归「其它测点」+ 4 条后端参数，全绿。
+> 字典快照存在 `tools/probe/fixtures/metric-params.kinds.json`，离线也能跑。
+
+> **L6/L7 的根因**：`/api/energy/metric-params` 的指标字典**按品种**定义，
+> 而前端拉的是全量平铺清单。`energy`、`energy_reading`、`power` 三个 key
+> 在 5 个品种里同名不同义：
+> ```
+> energy          电能·用电量(kW·h) | 水表·用水量(m³) | 燃气·用气量(m³)
+>                 | 蒸汽·蒸汽用量(t) | 热力·用热量(GJ)
+> energy_reading  电能·正向有功总电度 | 水表·累计用水量 | 燃气·累计用气量 | …
+> ```
+> 按 key 匹配时同一份数据被 5 个品种各收一次 → 90 行（多出 8 行水/气/蒸汽/热）。
+> 修法两条：**设备品种优先排序** + **同 key 只归一组**。
+> 反例验证：一台只有水 key 的表，不传品种会归到「电能·用电量 kW·h」（错），
+> 传 `devKind='水表'` 才归到「水表·用水量 m³」（对）。
+> 自动验收：`node tools/probe/device-ops-verify.mjs`（⑦ 组四条）
+
+> K3 是根因：`--mdc-icon-button-state-layer-size` 实测仍是 48px、padding 仍是 12px，
+> 于是按钮在 34px 的行里上下各溢 7px（K1 的"不齐"）+ 一个 48px 圆盘（K2 的"阴影"）。
+> 修法是把选择器写成「父级 + 自身」两级（`.grp-row .grp-caret`），
+> 加前缀后才够权重；同时把 hover 状态层与 touch-target 一起关掉。
+> 自动验收已含 ⑪–⑮ 五条：`node tools/probe/device-group-verify.mjs`
+
+> J3 是这次改造的核心：旧版「勾一下就等于选中」，
+> 客户点错只能自己找回来；穿梭框把「挑」和「定」分成两步。
+> 自动验收：`TB_USER=demo@126.com TB_PASS=demo123456 node tools/probe/device-group-verify.mjs`
+
+> I2/I4 是「丝滑」的可验证定义：**同样的操作，DOM 是否被重建**。
+> 实测（70 节点全展开，连续 10 次展开/收起）：
+> 旧实现每次 70 行树 + 5 行右栏全部重建（10/10 次丢失标记）；
+> 新实现 0 次重建。单次耗时接近（22.8ms → 21.5ms），
+> 真正的差别是"不再闪、不再丢滚动位置"。
+> 自动验收：`TB_USER=demo@126.com TB_PASS=demo123456 node tools/probe/device-group-verify.mjs`
 
 ---
 
@@ -2435,6 +2617,57 @@ system.comprehensive.table             24×9   逐设备用量 / 折标 / 费用
 
 同一份用量同时计入「分项」和「区域」两个口径，**不会重复计入总量** ——
 总量是逐设备累加的，维度只是同一批数字的另一种切法。
+
+### 14.8 页面显示 `0.00 tce` 怎么分辨「没数据」还是「精度」
+
+**先看同一屏里别的数字。** 这是最快的判据：
+
+| 同屏费用 / 碳排放 | 说明 | 查什么 |
+| --- | --- | --- |
+| 有值（¥7、0.01 tCO₂） | **精度问题**：数是真的，被两位小数舍成 0 | 显示格式 |
+| 都是 0 / 显示「无数据」 | 取数问题 | 请求的键、设备池 |
+
+2026-11-18 实测：单相园区 130 kW·h ≈ 0.016 tce。原先三处都写死
+`number:'1.2-2'` → 全部显示 `0.00`，而费用 ¥7、碳 0.01 都是对的。
+现在统一改成自适应：**< 0.01 tce 切 kgce**，显示为 `1.2 kgce`。
+
+涉及三处，改一处不够（这就是「不要重复造轮子」的反面教材）：
+
+```
+energy_management.sankey_flow        能源流向
+energy_management.audit_report       盘查报告
+energy_management.energy_overview    已删除（被 comprehensive.* 替代）
+```
+
+**取数侧的真故障**长这样：部件按 `keys=energy` 读遥测 ——
+`energy` 是手工填报表的键，实表上的累计表底是 `energy_reading`。
+24 台真实设备全部返回 `{}`，节点 value 全 0。
+判据是「已关联计量点 4 个」和「能源输入总量 0.00tce」同时出现 ——
+两个数字自相矛盾，说明是取数而不是数据本身。
+
+### 14.9 性能：为什么批量走 SQL 而不是 `timeseriesService`
+
+同一份数据两条读取路径，实测差 **18 倍**：
+
+| 路径 | 单次查询 | 全年全站（38 台） |
+| --- | --- | --- |
+| `timeseriesService.findAll`（每台 16 次） | ≈1.8 s | 226 s（串行）/ 141 s（8 路并发） |
+| `ts_kv` SQL 直查（一次全出） | ≈0.1 s | 1.8 s |
+
+页面 26 秒就放弃等待 → 用户看到 `0.00 tce`，而后端其实还在算。
+两边都没报错，用户只会觉得这功能坏了。
+
+`MeterUsageReader.readBatch` 就是 SQL 那条路，口径与 `read()` 逐位相同：
+
+```
+正泰三相 10000.0000 / 雅达三相 240.0000 / 单相表 10.0000
+```
+
+**两处唯一的表达差异**：SQL 的桶 ts 是**桶起点**（`from + n*iv`），
+TB 原生返回**桶中心**。`Slice` 本来就要求桶起点，所以 SQL 路径
+**不再减 30 分钟** —— 减了就整整偏半小时。
+
+SQL 后端不可用（Cassandra 等）时自动退回逐台 `read()`，结果不变只是慢。
 
 ## 十五、出问题时的第一反应
 
