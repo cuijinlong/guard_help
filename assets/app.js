@@ -88,11 +88,16 @@
   // 状态存 localStorage：换页、刷新都保持用户上次的展开/收起，
   // 否则每跳一页都得重新点开一次。
 
-  const NAV_STATE_KEY = 'help-nav-collapsed';
+  // ★ key 带版本号（-v2）：2026-11-25 把默认从「展开当前路径」改成「全部收起」。
+  //   不带版本的话，老访客浏览器里存着上一版的展开状态，升级后打开
+  //   **看到的还是展开的** —— 会以为「默认收缩没生效」。
+  //   换 key 等于一次性作废旧偏好；之后用户自己的选择照常记住。
+  const NAV_STATE_KEY = 'help-nav-collapsed-v2';
   /** 被收起的节点路径集合（如 'admin'、'menu-ops/customer/query'） */
   const collapsedPaths = new Set();
   let navStateStored = false;    // localStorage 里是否已有用户的显式状态
-  let navDefaultApplied = false; // 首次的「只展开当前路径」是否已生效
+  let navDefaultApplied = false; // 首次的「全部收起」是否已生效
+  let navVisited = false;        // 是否已经完成过首次渲染（用于区分「首次」与「导航」）
 
   function loadNavState() {
     try {
@@ -111,28 +116,29 @@
   }
 
   /**
-   * 首次访问：只展开当前页所在的路径，其余分组都收起。
+   * 首次进入：**全部收起**。
    *
-   * 这正是平台左侧菜单的默认行为 —— 进来就能看到「我在哪」，
-   * 同时不被 26 个条目淹没。用户一旦自己点过，就不再套用这个默认。
+   * 客户明确要求「默认是收缩的」——平台左侧菜单进去也是全收的，
+   * 手册保持一致。展开哪个组由用户自己点，不要替他猜。
+   *
+   * 先前的做法是「只展开当前页所在路径」，好处是能一眼看到自己在哪，
+   * 但 26 个功能页展开后仍要滚很长；客户定了全收，就按全收。
+   * 当前页藏在收起的分组里时，靠标题提亮（data-active-parent）提示位置。
    */
-  function applyDefaultCollapse(activeKey) {
-    if (navStateStored || navDefaultApplied || !activeKey) return;
+  function collapseAllByDefault() {
+    if (navStateStored || navDefaultApplied || !manifest) return;
     navDefaultApplied = true;
-    const parts = String(activeKey).split('/').filter(Boolean);
-    const onPath = new Set();
-    for (let i = 1; i <= parts.length; i++) onPath.add(parts.slice(0, i).join('/'));
     const walk = (items, prefix) => {
       for (const it of items || []) {
         const p = prefix + '/' + it.id;
         if (it.children && it.children.length) {
-          if (!onPath.has(p)) collapsedPaths.add(p);
+          collapsedPaths.add(p);
           walk(it.children, p);
         }
       }
     };
     for (const sec of manifest.sections) {
-      if (!onPath.has(sec.id)) collapsedPaths.add(sec.id);
+      if ((sec.items || []).length) collapsedPaths.add(sec.id);
       walk(sec.items, sec.id);
     }
   }
@@ -142,6 +148,8 @@
    *
    * 不这么做的话：用户收起「能耗查询」，再从别页点链接进来，
    * 当前页就藏在自己收起的组里 —— 只有标题高亮，看不见任何条目。
+   *
+   * 只用于**用户点击后的导航**；首次加载不调它，否则默认就不是「全收起」了。
    */
   function expandAncestors(activeKey) {
     const parts = String(activeKey || '').split('/').filter(Boolean);
@@ -393,9 +401,12 @@
 
     const key = found.key;
     currentKey = key;
-    // 首次访问只展开当前路径；跳转时把祖先展开（详见各自注释）
-    applyDefaultCollapse(key);
-    expandAncestors(key);
+    // 首次渲染不展开任何分组（默认收缩，含当前页所在的组）——
+    // 全收起已在 init 里应用，这里仅在**用户点击导航**后展开祖先：
+    // 用户点了某个条目，总得让他看见它。
+    const isFirstRender = !navVisited;
+    navVisited = true;
+    if (!isFirstRender) expandAncestors(key);
     renderNav(key);
     document.title = found.item.title + ' · ' + manifest.title;
 
@@ -455,6 +466,9 @@
       manifest = await res.json();
       versionEl.textContent = manifest.version || '';
       loadNavState();
+      // 在这里就把默认的「全部收起」应用上：
+      //   放到 loadPage 里做，首次会先渲染一次全展开再变收起 —— 肉眼能看到的闪动。
+      collapseAllByDefault();
       if (manifest.sections.length) {
         // 首页默认展示第一组的第一页
         const first = manifest.sections[0];
