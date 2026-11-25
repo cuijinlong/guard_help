@@ -166,10 +166,6 @@ body {
 }
 
 .nav-group-title {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 0 10px 8px;
   font-size: 12px;
   font-weight: 700;
   letter-spacing: .4px;
@@ -215,12 +211,13 @@ body {
    层级用 .nav-depth-N 控制缩进，不写死层数：菜单要和系统左侧逐级对齐，
    将来多一层不用回来改样式。 */
 
-.nav-sub-group { margin: 2px 0 4px; }
+.nav-sub-group { margin: 1px 0 2px; }
 
 .nav-sub-title {
   display: block;
-  padding: 6px 12px;
-  margin: 2px 0;
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
   border-radius: 6px;
   font-size: 13px;
   font-weight: 600;
@@ -232,6 +229,13 @@ a.nav-sub-title.active {
   background: #e3f0fb;
   color: var(--brand-dark);
 }
+
+/* 没有 file 的分组标题：纯文字，整行可点开合 */
+span.nav-sub-title.is-plain {
+  cursor: pointer;
+  user-select: none;
+}
+span.nav-sub-title.is-plain:hover { background: #eaf2fa; color: var(--brand-dark); }
 
 .nav-sub-items {
   display: flex;
@@ -246,6 +250,73 @@ a.nav-sub-title.active {
 }
 
 .nav-icon-ops { background: linear-gradient(135deg, #f0c987, #d9a24c); }
+
+/* ---------- 树形折叠 ----------
+   折叠状态靠容器上的 data-collapsed 属性，
+   用 `>` 限定只隐藏直接子级（更深层的嵌套不该被误伤）。 */
+
+.nav-group-row,
+.nav-sub-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-right: 8px;
+}
+
+/* section 标题需要底部间距（原来靠 .nav-group-title 的 padding 撑），
+   子分组标题不要 —— 条目间靠 .nav-sub-group 的 margin */
+.nav-group-row {
+  padding-bottom: 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.nav-group-row:hover { background: #eaf2fa; }
+.nav-sub-row { padding-left: 0; }
+
+.nav-caret-btn {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-mute);
+}
+.nav-caret-btn:hover { background: #e6eef7; color: var(--brand-dark); }
+.nav-caret-btn:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+}
+
+/* 三角形用 border 画：不依赖字体图标，也就不用额外请求资源 */
+.nav-caret-btn::before {
+  content: '';
+  width: 0;
+  height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform .15s ease;
+}
+.nav-caret-btn.open::before { transform: rotate(90deg); }
+
+.nav-caret-spacer { flex: none; width: 22px; }
+
+[data-collapsed="true"] > .nav-items,
+[data-collapsed="true"] > .nav-sub-items,
+[data-collapsed="true"] > .nav-group-desc { display: none; }
+
+/* 分组已收起，但当前页就在里面 → 标题提亮，避免「当前页凭空消失」 */
+[data-collapsed="true"][data-active-parent="true"] > .nav-group-row .nav-group-title,
+[data-collapsed="true"][data-active-parent="true"] > .nav-sub-row .nav-sub-title {
+  color: var(--brand-dark);
+}
 
 /* ---------- 右侧目录 ---------- */
 
