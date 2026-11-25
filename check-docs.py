@@ -477,6 +477,7 @@ def check_generated_pages() -> list[str]:
     tools = [
         ('gen-menu-sql-map.py', '⑭ 菜单→SQL 核对卡'),
         ('gen-ops-customer-pages.py', '运维管理→客户 逐功能页'),
+        ('gen-ops-tenant-pages.py', '运维管理→租户 逐功能页'),
     ]
     try:
         probe = subprocess.run(
@@ -496,6 +497,25 @@ def check_generated_pages() -> list[str]:
             detail = [ln for ln in (p.stdout or '').splitlines() if ln.strip().startswith('·')]
             errs.append(f'{label} 与库不一致（{(detail[0].strip() if detail else "见手册生成器输出")}）'
                         f' → 重跑 tools/{script}')
+
+    # 租户菜单快照 —— 只有本机带 ui-ngx 源码时才校验。
+    #
+    # 为什么要单独一条：租户菜单的真实结构在前端 menu.models.ts 里，
+    # 手册生成器读的是 tools/data/tenant-menu.json（快照）。前端加了菜单项、
+    # 而快照没重跑，手册就会静默停在旧结构 —— 既不报错，页面也正常打开。
+    # 没有源码的机器（只部署了服务）跳过，不阻塞文档同步。
+    snap_tool = repo / 'tools/gen-tenant-menu-snapshot.mjs'
+    has_ui = (repo / 'ui-ngx/src/app/core/services/menu.models.ts').exists()
+    if snap_tool.exists() and has_ui:
+        p = subprocess.run(['node', str(snap_tool), '--check'],
+                           capture_output=True, text=True, timeout=180, cwd=str(repo))
+        if p.returncode != 0:
+            errs.append('租户菜单快照与前端 menu.models.ts 不一致'
+                        ' → 重跑 node tools/gen-tenant-menu-snapshot.mjs，'
+                        '再跑 tools/gen-ops-tenant-pages.py')
+    elif snap_tool.exists():
+        # 跳过要打出来，别让人以为已经验过
+        print('· 租户菜单快照未校验：本机无 ui-ngx 源码')
     return errs
 
 
@@ -605,10 +625,16 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
     # 这些页给的 SQL 包在 `docker exec ... <<'SQL'` 的 heredoc 里 ——
     # 用户是整段复制到终端跑的，所以**必须是能跑的原样**。
     # 不从 heredoc 里抽出来跑，就等于把这些页排除在自动校验之外。
-    ops_dir = DOCS / 'ops-customer'
-    if ops_dir.is_dir():
+    # ★ 注意 DOCS 是 content/admin，而这两个目录在 content/ 下 ——
+    #   写成 DOCS / ops_name 会静默跳过（目录不存在就不是错误），
+    #   于是这些页的 SQL 从来没被实跑过（2026-11-25 发现并修正）。
+    for ops_name in ('ops-customer', 'ops-tenant'):
+        ops_dir = ROOT / 'content' / ops_name
+        if not ops_dir.is_dir():
+            continue
         for f in sorted(ops_dir.glob('*.md')):
-            blocks.extend(re.findall(r"<<'SQL'\n(.*?)\nSQL\n", f.read_text(encoding='utf-8'), re.S))
+            blocks.extend(re.findall(r"<<'SQL'\n(.*?)\nSQL\n",
+                                     f.read_text(encoding='utf-8'), re.S))
 
     # 去重：逐功能页与 14-menu-sql-map 共用同一份 PAGE_SQL，
     # 同一段 SQL 不必重复跑两遍（几十条 × 每条几百毫秒）。
@@ -928,7 +954,7 @@ def main() -> int:
         # 跳过也要打出来：否则看到「全部一致」会误以为已经验过
         print(f'\n· 生成页未校验：{gen_skipped[0]}')
     else:
-        print('\n✓ 生成页与库一致（⑭ 菜单→SQL 核对卡 + 运维管理→客户 逐功能页）')
+        print('\n✓ 生成页与库一致（⑭ 核对卡 + 运维管理→客户 / 租户 逐功能页）')
 
     # ---------------- 故障手册章节编号唯一性 ----------------
     numbering_errors = check_troubleshoot_numbering()

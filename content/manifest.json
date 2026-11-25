@@ -129,7 +129,7 @@
     {
       "id": "menu-ops",
       "title": "运维管理",
-      "desc": "按平台客户菜单逐级核对每个功能的取数 SQL（可复制运行）",
+      "desc": "按平台菜单逐级核对每个功能的取数 SQL（可复制运行）",
       "icon": "ops",
       "items": [
         {
@@ -330,9 +330,518 @@
               "dashboardId": "04e26da0-d3b7-11f1-8238-c3a7be535a93"
             }
           ]
+        },
+        {
+          "id": "tenant",
+          "title": "租户",
+          "file": "ops-tenant/00-index.md",
+          "children": [
+            {
+              "id": "home",
+              "title": "首页",
+              "file": "ops-tenant/home.md"
+            },
+            {
+              "id": "monitor",
+              "title": "监控",
+              "file": "ops-tenant/monitor.md",
+              "children": [
+                {
+                  "id": "dashboards",
+                  "title": "仪表板",
+                  "file": "ops-tenant/monitor-dashboards.md",
+                  "children": [
+                    {
+                      "id": "dashboard_all",
+                      "title": "全部",
+                      "file": "ops-tenant/monitor-dashboards-dashboard_all.md"
+                    },
+                    {
+                      "id": "dashboard_groups",
+                      "title": "分组",
+                      "file": "ops-tenant/monitor-dashboards-dashboard_groups.md"
+                    },
+                    {
+                      "id": "dashboard_shared",
+                      "title": "共享",
+                      "file": "ops-tenant/monitor-dashboards-dashboard_shared.md"
+                    }
+                  ]
+                },
+                {
+                  "id": "alarms_center",
+                  "title": "告警",
+                  "file": "ops-tenant/monitor-alarms_center.md",
+                  "children": [
+                    {
+                      "id": "alarms",
+                      "title": "告警列表",
+                      "file": "ops-tenant/monitor-alarms_center-alarms.md"
+                    },
+                    {
+                      "id": "alarm_rules",
+                      "title": "告警规则",
+                      "file": "ops-tenant/monitor-alarms_center-alarm_rules.md"
+                    }
+                  ]
+                },
+                {
+                  "id": "notifications_center",
+                  "title": "通知",
+                  "file": "ops-tenant/monitor-notifications_center.md",
+                  "children": [
+                    {
+                      "id": "notification_inbox",
+                      "title": "收件箱",
+                      "file": "ops-tenant/monitor-notifications_center-notification_inbox.md"
+                    },
+                    {
+                      "id": "notification_sent",
+                      "title": "已发送",
+                      "file": "ops-tenant/monitor-notifications_center-notification_sent.md"
+                    },
+                    {
+                      "id": "notification_recipients",
+                      "title": "收件人",
+                      "file": "ops-tenant/monitor-notifications_center-notification_recipients.md"
+                    },
+                    {
+                      "id": "notification_templates",
+                      "title": "模板",
+                      "file": "ops-tenant/monitor-notifications_center-notification_templates.md"
+                    },
+                    {
+                      "id": "notification_rules",
+                      "title": "规则",
+                      "file": "ops-tenant/monitor-notifications_center-notification_rules.md"
+                    }
+                  ]
+                },
+                {
+                  "id": "reporting",
+                  "title": "报告",
+                  "file": "ops-tenant/monitor-reporting.md",
+                  "children": [
+                    {
+                      "id": "report_templates",
+                      "title": "模板",
+                      "file": "ops-tenant/monitor-reporting-report_templates.md"
+                    },
+                    {
+                      "id": "report_scheduling",
+                      "title": "调度",
+                      "file": "ops-tenant/monitor-reporting-report_scheduling.md"
+                    },
+                    {
+                      "id": "reports",
+                      "title": "报告",
+                      "file": "ops-tenant/monitor-reporting-reports.md"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "entities",
+              "title": "实体",
+              "file": "ops-tenant/entities.md",
+              "children": [
+                {
+                  "id": "devices",
+                  "title": "设备",
+                  "file": "ops-tenant/entities-devices.md",
+                  "children": [
+                    {
+                      "id": "device_all",
+                      "title": "全部",
+                      "file": "ops-tenant/entities-devices-device_all.md"
+                    },
+                    {
+                      "id": "device_groups",
+                      "title": "分组",
+                      "file": "ops-tenant/entities-devices-device_groups.md"
+                    },
+                    {
+                      "id": "device_shared",
+                      "title": "共享",
+                      "file": "ops-tenant/entities-devices-device_shared.md"
+                    }
+                  ]
+                },
+                {
+                  "id": "gateways",
+                  "title": "网关",
+                  "file": "ops-tenant/entities-gateways.md"
+                },
+                {
+                  "id": "assets",
+                  "title": "资产",
+                  "file": "ops-tenant/entities-assets.md",
+                  "children": [
+                    {
+                      "id": "asset_all",
+                      "title": "全部",
+                      "file": "ops-tenant/entities-assets-asset_all.md"
+                    },
+                    {
+                      "id": "asset_groups",
+                      "title": "组",
+                      "file": "ops-tenant/entities-assets-asset_groups.md"
+                    },
+                    {
+                      "id": "asset_shared",
+                      "title": "共享",
+                      "file": "ops-tenant/entities-assets-asset_shared.md"
+                    }
+                  ]
+                },
+                {
+                  "id": "device_profiles",
+                  "title": "设备配置",
+                  "file": "ops-tenant/entities-device_profiles.md"
+                },
+                {
+                  "id": "asset_profiles",
+                  "title": "资产配置",
+                  "file": "ops-tenant/entities-asset_profiles.md"
+                },
+                {
+                  "id": "entity_views",
+                  "title": "实体视图",
+                  "file": "ops-tenant/entities-entity_views.md",
+                  "children": [
+                    {
+                      "id": "entity_view_all",
+                      "title": "全部",
+                      "file": "ops-tenant/entities-entity_views-entity_view_all.md"
+                    },
+                    {
+                      "id": "entity_view_groups",
+                      "title": "分组",
+                      "file": "ops-tenant/entities-entity_views-entity_view_groups.md"
+                    },
+                    {
+                      "id": "entity_view_shared",
+                      "title": "共享",
+                      "file": "ops-tenant/entities-entity_views-entity_view_shared.md"
+                    }
+                  ]
+                },
+                {
+                  "id": "otaUpdates",
+                  "title": "OTA 更新",
+                  "file": "ops-tenant/entities-otaUpdates.md"
+                }
+              ]
+            },
+            {
+              "id": "customers_and_users",
+              "title": "客户与用户",
+              "file": "ops-tenant/customers_and_users.md",
+              "children": [
+                {
+                  "id": "customers",
+                  "title": "客户",
+                  "file": "ops-tenant/customers_and_users-customers.md",
+                  "children": [
+                    {
+                      "id": "customer_all",
+                      "title": "全部",
+                      "file": "ops-tenant/customers_and_users-customers-customer_all.md"
+                    },
+                    {
+                      "id": "customer_groups",
+                      "title": "分组",
+                      "file": "ops-tenant/customers_and_users-customers-customer_groups.md"
+                    },
+                    {
+                      "id": "customer_shared",
+                      "title": "共享",
+                      "file": "ops-tenant/customers_and_users-customers-customer_shared.md"
+                    },
+                    {
+                      "id": "customers_hierarchy",
+                      "title": "层级",
+                      "file": "ops-tenant/customers_and_users-customers-customers_hierarchy.md"
+                    }
+                  ]
+                },
+                {
+                  "id": "users",
+                  "title": "用户",
+                  "file": "ops-tenant/customers_and_users-users.md",
+                  "children": [
+                    {
+                      "id": "user_all",
+                      "title": "全部",
+                      "file": "ops-tenant/customers_and_users-users-user_all.md"
+                    },
+                    {
+                      "id": "user_groups",
+                      "title": "分组",
+                      "file": "ops-tenant/customers_and_users-users-user_groups.md"
+                    }
+                  ]
+                },
+                {
+                  "id": "roles",
+                  "title": "角色",
+                  "file": "ops-tenant/customers_and_users-roles.md"
+                }
+              ]
+            },
+            {
+              "id": "data_processing",
+              "title": "数据处理",
+              "file": "ops-tenant/data_processing.md",
+              "children": [
+                {
+                  "id": "calculated_fields",
+                  "title": "计算字段",
+                  "file": "ops-tenant/data_processing-calculated_fields.md"
+                },
+                {
+                  "id": "rule_chains",
+                  "title": "规则链",
+                  "file": "ops-tenant/data_processing-rule_chains.md"
+                }
+              ]
+            },
+            {
+              "id": "white_labeling",
+              "title": "白标",
+              "file": "ops-tenant/white_labeling.md",
+              "children": [
+                {
+                  "id": "white_labeling_general",
+                  "title": "常规",
+                  "file": "ops-tenant/white_labeling-white_labeling_general.md"
+                },
+                {
+                  "id": "login_white_labeling",
+                  "title": "登录",
+                  "file": "ops-tenant/white_labeling-login_white_labeling.md"
+                },
+                {
+                  "id": "mail_templates",
+                  "title": "邮件模板",
+                  "file": "ops-tenant/white_labeling-mail_templates.md"
+                },
+                {
+                  "id": "custom_translation",
+                  "title": "自定义翻译",
+                  "file": "ops-tenant/white_labeling-custom_translation.md"
+                },
+                {
+                  "id": "custom_menu",
+                  "title": "自定义菜单",
+                  "file": "ops-tenant/white_labeling-custom_menu.md"
+                }
+              ]
+            },
+            {
+              "id": "resources",
+              "title": "资源",
+              "file": "ops-tenant/resources.md",
+              "children": [
+                {
+                  "id": "widget_library",
+                  "title": "部件",
+                  "file": "ops-tenant/resources-widget_library.md",
+                  "children": [
+                    {
+                      "id": "widget_types",
+                      "title": "部件",
+                      "file": "ops-tenant/resources-widget_library-widget_types.md"
+                    },
+                    {
+                      "id": "widgets_bundles",
+                      "title": "部件包",
+                      "file": "ops-tenant/resources-widget_library-widgets_bundles.md"
+                    }
+                  ]
+                },
+                {
+                  "id": "images",
+                  "title": "图片",
+                  "file": "ops-tenant/resources-images.md"
+                },
+                {
+                  "id": "scada_symbols",
+                  "title": "SCADA 符号",
+                  "file": "ops-tenant/resources-scada_symbols.md"
+                },
+                {
+                  "id": "javascript_library",
+                  "title": "JS 库",
+                  "file": "ops-tenant/resources-javascript_library.md"
+                },
+                {
+                  "id": "resources_library",
+                  "title": "资源库",
+                  "file": "ops-tenant/resources-resources_library.md"
+                }
+              ]
+            },
+            {
+              "id": "security_settings",
+              "title": "安全",
+              "file": "ops-tenant/security_settings.md",
+              "children": [
+                {
+                  "id": "two_fa",
+                  "title": "双因素认证",
+                  "file": "ops-tenant/security_settings-two_fa.md"
+                },
+                {
+                  "id": "oauth2",
+                  "title": "OAuth 2.0",
+                  "file": "ops-tenant/security_settings-oauth2.md",
+                  "children": [
+                    {
+                      "id": "domains",
+                      "title": "域名",
+                      "file": "ops-tenant/security_settings-oauth2-domains.md"
+                    },
+                    {
+                      "id": "clients",
+                      "title": "OAuth 2.0 客户端",
+                      "file": "ops-tenant/security_settings-oauth2-clients.md"
+                    }
+                  ]
+                },
+                {
+                  "id": "self_registration",
+                  "title": "自助注册",
+                  "file": "ops-tenant/security_settings-self_registration.md"
+                },
+                {
+                  "id": "secrets",
+                  "title": "密钥存储",
+                  "file": "ops-tenant/security_settings-secrets.md"
+                },
+                {
+                  "id": "audit_log",
+                  "title": "审计日志",
+                  "file": "ops-tenant/security_settings-audit_log.md"
+                }
+              ]
+            },
+            {
+              "id": "platform_section",
+              "title": "运营配置",
+              "file": "ops-tenant/platform_section.md",
+              "children": [
+                {
+                  "id": "energy_vendor_model",
+                  "title": "厂商与型号",
+                  "file": "ops-tenant/platform_section-energy_vendor_model.md"
+                },
+                {
+                  "id": "energy_base_config",
+                  "title": "峰谷时段",
+                  "file": "ops-tenant/platform_section-energy_base_config.md"
+                },
+                {
+                  "id": "energy_dict",
+                  "title": "品种指标",
+                  "file": "ops-tenant/platform_section-energy_dict.md"
+                },
+                {
+                  "id": "energy_device_type",
+                  "title": "设备类型",
+                  "file": "ops-tenant/platform_section-energy_device_type.md"
+                },
+                {
+                  "id": "version_control",
+                  "title": "版本控制",
+                  "file": "ops-tenant/platform_section-version_control.md"
+                },
+                {
+                  "id": "task_manager",
+                  "title": "任务管理器",
+                  "file": "ops-tenant/platform_section-task_manager.md"
+                },
+                {
+                  "id": "scheduler",
+                  "title": "调度器",
+                  "file": "ops-tenant/platform_section-scheduler.md"
+                },
+                {
+                  "id": "settings",
+                  "title": "设置",
+                  "file": "ops-tenant/platform_section-settings.md",
+                  "children": [
+                    {
+                      "id": "home_settings",
+                      "title": "首页",
+                      "file": "ops-tenant/platform_section-settings-home_settings.md"
+                    },
+                    {
+                      "id": "mail_server",
+                      "title": "邮件服务器",
+                      "file": "ops-tenant/platform_section-settings-mail_server.md"
+                    },
+                    {
+                      "id": "notification_settings",
+                      "title": "通知",
+                      "file": "ops-tenant/platform_section-settings-notification_settings.md"
+                    },
+                    {
+                      "id": "repository_settings",
+                      "title": "仓库",
+                      "file": "ops-tenant/platform_section-settings-repository_settings.md"
+                    },
+                    {
+                      "id": "auto_commit_settings",
+                      "title": "自动提交",
+                      "file": "ops-tenant/platform_section-settings-auto_commit_settings.md"
+                    },
+                    {
+                      "id": "ai_models",
+                      "title": "AI 模型",
+                      "file": "ops-tenant/platform_section-settings-ai_models.md"
+                    }
+                  ]
+                },
+                {
+                  "id": "api_usage",
+                  "title": "API 使用量",
+                  "file": "ops-tenant/platform_section-api_usage.md"
+                }
+              ]
+            },
+            {
+              "id": "custom-9",
+              "title": "Trend 分析（外链）",
+              "file": "ops-tenant/custom-9.md"
+            },
+            {
+              "id": "mobile_center",
+              "title": "移动应用",
+              "file": "ops-tenant/mobile_center.md",
+              "children": [
+                {
+                  "id": "mobile_bundles",
+                  "title": "包",
+                  "file": "ops-tenant/mobile_center-mobile_bundles.md"
+                },
+                {
+                  "id": "mobile_apps",
+                  "title": "应用程序",
+                  "file": "ops-tenant/mobile_center-mobile_apps.md"
+                },
+                {
+                  "id": "mobile_qr_code_widget",
+                  "title": "二维码部件",
+                  "file": "ops-tenant/mobile_center-mobile_qr_code_widget.md"
+                }
+              ]
+            }
+          ]
         }
       ],
-      "description": "给运维：客户菜单的每个功能点，数据从哪张表来、怎么查"
+      "description": "给运维：菜单的每个功能点，数据从哪张表来、怎么查"
     }
   ]
 }

@@ -346,12 +346,15 @@
       return `href="#/${target}${anchor || ''}"`;
     });
 
-    // 站内短链：/admin/deploy、/user/quick-start 这类写法也要走 hash 路由。
-    // /downloads/ 下是真实文件（脚本与 SQL），必须保持原样。
-    // item id 的字符集要放宽：manifest 里允许 02b-cassandra 这类带点/数字的 id，
-    // 早先只写 [a-z0-9-]，写成 /admin/xxx.yyy 这种链接就匹配不到，点进去变「页面不存在」。
-    html = html.replace(/href="\/(admin|user)\/([a-zA-Z0-9._-]+)"/g,
-      (match, section, item) => `href="#/${section}/${item}"`);
+    // 站内短链：/admin/deploy、/user/quick-start、/menu-ops/tenant/... 这类写法
+    // 也要走 hash 路由。/downloads/ 下是真实文件（脚本与 SQL），必须保持原样。
+    //
+    // 字符集与深度都要放宽：
+    //   · item id 可以是 02b-cassandra（带点/数字）
+    //   · 新增的「运维管理」菜单有多层，写成 /menu-ops/tenant/entities/devices/device_all
+    //     早先只允许一段，那些链接会原样输出成 http://站点/menu-ops/... → 404。
+    html = html.replace(/href="\/(admin|user|menu-ops)\/([a-zA-Z0-9._\/-]+)"/g,
+      (match, section, rest) => `href="#/${section}/${rest.replace(/\/+$/, '')}"`);
 
     return html;
   }
