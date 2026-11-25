@@ -51,29 +51,59 @@
   function resolveRoute() {
     const hash = location.hash.replace(/^#\/?/, '');
     if (!hash) return null;
-    const [sectionId, itemId] = hash.split('/');
-    return { sectionId, itemId };
+    const parts = hash.split('/').filter(Boolean);
+    if (!parts.length) return null;
+    // 路径深度不固定：老的两级路由 #/admin/deploy，新的三级 #/menu-ops/customer/energy-overview
+    return { sectionId: parts[0], path: parts.slice(1) };
   }
 
-  function findItem(sectionId, itemId) {
+  /**
+   * 按路径找节点。path 可以是字符串（旧的两级路由）或数组（任意深度）。
+   *
+   * 深度不写死，是因为菜单要跟系统的「一级 → 二级 → 三级」逐级对齐；
+   * 写死两级后，加一层就得改路由、改渲染、改链接三处。
+   */
+  function findItem(sectionId, path) {
     if (!manifest) return null;
     const section = manifest.sections.find((s) => s.id === sectionId);
     if (!section) return null;
-    const item = section.items.find((i) => i.id === itemId);
-    if (!item) return null;
-    return { section, item };
+    const segs = Array.isArray(path) ? path : String(path || '').split('/').filter(Boolean);
+    if (!segs.length) return null;
+    let items = section.items;
+    let found = null;
+    for (const seg of segs) {
+      found = (items || []).find((i) => i.id === seg);
+      if (!found) return null;
+      items = found.children;
+    }
+    return { section, item: found, key: sectionId + '/' + segs.join('/') };
   }
 
   // ---------------- 导航 ----------------
 
+  /** 递归渲染菜单。有 children 的节点渲染成分组标题，下面挂子项。 */
+  function navItemsHtml(items, prefix, activeKey, depth) {
+    return (items || []).map((item) => {
+      const key = prefix + '/' + item.id;
+      const active = key === activeKey ? ' class="active"' : '';
+      const hasKids = Array.isArray(item.children) && item.children.length > 0;
+      if (!hasKids) {
+        return `<a href="#/${key}"${active}>${escapeHtml(item.title)}</a>`;
+      }
+      // 分组节点：有 file 就可点（显示该层总览），没有就只作标题。
+      const title = item.file
+        ? `<a class="nav-sub-title" href="#/${key}"${active}>${escapeHtml(item.title)}</a>`
+        : `<div class="nav-sub-title">${escapeHtml(item.title)}</div>`;
+      return `<div class="nav-sub-group nav-depth-${depth}">${title}
+        <div class="nav-sub-items">${navItemsHtml(item.children, key, activeKey, depth + 1)}</div>
+      </div>`;
+    }).join('');
+  }
+
   function renderNav(activeKey) {
     if (!manifest) return;
     const html = manifest.sections.map((section) => {
-      const items = section.items.map((item) => {
-        const key = section.id + '/' + item.id;
-        const active = key === activeKey ? ' class="active"' : '';
-        return `<a href="#/${key}"${active}>${escapeHtml(item.title)}</a>`;
-      }).join('');
+      const items = navItemsHtml(section.items, section.id, activeKey, 1);
       // 分组标题下的说明：让读者一眼知道这组是给谁看的
       const desc = section.description
         ? `<div class="nav-group-desc">${escapeHtml(section.description)}</div>`
@@ -180,34 +210,44 @@
     const parts = clean.split('/');
     const file = parts[parts.length - 1];
     const dir = parts.length > 1 ? parts[parts.length - 2] : '';
-    for (const section of manifest.sections) {
-      for (const item of section.items) {
-        const itemFile = item.file.split('/').pop();
-        if (itemFile !== file) continue;
-        // 目录能对上就精确匹配，对不上（如 user/01-x.md 与 admin/01-x.md 同名）时退回首个
-        if (!dir || item.file === dir + '/' + file) return section.id + '/' + item.id;
+
+    // 菜单可能有多层（children 嵌套），所以拍平成 [(path, item)] 再比 ——
+    // 只遍历一层的话，三级页面的链接会全部落到「页面不存在」。
+    const flat = [];
+    const walk = (items, prefix) => {
+      for (const it of items || []) {
+        const path = prefix ? prefix + '/' + it.id : it.id;
+        flat.push({ path, item: it });
+        if (it.children) walk(it.children, path);
       }
+    };
+    for (const section of manifest.sections) walk(section.items, section.id);
+
+    for (const e of flat) {
+      const itemFile = (e.item.file || '').split('/').pop();
+      if (itemFile !== file) continue;
+      // 目录能对上就精确匹配，对不上（如 user/01-x.md 与 admin/01-x.md 同名）时退回首个
+      if (!dir || e.item.file === dir + '/' + file) return e.path;
     }
-    for (const section of manifest.sections) {
-      for (const item of section.items) {
-        if (item.file.split('/').pop() === file) return section.id + '/' + item.id;
-      }
+    for (const e of flat) {
+      if ((e.item.file || '').split('/').pop() === file) return e.path;
     }
     return null;
   }
 
-  async function loadPage(sectionId, itemId) {
-    const found = findItem(sectionId, itemId);
+  async function loadPage(sectionId, path) {
+    const found = findItem(sectionId, path);
     if (!found) {
+      const shown = Array.isArray(path) ? path.join('/') : path;
       contentEl.innerHTML = `
         <h1>页面不存在</h1>
-        <p>没有找到 <code>${escapeHtml(sectionId)}/${escapeHtml(itemId)}</code> 这一页。</p>
+        <p>没有找到 <code>${escapeHtml(sectionId)}/${escapeHtml(shown)}</code> 这一页。</p>
         <p><a href="#/user/quick-start">返回快速开始</a></p>`;
       tocEl.innerHTML = '';
       return;
     }
 
-    const key = sectionId + '/' + itemId;
+    const key = found.key;
     currentKey = key;
     renderNav(key);
     document.title = found.item.title + ' · ' + manifest.title;
@@ -256,7 +296,7 @@
       location.replace('#/user/quick-start');
       return;
     }
-    loadPage(r.sectionId, r.itemId);
+    loadPage(r.sectionId, r.path);
   }
 
   async function init() {

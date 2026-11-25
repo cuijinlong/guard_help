@@ -2917,7 +2917,7 @@ http://<平台IP>:8090/spsspro/guardian/onboard
 **流程（固定在「建客户账号」之后、「核对演示数据」之前）**
 
 ```
-核对 ①  标准 key 155 条
+核对 ①  标准 key 165 条
         型号 DDSU666           8 条 vendorKeys（正泰，单相）
         型号 DTSD3366D-J(P4)  34 条 vendorKeys（正泰，三相四线）
         型号 YDPQ200-A        45 条 vendorKeys（雅达，三相四线）
@@ -5866,10 +5866,10 @@ bash docker-02-start.sh --allinone --admin-email ... --admin-pass ...
 | --- | --- |
 | 库表 | 150 上下（`SELECT count(*) FROM information_schema.tables WHERE table_schema='public'`） |
 | 系统部件（install 后 DB 行数） | 740 上下 |
-| 交付的部件文件 | 585 个 |
+| 交付的部件文件 | 586 个 |
 | 客户看板模板 | 30 个 |
 | 建表 SQL | 8 个 |
-| 能源参数字典 | 1 个资产，标准 key **155** 个（电能 140） |
+| 能源参数字典 | 1 个资产，标准 key **165** 个（电能 140 / 环境 12 / 热力 6 / 水 4 / 蒸汽 2 / 燃气 1） |
 | 演示客户 | 10 台设备（8 台可模拟） |
 
 ## 两个「等很久」是正常的
@@ -6255,6 +6255,96 @@ git add <冲突文件> && git rebase --continue
 ```
 
 **预防**：开推之前先拉一次 —— `git pull --rebase origin main && git push origin main`
+
+## AI 搭建：把 3D-NGX 的 AI 面板接到 codewhale
+
+3D-NGX 大屏编辑器有个「AI 搭建」面板（顶栏按钮）。它调 `POST /api/ngx/ai/chat`，
+由**宿主机上的一个桥接进程**转给本机 `codewhale exec`。
+
+### 为什么是独立进程
+
+codewhale 是宿主机的 CLI，带用户自己的模型凭据。Java 后端跑在容器里，
+既没有这个二进制，也不该拿到密钥。所以桥接在宿主机、nginx 转发一条路径过去。
+
+### 安装（三步）
+
+```bash
+# 前提：node ≥ 22 且 codewhale 可跑（codewhale --version）
+mkdir -p ~/energy-app/ai-bridge
+cp ~/energy-app/../shiyongshouce/downloads/ai-bridge/*.js \
+   ~/energy-app/../shiyongshouce/downloads/ai-bridge/*.sh ~/energy-app/ai-bridge/ 2>/dev/null \
+  || cp downloads/ai-bridge/*.js downloads/ai-bridge/*.sh ~/energy-app/ai-bridge/
+chmod +x ~/energy-app/ai-bridge/*.sh
+
+bash ~/energy-app/ai-bridge/start.sh          # 首次生成密钥
+bash ~/energy-app/ai-bridge/install-service.sh   # ★ 注册成系统服务
+bash ~/energy-app/ai-bridge/wire-nginx.sh        # 接进 nginx
+```
+
+> **★ 第 2 步不能省**。`start.sh` 是「手工跑一次看看」用的；直接用
+> `nohup node server.js &` 起的进程挂在那个 shell 上，**终端一关就死** ——
+> 表现为「启动了但过一会儿 connection refused」，日志里只有启动那三行。
+> 这不是代码问题，是托管方式不对。launchd（macOS）/ systemd（Linux）
+> 才是正确的托管，还能崩溃自愈、开机自启。
+
+### 验证
+
+```bash
+curl -s http://127.0.0.1:8092/healthz
+# → {"ok":true,"running":0,...}
+
+# ★ 必须带平台登录令牌，否则 401（2026-11-24 起）
+TOKEN=$(curl -s -X POST http://127.0.0.1:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"tenant@126.com","password":"12345678"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+
+curl -s -X POST http://127.0.0.1:8090/api/ngx/ai/chat \
+  -H "X-Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"用一句话说明你是谁"}]}'
+# → {"content":"我是「3D-NGX …」的搭建助手…","actions":[],"model":"deepseek-v4-pro"}
+```
+
+> **为什么现在要令牌**：之前这条路径**没有任何身份校验** ——
+> 不带任何凭据也返回 200。拿到 8090 的人都能白嫖模型额度。
+> 现在桥接会拿这个令牌去 `GET /api/auth/user` 验一遍，
+> 非 `TENANT_ADMIN` / `SYS_ADMIN` 一律拒绝。
+
+浏览器里则直接打开设计器 → 顶栏「AI 搭建」→ 输入「把场站用电趋势改名成机组功率趋势」。
+
+### 安全边界
+
+| 边界 | 做法 |
+| --- | --- |
+| 只读 | 固定 `--permission-mode plan`，AI 不改文件、不跑写命令 |
+| 工作目录 | 每轮新建空临时目录 |
+| 鉴权（内层） | `X-Ngx-Ai-Key`（`timingSafeEqual`），nginx 注入，不下发浏览器 |
+| 鉴权（外层） | `X-Authorization` 透传到桥接 → `GET /api/auth/user` 验身份，只放行 `TENANT_ADMIN` / `SYS_ADMIN` |
+| 失败关闭 | 平台不可达返回 503，**不放行**；不提供「跳过校验」开关 |
+| 并发 | 上限 2 |
+| 超时 | 桥接 150s / nginx 180s |
+
+AI 只产出**提案**（`actions`），必须经前端 `examineLayoutProposal` 校验 +
+人点「应用到布局」才生效。出错的代价是一份被拒绝的提案，不是一次误操作。
+
+### 排查
+
+| 现象 | 原因 |
+| --- | --- |
+| `codewhale: Node.js 22 or newer is required` | launchd 的 PATH 里 node 是旧版。`install-service.sh` 已把 `dirname(node)` 放 PATH 最前 |
+| 启动成功但过一会儿 connection refused | 没注册成服务，进程被 shell 带走 |
+| nginx 502 | 分段查：`curl 127.0.0.1:8092/healthz` → 容器内 `wget host.docker.internal:8092/healthz` → `docker logs energy-gateway` |
+| 面板说「后端未接通」 | 桥接没起，或 nginx 没接上（`wire-nginx.sh` 没跑） |
+| `401 未授权：缺少平台登录凭据` | 前端没带 `X-Authorization`，或 nginx 漏了 `proxy_set_header X-Authorization`（重跑 `wire-nginx.sh`） |
+| `401 登录已失效` | 令牌过期 / 伪造。重新登录 3D-NGX 即可 |
+| `403 只有租户管理员可以使用 AI 搭建` | 用客户账号登录了。AI 搭建只对租户开放 |
+| `503 无法校验登录状态（平台不可达）` | 平台没起。桥接校验身份必须问平台，不会在问不到时放行 |
+| `wire-nginx.sh: line 205: NGINX_CONF…: unbound variable` | 旧版脚本 bug（`$VAR` 后紧跟中文标点被当成变量名），已修；`cp` 新的脚本过来重跑 |
+
+详细文档：`downloads/ai-bridge/README.md`
+
+---
 
 ## 附录：两个只在干净库才暴露的坑
 

@@ -197,8 +197,40 @@ CLIENT_LOGIN=$(login "$EMAIL" "$PASS")
 SITE_N=$(echo "$ASSETS" | python3 -c "import json,sys;print(sum(1 for a in json.load(sys.stdin).get('data',[]) if a.get('type')=='场站'))" 2>/dev/null || echo 0)
 ITEM_N=$(echo "$ASSETS" | python3 -c "import json,sys;print(sum(1 for a in json.load(sys.stdin).get('data',[]) if a.get('type')=='分项'))" 2>/dev/null || echo 0)
 DEV_N=$(echo "$DEVICES" | python3 -c "import json,sys;print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo 0)
-TOPO_N=$(echo "$ASSETS" | python3 -c "import json,sys;print(sum(1 for a in json.load(sys.stdin).get('data',[]) if a.get('type')=='topology'))" 2>/dev/null || echo 0)
-DASH_N=$(api GET "/api/customer/$CID/dashboards?pageSize=200&page=0" | python3 -c "import json,sys;print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo 0)
+# 拓扑数走权威接口（2026-11-24 修）。
+#
+# 原来数 \`/api/customer/{id}/assets\` 里 type=='topology' 的条目，两个问题：
+# ① 口径不对；② 建客户后的初始化是异步的，查早了会读到半成品
+#    （实测同一客户：脚本读 2 张，十几秒后是 3 张，与 3 个场站一致）。
+TOPO_N=0
+for _try in $(seq 1 15); do
+  TOPO_N=$(api GET "/api/energy/topologies?customerId=$CID&pageSize=100&page=0" \
+    | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('total') or len(d.get('data',[])))" 2>/dev/null || echo 0)
+  [[ "${TOPO_N:-0}" -ge "${SITE_N:-0}" ]] && break
+  sleep 2
+done
+
+# 客户看板：按 **assigned_customers** 口径（2026-11-24 修）。
+#
+# 2026-11-13 起客户看板改成「共享租户级看板」而不是复制副本
+# （客户明确要求：不要每个客户都建一套同名看板）。
+# 于是 \`/api/customer/{id}/dashboards\` 恒为 0 —— 它按 customer_id 查，
+# 而客户的真实入口是左侧菜单，菜单里的 dashboardId 指向租户级看板，
+# 打开权限由 \`checkDashboardIdOrAssigned\` 按 assigned_customers 放行。
+#
+# 旧断言永远读到 0 → 每次开户都报「看板没复制给客户」，是误报。
+# 实测同一客户：菜单 26 个看板入口全部可打开（26/26 HTTP 200），而 customer_id 口径是 0。
+DASH_N=$(api GET "/api/tenant/dashboards?pageSize=200&page=0" | python3 -c "
+import json,sys
+cid='$CID'
+d=json.load(sys.stdin)
+n=0
+for w in d.get('data',[]):
+    for a in (w.get('assignedCustomers') or []):
+        if str(((a.get('customerId') or {}).get('id')) or a.get('id') or '') == cid:
+            n += 1
+            break
+print(n)" 2>/dev/null || echo 0)
 
 # 用**客户自己的 token** 验菜单：租户查自己的菜单看不到客户的
 MENU_N=$(ncurl -H "X-Authorization: Bearer $CLIENT_LOGIN" "$BASE/api/customMenu" | python3 -c "
@@ -222,7 +254,7 @@ chk "设备"            "$DEV_N"  10  "演示设备缺失"
 GW_N=$(echo "$DEVICES" | python3 -c "import json,sys;print(sum(1 for d in json.load(sys.stdin).get('data',[]) if d.get('type')=='网关'))" 2>/dev/null || echo 0)
 chk "网关（RTU）"      "$GW_N"    1  "RTU 现场形态缺失，跑 scripts/30-rtu-env-init.py"
 chk "拓扑图"          "$TOPO_N"  2  "每个场站应有一张"
-chk "客户看板"        "$DASH_N" 10  "看板没复制给客户"
+chk "客户看板（共享）"  "$DASH_N" 10  "租户看板没有 assigned_customers 给这个客户"
 chk "客户菜单项"      "$MENU_N" 10  "侧边栏会是空的"
 [[ "$HOME_N" == "1" ]] && ok "落地页（菜单第一项是 home）" \
   || { printf '\033[31m  ✗ 落地页未设置 —— 客户登录会落在空门户页\033[0m\n'; FAIL=1; }

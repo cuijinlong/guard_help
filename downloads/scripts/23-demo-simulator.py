@@ -26,6 +26,8 @@
 <h3>数据模型（与平台约定一致，改错会让看板空白）</h3>
 ```
 电表     energy（本周期增量） energy_reading（累积表底，单调递增） power_total
+         power_factor_total apparent_power_total
+         demand_max（当天最大需量，跨天重置） load_rate（占铭牌容量 %）
          voltage_a [current_a] [power_a]     三相另有 _b / _c
 水/气/汽  energy（本周期增量） energy_reading（累积表底） power
 温湿度    temperature humidity
@@ -86,30 +88,128 @@ UTILITY_PROFILES = {"水表": "water", "燃气表": "gas", "蒸汽表": "steam",
                     "热力表": "heat"}
 SENSOR_PROFILES = {"温湿度变送器"}
 
+# ── 暖通（环境系统）设备档案 ─────────────────────────────────
+#
+# 2026-11-25 之前这里**没有**这一组，于是暖通设备在 discover 里走到
+# `continue` —— 永远不产生任何遥测。
+#
+# 现场表现（客户报障原话）：「冷热机组模块、立式管道离心泵都没有获取到」。
+# 设备在查询设置里能勾选（2026-11-25 已修好品种过滤），勾上点查询却是
+# 「暂无实时数据」—— 因为它们从安装快照之后就没有新数据了。
+# 实测：9 台模块机、2 台离心泵、2 台 PLC 柜停在 11-21 02:00，
+# 而电表数据是实时的，客户一眼就看出暖通这块是死的。
+#
+# 档案名 → 设备角色。角色决定写哪些遥测键（见 build_hvac_payload）。
+# 键名必须与「环境系统」品种的指标字典一致，否则查询设置里
+# 选得到设备、选不到指标：
+#   环境参数 temperature/humidity      运行状态 running/spin/led/door
+#   调节参数 opening                   热泵运行 sys_run_state/sys_mode/
+#   机组水温 water_in_temp/water_out_temp/ambient_temp   compressor_state
+#   水泵频率 pump_freq                 报警代码 alarm_code
+HVAC_PROFILES = {
+    "风冷冷水机": "chiller",        # 生产园区的「模块机」就是这个档案
+    "立式管道离心泵": "pump",
+    "热水泵": "pump",
+    "锅炉": "boiler",
+    "新风机组": "ahu",
+    "PLC控制柜": "plc",
+    "网关": "gateway",
+    "室内环境变送器": "env_sensor",
+    "智能空开": "breaker",
+    "换热站控制器": "heat_exchanger",
+}
+
 
 # ---------------------------------------------------------------- HTTP
-def api(base, path, token=None, method=None, body=None):
-    req = urllib.request.Request(base + path, method=method or ("POST" if body else "GET"))
-    if body is not None:
-        req.data = json.dumps(body).encode()
-        req.add_header("Content-Type", "application/json")
-    if token:
-        req.add_header("X-Authorization", "Bearer " + token)
+#
+# 会话状态（2026-11-25 加）。
+#
+# <h3>为什么必须自己管 token 续期</h3>
+#
+# TB 的 access token 默认 2.5 小时过期，而本脚本是**常驻**进程
+# （launchd KeepAlive，跑几天不重启）。原实现只在启动时登录一次，
+# 把 token 存进局部变量后一直用它 —— 过期之后**每一轮都 401**，
+# 但进程还活着，KeepAlive 认为一切正常。
+#
+# 实测后果（2026-11-25 09:51）：进程 PID 46882 在跑，日志里
+# 「第 371 轮：0/49 成功」，全站数据停在 06:09 —— 停了 3 小时 42 分。
+# 而看板上没有任何提示，客户以为系统坏了。
+#
+# 修法：token 放进模块级容器，api() 遇到 401 自动用记住的账号重登一次
+# 再重试。调用方不用改，因为它们现在读的是 `_AUTH["token"]`。
+# `pass_` 带下划线：避免和内置名 pass（将来若有）混淆，也和 update(pass_=...) 对齐
+_AUTH = {"base": None, "user": None, "pass_": None, "token": None, "relogins": 0}
+
+
+def login(base, user, pw):
+    """登录并把账号记下来（供 401 时自动续期）。"""
+    _AUTH.update(base=base.rstrip("/"), user=user, pass_=pw)
+    body = api(base, "/api/auth/login", method="POST",
+               body={"username": user, "password": pw}, _no_retry=True)
+    _AUTH["token"] = body["token"]
+    return _AUTH["token"]
+
+
+def _relogin():
+    """用记住的账号重新登录。成功返回新 token，失败返回 None。"""
+    if not (_AUTH["user"] and _AUTH.get("pass_")):
+        return None
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            t = r.read().decode()
-            return json.loads(t) if t.strip() else None
-    except urllib.error.HTTPError as e:
-        raise RuntimeError("HTTP %s %s → %s" % (e.code, path, e.read().decode("utf-8", "replace")[:200]))
-    except urllib.error.URLError as e:
-        raise RuntimeError("连不上平台：%s" % e.reason)
+        body = api(_AUTH["base"], "/api/auth/login", method="POST",
+                   body={"username": _AUTH["user"], "password": _AUTH["pass_"]},
+                   _no_retry=True)
+        _AUTH["token"] = body["token"]
+        _AUTH["relogins"] += 1
+        print("  ↻ 登录已过期，已自动重新登录（第 %d 次）" % _AUTH["relogins"])
+        return _AUTH["token"]
+    except Exception as e:
+        print("  ✗ 重新登录失败：%s" % e)
+        return None
 
 
-def paged(base, path, token):
+def api(base, path, token=None, method=None, body=None, _no_retry=False):
+    """一次 HTTP 调用。401 时自动续期并重试一次。
+
+    ★ `token=None` 表示「用当前会话的 token」—— 新增调用点一律省略它，
+      这样续期后自动生效，不会拿着一份过期的字符串死磕。
+    """
+    def once(tok):
+        req = urllib.request.Request(base + path, method=method or ("POST" if body else "GET"))
+        if body is not None:
+            req.data = json.dumps(body).encode()
+            req.add_header("Content-Type", "application/json")
+        if tok:
+            req.add_header("X-Authorization", "Bearer " + tok)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                t = r.read().decode()
+                return json.loads(t) if t.strip() else None
+        except urllib.error.HTTPError as e:
+            raise RuntimeError("HTTP %s %s → %s" % (
+                e.code, path, e.read().decode("utf-8", "replace")[:200]))
+        except urllib.error.URLError as e:
+            raise RuntimeError("连不上平台：%s" % e.reason)
+
+    use = token if token is not None else _AUTH.get("token")
+    try:
+        return once(use)
+    except RuntimeError as e:
+        msg = str(e)
+        expired = "HTTP 401" in msg or "Token has expired" in msg
+        if not expired or _no_retry:
+            raise
+        newtok = _relogin()
+        if not newtok:
+            raise
+        return once(newtok)
+
+
+def paged(base, path, token=None):
+    """分页取全量。token 参数保留只为兼容旧调用点 —— 实际用会话 token（可续期）。"""
     out, page = [], 0
     while True:
         sep = "&" if "?" in path else "?"
-        d = api(base, "%s%spageSize=500&page=%d" % (path, sep, page), token)
+        d = api(base, "%s%spageSize=500&page=%d" % (path, sep, page))
         out.extend(d.get("data") or [])
         if not d.get("hasNext"):
             return out
@@ -172,6 +272,21 @@ class Meter:
         self.temp = 24.0
         self.humi = 55.0
         self.temp_drift = 0.0
+        # ── 暖通设备的角色与内部状态（kind == "hvac" 时才用）──────────
+        # 冷水机组的水温要**缓慢漂移**，不能每轮随机重抽：
+        # 查询设置的曲线是按小时聚合的，随机重抽会得到一条锯齿噪声，
+        # 而真实机组的水温是一条平滑曲线。这里用上一轮的值做起点。
+        self.hvac_type = ""             # chiller / pump / boiler / ahu …
+        self.water_in = None            # 回水温度 ℃
+        self.water_out = None           # 供水温度 ℃
+        # 当天累积最大需量（kW）与它所属的日期。
+        #
+        # 语义与电能表一致：**当天为周期的最大值，跨天重置**。
+        # 2026-11-25 之前本脚本不产出 demand_max，而「用电容量负荷需量监控」
+        # 部件读的正是它 —— 于是需量曲线在安装快照用完后整段变空，
+        # 页面上只剩开头两天的点。
+        self.day_peak = 0.0
+        self.day_key = None
 
     def compute_power(self, hour):
         """算出本周期实际功率，缓存到 self.this_power。**先算子表，再算父表**。
@@ -194,9 +309,167 @@ class Meter:
         return self.this_power
 
 
+def build_hvac_payload(meter):
+    """暖通设备的遥测（kind == "hvac"）。
+
+    <h3>为什么单独一个函数，不复用表计分支</h3>
+
+    暖通设备**不是表计**：没有 `energy_reading`。硬塞一个会让抄表把
+    空调算成一台电表（表底从 0 开始、月月不动），账单里凭空多一行。
+
+    <h3>键名与「环境系统」品种的指标字典严格对齐</h3>
+
+    字典的 7 组参数各对应一组键（见 HVAC_PROFILES 上方注释）。
+    只写字典里有的键 —— 写别的键，查询设置里指标下拉选了也没数据，
+    客户会以为部件坏了。
+
+    <h3>「空调运行监控」页的专属键也一并写</h3>
+
+    那个页面读的是 `ahu_freq` / `ahu_mode` / `boiler_water_temp` /
+    `pump_freq_big|small` / `boiler_run_count` / `indoor_temp` / `indoor_co2`，
+    与字典口径不同名。两边都写，两个入口才都有数。
+    """
+    t = meter.hvac_type
+
+    def jitter(v, d, lo=None, hi=None):
+        """在 v 附近抖动 ±d，可选上下限。lo/hi 为 None 时不裁剪。
+
+        ★ 不能写成 `min(hi, max(lo, x))` 的一行 lambda：boiler / chiller
+          的水温调用只给两个参数，lo/hi 是 None，min(None) 直接抛
+          TypeError（'">" not supported between float and NoneType'）。
+        """
+        x = v + random.uniform(-d, d)
+        if lo is not None:
+            x = max(lo, x)
+        if hi is not None:
+            x = min(hi, x)
+        return round(x, 2)
+
+    # 设备在不在运行：按一天中的时段决定，深夜部分设备停机
+    hour = time.localtime().tm_hour
+    working = 6 <= hour < 23
+
+    if t == "chiller":
+        # 冷水机组 / 模块机：供水 7~12℃、回水比供水高 4~6℃
+        if meter.water_in is None:
+            meter.water_in = random.uniform(11.0, 15.0)
+            meter.water_out = random.uniform(6.5, 9.5)
+        target_out = 7.0 if working else 10.0
+        meter.water_out = jitter(meter.water_out + (target_out - meter.water_out) * 0.25, 0.12, 5.0, 14.0)
+        meter.water_in = jitter(meter.water_out + random.uniform(3.6, 5.4), 0.10)
+        return {
+            "running": 1 if working else 0,
+            "sys_run_state": 2 if working else 0,
+            "sys_mode": 1,                       # 1=制冷
+            "compressor_state": 1 if working else 0,
+            "water_in_temp": meter.water_in,
+            "water_out_temp": meter.water_out,
+            "ambient_temp": round(random.uniform(18.0, 32.0), 1),
+            "opening": jitter(75.0, 8.0, 20.0, 100.0),
+            "alarm_code": 0,
+        }
+
+    if t == "pump":
+        # 停机就是 0Hz。抖动幅度按状态区分：运行中 ±6，停机只 ±0.3 ——
+        # 原来停机也用 ±6，实测给出 5.24Hz，等于「停着的泵在转」，
+        # 客户一眼就看出数据是编的。
+        freq = jitter(42.0, 6.0, 0.0, 50.0) if working else jitter(0.0, 0.3, 0.0, 1.0)
+        out = {
+            "running": 1 if working else 0,
+            "pump_freq": freq,
+            "opening": jitter(65.0, 10.0, 0.0, 100.0),
+            "alarm_code": 0,
+        }
+        # 「空调运行监控」按名字区分大/小泵
+        nm = meter.name or ""
+        if "大" in nm:
+            out["pump_freq_big"] = freq
+            out["pump_run_big"] = 1 if working else 0
+        elif "小" in nm:
+            out["pump_freq_small"] = freq
+            out["pump_run_small"] = 1 if working else 0
+        return out
+
+    if t == "boiler":
+        if meter.water_out is None:
+            meter.water_in = random.uniform(48.0, 55.0)
+            meter.water_out = random.uniform(58.0, 65.0)
+        meter.water_out = jitter(meter.water_out + ((62.0 if working else 55.0) - meter.water_out) * 0.2, 0.15, 45.0, 75.0)
+        meter.water_in = jitter(meter.water_out - random.uniform(6.0, 10.0), 0.12)
+        return {
+            "running": 1 if working else 0,
+            "sys_run_state": 1 if working else 0,
+            "sys_mode": 2,                       # 2=制热
+            "water_in_temp": meter.water_in,
+            "water_out_temp": meter.water_out,
+            "opening": jitter(70.0, 8.0, 20.0, 100.0),
+            "alarm_code": 0,
+            # 「空调运行监控」专属
+            "boiler_water_temp": meter.water_out,
+            "boiler_run_count": 1 if working else 0,
+        }
+
+    if t == "ahu":
+        meter.temp = round(meter.temp + random.uniform(-0.2, 0.2), 1)
+        meter.humi = round(min(85, max(30, meter.humi + random.uniform(-1.0, 1.0))), 1)
+        return {
+            "running": 1 if working else 0,
+            "spin": 1 if working else 0,
+            "opening": jitter(55.0, 12.0, 0.0, 100.0),
+            "temperature": meter.temp,
+            "humidity": meter.humi,
+            "alarm_code": 0,
+            # 「空调运行监控」专属
+            "ahu_freq": jitter(38.0 if working else 0.0, 5.0, 0.0, 50.0),
+            "ahu_mode": 1,
+        }
+
+    if t == "plc":
+        return {
+            "running": 1,
+            "led": 1,
+            "door": 0,
+            "alarm_code": 0,
+        }
+
+    if t == "gateway":
+        # 网关只报在线状态：它不产业务指标，写别的会污染「环境参数」曲线
+        return {"running": 1}
+
+    if t == "env_sensor":
+        meter.temp = round(meter.temp + random.uniform(-0.2, 0.2), 1)
+        meter.humi = round(min(85, max(30, meter.humi + random.uniform(-1.0, 1.0))), 1)
+        return {
+            "temperature": meter.temp,
+            "humidity": meter.humi,
+            "indoor_temp": meter.temp,
+            "indoor_co2": round(random.uniform(450.0, 900.0), 0),
+        }
+
+    if t == "breaker":
+        return {"running": 1, "opening": 100.0}
+
+    if t == "heat_exchanger":
+        if meter.water_out is None:
+            meter.water_in = random.uniform(50.0, 58.0)
+            meter.water_out = random.uniform(44.0, 50.0)
+        meter.water_out = jitter(meter.water_out, 0.15)
+        meter.water_in = jitter(meter.water_out + random.uniform(5.0, 9.0), 0.12)
+        return {
+            "running": 1 if working else 0,
+            "water_in_temp": meter.water_in,
+            "water_out_temp": meter.water_out,
+            "opening": jitter(60.0, 10.0, 0.0, 100.0),
+        }
+
+    return {"running": 1}
+
+
 def build_payload(meter, hours):
     """按品种生成遥测字典。键名必须与平台/看板约定一致。"""
     hour = time.localtime().tm_hour
+    if meter.kind == "hvac":
+        return build_hvac_payload(meter)
     if meter.kind == "sensor":
         meter.temp = round(meter.temp + random.uniform(-0.25, 0.25), 1)
         meter.humi = round(min(90, max(25, meter.humi + random.uniform(-1.2, 1.2))), 1)
@@ -210,11 +483,22 @@ def build_payload(meter, hours):
 
     if meter.kind == "electric":
         pf = round(random.uniform(0.88, 0.97), 3)
+        # 当天峰值：与安装快照同口径（单调不减，跨天归零）
+        today = time.strftime("%Y-%m-%d")
+        if meter.day_key != today:
+            meter.day_key = today
+            meter.day_peak = 0.0
+        meter.day_peak = max(meter.day_peak, power)
         out = {
             "energy": energy,
             "energy_reading": round(meter.reading, 3),
             "power_total": round(power, 2),
             "power_factor_total": pf,
+            # 需量：表计自报的当天最大需量。缺了它，「用电容量负荷需量监控」
+            # 就没有数可画 —— 页面显示「—」，另配的额定容量也算不出负载率。
+            "demand_max": round(meter.day_peak, 2),
+            # 负载率 = 当前功率 / 铭牌容量，与部件里的口径一致（%）
+            "load_rate": round(power / meter.nominal_kw * 100, 2) if meter.nominal_kw > 0 else 0.0,
             "frequency": round(random.uniform(49.92, 50.06), 2),
         }
         if meter.phases == 3:
@@ -250,6 +534,13 @@ def build_payload(meter, hours):
                 "voltage_a": v,
                 "current_a": round(power * 1000 / v / pf, 3) if v else 0,
             })
+        # 视在/无功：单相表也必须有。
+        #
+        # 原来只在三相分支里写，结果单相表（办公园区的进线总表就是单相）
+        # 没有 apparent_power_total —— 「功率因数与负荷需量」的多表加权
+        # 会因为缺 S 退化成算术平均，标注也跟着变，看起来像算错了。
+        out["apparent_power_total"] = round(power / pf, 2)
+        out["reactive_power_total"] = round(power * math.tan(math.acos(pf)), 2)
         return out
 
     # 水 / 燃气 / 蒸汽
@@ -274,7 +565,7 @@ def discover(base, token, customer_id):
         ai = d.get("additionalInfo") or {}
         level = 0
         try:
-            attrs = api(base, "/api/plugins/telemetry/DEVICE/%s/values/attributes/SERVER_SCOPE" % did, token)
+            attrs = api(base, "/api/plugins/telemetry/DEVICE/%s/values/attributes/SERVER_SCOPE" % did)
             m = {x["key"]: x["value"] for x in (attrs or [])}
             level = int(m.get("meterLevel") or 0)
         except Exception:
@@ -294,13 +585,16 @@ def discover(base, token, customer_id):
                        "heat": 0.30}.get(kind, 0.18)
         elif prof_name in SENSOR_PROFILES:
             kind, phases, nominal = "sensor", 1, 0.0
+        elif prof_name in HVAC_PROFILES:
+            # 暖通设备：不是表计，不写 energy_reading（见 build_hvac_payload）
+            kind, phases, nominal = "hvac", 1, 0.0
         else:
             continue
 
         # 当前表底：接着历史往下走，不能从 0 开始（否则抄表算出「电量倒走」）
         reading = 0.0
         try:
-            d2 = api(base, "/api/plugins/telemetry/DEVICE/%s/values/timeseries?keys=energy_reading&limit=1&orderBy=DESC" % did, token)
+            d2 = api(base, "/api/plugins/telemetry/DEVICE/%s/values/timeseries?keys=energy_reading&limit=1&orderBy=DESC" % did)
             pts = d2.get("energy_reading") or []
             if pts and pts[0].get("value") is not None:
                 reading = float(pts[0]["value"])
@@ -309,6 +603,21 @@ def discover(base, token, customer_id):
 
         m = Meter(name, prof_name, level, reading, nominal, kind, did,
                   phases=phases, site_id=ai.get("siteId") or "")
+        if kind == "hvac":
+            m.hvac_type = HVAC_PROFILES[prof_name]
+            # 水温从历史接上：查询设置的曲线按小时聚合，每轮重抽会得到锯齿
+            if m.hvac_type in ("chiller", "boiler", "heat_exchanger"):
+                try:
+                    d4 = api(base, "/api/plugins/telemetry/DEVICE/%s/values/timeseries"
+                                    "?keys=water_in_temp,water_out_temp&limit=1&orderBy=DESC" % did)
+                    wi = (d4.get("water_in_temp") or [{}])[0].get("value")
+                    wo = (d4.get("water_out_temp") or [{}])[0].get("value")
+                    if wi is not None:
+                        m.water_in = float(wi)
+                    if wo is not None:
+                        m.water_out = float(wo)
+                except Exception:
+                    pass
         # 虚拟表（additionalInfo.deviceVirtual == "virtual"）是「手工填报」页的载体，
         # 只有月首点、不写 energy_reading。给它自动上报等于自己演示的两种口径打架，
         # 还会让手工填报页的月值被小时数据淹没 —— 一律跳过。
@@ -318,7 +627,7 @@ def discover(base, token, customer_id):
         # 温度从历史接上，避免曲线从 24℃ 突然开始
         if kind == "sensor":
             try:
-                d3 = api(base, "/api/plugins/telemetry/DEVICE/%s/values/timeseries?keys=temperature,humidity&limit=1&orderBy=DESC" % did, token)
+                d3 = api(base, "/api/plugins/telemetry/DEVICE/%s/values/timeseries?keys=temperature,humidity&limit=1&orderBy=DESC" % did)
                 if d3.get("temperature"):
                     meters[-1].temp = float(d3["temperature"][0]["value"])
                 if d3.get("humidity"):
@@ -339,7 +648,7 @@ def discover(base, token, customer_id):
             continue
         try:
             rels = api(base, "/api/relations?fromId=%s&fromType=DEVICE&relationType=Contains"
-                       "&relationTypeGroup=COMMON" % m.device_id, token)
+                       "&relationTypeGroup=COMMON" % m.device_id)
         except Exception:
             rels = []
         for r in (rels or []):
@@ -355,7 +664,7 @@ def discover(base, token, customer_id):
 
 # ---------------------------------------------------------------- 上报
 def device_token(base, token, device_id):
-    cred = api(base, "/api/device/%s/credentials" % device_id, token)
+    cred = api(base, "/api/device/%s/credentials" % device_id)
     return cred.get("credentialsId")
 
 
@@ -392,8 +701,8 @@ def main():
         args.count = 1
 
     base = args.base.rstrip("/")
-    token = api(base, "/api/auth/login", method="POST",
-                body={"username": args.tenant, "password": args.tenant_pass})["token"]
+    login(base, args.tenant, args.tenant_pass)
+    token = _AUTH["token"]
 
     custs = paged(base, "/api/customers", token)
     hit = [c for c in custs if args.customer in (c.get("title"), c.get("name"), c["id"]["id"])]
@@ -431,6 +740,7 @@ def main():
     hours = args.interval / 3600.0
     rounds = 0
     fail = 0
+    zero_streak = 0
     print("-" * 96)
     try:
         while True:
@@ -444,7 +754,13 @@ def main():
                     if rounds == 1 or args.count == 1:
                         # 首轮逐台打印，之后只打汇总（否则日志太长）
                         main_key = ("power_total" if m.kind == "electric"
-                                    else "temperature" if m.kind == "sensor" else "power")
+                                    else "temperature" if m.kind == "sensor"
+                                    # 暖通没有 power 键，按角色挑一个最有代表性的
+                                    else "water_out_temp" if m.hvac_type in ("chiller", "boiler")
+                                    else "pump_freq" if m.hvac_type == "pump"
+                                    else "temperature" if m.hvac_type == "env_sensor"
+                                    else "running" if m.kind == "hvac"
+                                    else "power")
                         print("  %-36s %-18s %s" % (m.name[:34], main_key, p.get(main_key)))
                 except Exception as e:
                     fail += 1
@@ -452,7 +768,7 @@ def main():
 
             if args.rebuild_totals and not args.dry_run:
                 try:
-                    r = api(base, "/api/energy/asset-totals/rebuild", token, method="POST",
+                    r = api(base, "/api/energy/asset-totals/rebuild", method="POST",
                             body={"customerId": cid, "days": 2})
                     print("  ↻ 资产汇总已刷新（%s 个资产）" % (r or {}).get("assetsWritten", "?"))
                 except Exception as e:
@@ -461,6 +777,30 @@ def main():
             print("[%s] 第 %d 轮：%d/%d 成功，耗时 %.1fs%s" % (
                 time.strftime("%H:%M:%S"), rounds, n_ok, len(chosen),
                 time.time() - t0, "（dry-run，未写库）" if args.dry_run else ""))
+
+            # ── 连续全失败要吼出来 ──────────────────────────────
+            #
+            # 为什么（2026-11-25 真事故）：
+            #   token 过期后本脚本不会续期，于是**每一轮都是 0/49**，
+            #   而进程还活着、KeepAlive 认为一切正常。实测从 06:09 到 09:51
+            #   连跑 371 轮全失败，日志每分钟一行 0/49 —— 混在正常输出里
+            #   完全不显眼，客户只看到「看板数据不动了」。
+            #
+            # 现在：
+            #   1. 401 会自动续期（见 _relogin），兜住最常见的原因；
+            #   2. 连续 3 轮一台都没写进去就打一条一眼能看见的告警，
+            #      之后每 10 轮重复一次（不刷屏但不会沉底）。
+            if n_ok == 0 and len(chosen) > 0:
+                zero_streak += 1
+            else:
+                zero_streak = 0
+            if zero_streak >= 3 and (zero_streak == 3 or zero_streak % 10 == 0):
+                print("!" * 96)
+                print("!! 已连续 %d 轮未写入任何设备（第 %d 轮）。看板数据此刻正在停更！" % (
+                    zero_streak, rounds))
+                print("!! 排查顺序：① 平台是否可达  ② 账号密码是否改过（续期会失败）")
+                print("!!           ③ 设备 token 是否被重置  ④ 后端日志有无 5xx")
+                print("!" * 96)
             if args.count and rounds >= args.count:
                 break
             time.sleep(max(1.0, args.interval - (time.time() - t0)))

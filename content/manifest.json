@@ -1,7 +1,7 @@
 {
   "title": "能源管理平台 · 使用手册",
   "version": "v2.0",
-  "updated": "2026-11-15",
+  "updated": "2026-11-25",
   "sections": [
     {
       "id": "user",
@@ -117,9 +117,222 @@
           "id": "testing",
           "title": "⑬ 测试与验收（用例与判据）",
           "file": "admin/13-testing.md"
+        },
+        {
+          "id": "menu-sql-map",
+          "title": "⑭ 菜单→SQL 核对卡（26 个页面）",
+          "file": "admin/14-menu-sql-map.md"
         }
       ],
       "description": "给平台方的：怎么部署、开租户、导入数据、排障"
+    },
+    {
+      "id": "menu-ops",
+      "title": "运维管理",
+      "desc": "按平台客户菜单逐级核对每个功能的取数 SQL（可复制运行）",
+      "icon": "ops",
+      "items": [
+        {
+          "id": "customer",
+          "title": "客户",
+          "file": "ops-customer/00-index.md",
+          "children": [
+            {
+              "id": "energy-overview",
+              "title": "能耗概览（首页）",
+              "file": "ops-customer/01-energy-overview.md",
+              "dashboardId": "73dd2240-d2bd-11f1-b794-31725d9e3862"
+            },
+            {
+              "id": "query",
+              "title": "能耗查询",
+              "children": [
+                {
+                  "id": "realtime",
+                  "title": "实时能耗",
+                  "file": "ops-customer/02-realtime.md",
+                  "dashboardId": "74466b60-d2bd-11f1-b794-31725d9e3862"
+                },
+                {
+                  "id": "history",
+                  "title": "历史能耗",
+                  "file": "ops-customer/03-history.md",
+                  "dashboardId": "73e6bf30-d2bd-11f1-b794-31725d9e3862"
+                },
+                {
+                  "id": "meter-reading",
+                  "title": "抄表功能",
+                  "file": "ops-customer/04-meter-reading.md",
+                  "dashboardId": "742ca1d0-d2bd-11f1-b794-31725d9e3862"
+                }
+              ]
+            },
+            {
+              "id": "analysis",
+              "title": "能耗分析",
+              "children": [
+                {
+                  "id": "tou-analysis",
+                  "title": "峰谷分析",
+                  "file": "ops-customer/05-tou-analysis.md",
+                  "dashboardId": "745670f0-d2bd-11f1-b794-31725d9e3862"
+                },
+                {
+                  "id": "itemized",
+                  "title": "分项能耗",
+                  "file": "ops-customer/06-itemized.md",
+                  "dashboardId": "7412d840-d2bd-11f1-b794-31725d9e3862"
+                },
+                {
+                  "id": "region",
+                  "title": "区域能耗",
+                  "file": "ops-customer/07-region.md",
+                  "dashboardId": "7397b4d0-d2bd-11f1-b794-31725d9e3862"
+                },
+                {
+                  "id": "billing",
+                  "title": "用能账单",
+                  "file": "ops-customer/08-billing.md",
+                  "dashboardId": "7431aae0-d2bd-11f1-b794-31725d9e3862"
+                }
+              ]
+            },
+            {
+              "id": "reports",
+              "title": "综合报表",
+              "children": [
+                {
+                  "id": "basic-report",
+                  "title": "基础报表",
+                  "file": "ops-customer/09-basic-report.md",
+                  "dashboardId": "73b500d0-d2bd-11f1-b794-31725d9e3862"
+                },
+                {
+                  "id": "manual-entry",
+                  "title": "手工填报",
+                  "file": "ops-customer/10-manual-entry.md",
+                  "dashboardId": "7426ae60-d2bd-11f1-b794-31725d9e3862"
+                }
+              ]
+            },
+            {
+              "id": "optimize",
+              "title": "能耗优化",
+              "children": [
+                {
+                  "id": "idle-energy",
+                  "title": "闲时能耗",
+                  "file": "ops-customer/11-idle-energy.md",
+                  "dashboardId": "74091440-d2bd-11f1-b794-31725d9e3862"
+                },
+                {
+                  "id": "forecast",
+                  "title": "负载预测",
+                  "file": "ops-customer/12-forecast.md",
+                  "dashboardId": "741d86a0-d2bd-11f1-b794-31725d9e3862"
+                },
+                {
+                  "id": "advice",
+                  "title": "用能建议",
+                  "file": "ops-customer/13-advice.md",
+                  "dashboardId": "1cebb370-da6f-11f1-aec2-1192e109281d"
+                },
+                {
+                  "id": "quality",
+                  "title": "用能质量",
+                  "file": "ops-customer/14-quality.md",
+                  "dashboardId": "1d661390-da6f-11f1-aec2-1192e109281d"
+                }
+              ]
+            },
+            {
+              "id": "alarm-events",
+              "title": "告警事件",
+              "file": "ops-customer/15-alarm-events.md",
+              "dashboardId": "573f38b0-d3d2-11f1-9ee9-c3a7be535a93"
+            },
+            {
+              "id": "device",
+              "title": "设备管理",
+              "children": [
+                {
+                  "id": "device-ops",
+                  "title": "设备运维",
+                  "file": "ops-customer/16-device-ops.md",
+                  "dashboardId": "a9061a40-d3ca-11f1-9ee9-c3a7be535a93"
+                },
+                {
+                  "id": "device-group",
+                  "title": "设备分组",
+                  "file": "ops-customer/17-device-group.md",
+                  "dashboardId": "a4917020-d3cc-11f1-9ee9-c3a7be535a93"
+                },
+                {
+                  "id": "device-topology",
+                  "title": "设备拓扑",
+                  "file": "ops-customer/18-device-topology.md",
+                  "dashboardId": "4dd17660-d3cf-11f1-9ee9-c3a7be535a93"
+                }
+              ]
+            },
+            {
+              "id": "comprehensive",
+              "title": "综合能耗",
+              "file": "ops-customer/19-comprehensive.md",
+              "dashboardId": "73ba09e0-d2bd-11f1-b794-31725d9e3862"
+            },
+            {
+              "id": "sankey",
+              "title": "能源流向",
+              "file": "ops-customer/20-sankey.md",
+              "dashboardId": "744ef6e0-d2bd-11f1-b794-31725d9e3862"
+            },
+            {
+              "id": "audit-report",
+              "title": "盘查报告",
+              "file": "ops-customer/21-audit-report.md",
+              "dashboardId": "73abb200-d2bd-11f1-b794-31725d9e3862"
+            },
+            {
+              "id": "saving-records",
+              "title": "节能记录",
+              "file": "ops-customer/22-saving-records.md",
+              "dashboardId": "7452c770-d2bd-11f1-b794-31725d9e3862"
+            },
+            {
+              "id": "hvac",
+              "title": "空调管理",
+              "children": [
+                {
+                  "id": "hvac-monitor",
+                  "title": "空调运行监控",
+                  "file": "ops-customer/23-hvac-monitor.md",
+                  "dashboardId": "73f58c40-d2bd-11f1-b794-31725d9e3862"
+                },
+                {
+                  "id": "hvac-plan",
+                  "title": "运行计划与配置",
+                  "file": "ops-customer/24-hvac-plan.md",
+                  "dashboardId": "74001390-d2bd-11f1-b794-31725d9e3862"
+                },
+                {
+                  "id": "hvac-daily",
+                  "title": "每日复盘报告",
+                  "file": "ops-customer/25-hvac-daily.md",
+                  "dashboardId": "73ed9d00-d2bd-11f1-b794-31725d9e3862"
+                }
+              ]
+            },
+            {
+              "id": "org",
+              "title": "组织",
+              "file": "ops-customer/26-org.md",
+              "dashboardId": "04e26da0-d3b7-11f1-8238-c3a7be535a93"
+            }
+          ]
+        }
+      ],
+      "description": "给运维：客户菜单的每个功能点，数据从哪张表来、怎么查"
     }
   ]
 }

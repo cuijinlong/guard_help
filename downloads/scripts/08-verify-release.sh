@@ -1288,6 +1288,25 @@ SAVING_N=$(DASH_DB "select count(*) from asset where type='saving_record'")
 ge "节能记录演示数据" "${SAVING_N:-0}" 3 \
    "重建客户（09-onboard-customer.sh）或对已有客户调 POST /api/energy/demo-data 补齐"
 
+# I-10. alarm 表没有 NULL 的时间戳 / 布尔列
+#
+#       客户报障原话（2026-11-25）：
+#         Cannot invoke "java.lang.Long.longValue()" because
+#         the return value of "java.util.Map.get(Object)" is null
+#
+#       根因：TB 内核 AlarmDataAdapter 写的是 (long) row.get("ack_ts")，
+#       列值为 SQL NULL 时拆箱直接 NPE。propagate* 四个 Boolean 同理。
+#
+#       ★ 为什么必须进发版验收：这个错**只在结果集恰好翻到脏行时才炸**
+#         （pageSize=2 过、3 炸），平时谁也不会发现。等客户打开某场站的
+#         「设备运维」时才知道 —— 而那时已经不知道是谁写进去的。
+#
+#       写入方主要是 scripts/simulate-alarms.mjs（直接 INSERT INTO alarm）。
+#       判据用 ${ALARM_BAD:-查询失败}：查询本身失败时不能当成 0（否则静默通过）。
+ALARM_BAD=$(DASH_DB "select count(*) from alarm where ack_ts is null or clear_ts is null or end_ts is null or assign_ts is null or propagate is null or propagate_to_owner_hierarchy is null")
+eq "告警表时间戳/布尔列无 NULL" "${ALARM_BAD:-查询失败}" "0" \
+   "会让「设备运维」整页 500（longValue NPE）；跑 scripts/49-fix-alarm-null-ts.sh --fix"
+
 # ================================================================
 echo
 echo "============================================================"

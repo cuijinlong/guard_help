@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    演示数据模拟器常驻（2026-11-25 新增）。
+
+    背景：23-demo-simulator.py 原来没有常驻配置，只手工跑 --once，
+    几小时后全站遥测停更，看板显示「数据滞后 N 小时」。
+
+    KeepAlive=true：进程崩了自动拉起（模拟器偶发 token 过期会退出）。
+    RunAtLoad=true：登录后立即开始，不用记得手动启动。
+  -->
+  <key>Label</key><string>com.guard.demo-sim</string>
+  <key>ProgramArguments</key>
+  <array><string>/Users/cuijinlong/energy-app/scripts/demo-sim/run.sh</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/demo-sim.log</string>
+  <key>StandardErrorPath</key><string>/tmp/demo-sim.err</string>
+</dict>
+</plist>

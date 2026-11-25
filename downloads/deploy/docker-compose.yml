@@ -122,6 +122,12 @@ services:
       # ts 到日期/小时边界的换算。存量数据是 epoch 毫秒，不受影响。
       - -c
       - timezone=${TZ:-Asia/Shanghai}
+    ports:
+      # 局域网访问数据库（2026-11-25 客户要求）。
+      # 默认绑所有网卡；只想本机调试就在 .env 写 DB_BIND_ADDR=127.0.0.1。
+      # 对外后安全性完全依赖密码（DB_PASSWORD，≥scram-sha-256），
+      # 不要把 pg_hba 改成 trust。
+      - "${DB_BIND_ADDR:-0.0.0.0}:${DB_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -130,7 +136,8 @@ services:
       timeout: 3s
       retries: 20
       start_period: 10s
-    # 数据库不对外暴露：调试用 docker compose exec postgres psql
+    # 端口映射见上（DB_BIND_ADDR，默认 0.0.0.0，供局域网访问）；
+    # 容器内调试：docker compose exec postgres psql
     logging: *default-logging
 
   # ────────────────────────────────────────────────────────────────

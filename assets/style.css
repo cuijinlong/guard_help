@@ -211,6 +211,42 @@ body {
   border-left-color: var(--brand);
 }
 
+/* ---------- 三级菜单（运维管理 → 客户 → 分组 → 功能） ----------
+   层级用 .nav-depth-N 控制缩进，不写死层数：菜单要和系统左侧逐级对齐，
+   将来多一层不用回来改样式。 */
+
+.nav-sub-group { margin: 2px 0 4px; }
+
+.nav-sub-title {
+  display: block;
+  padding: 6px 12px;
+  margin: 2px 0;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-soft);
+  text-decoration: none;
+}
+a.nav-sub-title:hover { background: #eaf2fa; color: var(--brand-dark); }
+a.nav-sub-title.active {
+  background: #e3f0fb;
+  color: var(--brand-dark);
+}
+
+.nav-sub-items {
+  display: flex;
+  flex-direction: column;
+  margin-left: 10px;
+  padding-left: 8px;
+  border-left: 1px dashed #dbe6f0;
+}
+.nav-sub-items a {
+  padding: 5px 10px;
+  font-size: 13px;
+}
+
+.nav-icon-ops { background: linear-gradient(135deg, #f0c987, #d9a24c); }
+
 /* ---------- 右侧目录 ---------- */
 
 .toc {

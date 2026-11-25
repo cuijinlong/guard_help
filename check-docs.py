@@ -42,8 +42,73 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent          # shiyongshouce/
 REPO = ROOT.parent                              # 仓库根
 GS = REPO / 'guard-server' / 'src' / 'main'
-JAVA_INSTALL = GS / 'java' / 'com' / 'guard' / 'server' / 'service' / 'install'
-RES_ENERGY = GS / 'resources' / 'data' / 'json' / 'system' / 'energy'
+
+
+def _locate(*rel: str) -> Path:
+    """
+    在 `guard-server` 下定位一个路径，**自动适配模块拆分**。
+
+    <h3>为什么不能写死（2026-11-24 实测踩到）</h3>
+
+    <p>原来这里是 `GS = guard-server/src/main`，但代码早已拆成
+    `guard-core` / `guard-energy` / `guard-app` 等子模块 —— 于是
+    `JAVA_INSTALL` / `RES_ENERGY` 两个路径**永远指不到文件**，
+    12 项数据模型检查全部 `[Errno 2]`。
+
+    <p>后果比「少 12 项检查」更糟：脚本整体仍以退出码 0 结束
+    （因为还有别的检查在过），`✗ 12 项不一致` 变成长期存在的噪音。
+    噪音久了就没人看，AGENTS.md 里「发版前跑 check-docs.py」等于失效。
+
+    <p>所以先试老路径（保持兼容），再在各 `guard-*` 子模块里找。
+    """
+    direct = REPO / 'guard-server' / Path(*rel)
+    if direct.exists():
+        return direct
+    base = REPO / 'guard-server'
+    if base.is_dir():
+        for mod in sorted(base.iterdir()):
+            if mod.is_dir() and mod.name.startswith('guard-'):
+                cand = mod / Path(*rel)
+                if cand.exists():
+                    return cand
+    return direct
+
+
+JAVA_INSTALL = _locate('src/main/java/com/guard/server/service/install')
+
+
+def _java_file(name: str) -> Path:
+    """
+    按**文件名**在所有 `guard-*` 模块里找 Java 源文件。
+
+    <h3>为什么不能只用一个目录常量（2026-11-24 实测踩到）</h3>
+
+    <p>`service/install/` 这个包**被拆到了两个模块**：
+
+    ```
+    guard-core/.../service/install/    AssetProfileInstaller
+    guard-energy/.../service/install/  EnergyMenuInstaller、DeviceRuleInstaller、…
+    ```
+
+    <p>所以 `_java_file('EnergyMenuInstaller.java')` 必然找不到 ——
+    修好目录层级之后仍然有 5 项 `[Errno 2]`，就是这么来的。
+
+    <p>按文件名搜而不是按目录定：install 类分属哪个模块是实现细节，
+    手册校验不该依赖它。
+    """
+    rel = Path('src/main/java/com/guard/server/service/install') / name
+    direct = REPO / 'guard-server' / rel
+    if direct.exists():
+        return direct
+    base = REPO / 'guard-server'
+    if base.is_dir():
+        for mod in sorted(base.iterdir()):
+            if mod.is_dir() and mod.name.startswith('guard-'):
+                cand = mod / rel
+                if cand.exists():
+                    return cand
+    return direct
+RES_ENERGY = _locate('src/main/resources/data/json/system/energy')
 DASHBOARDS = GS / 'data' / 'json' / 'tenant' / 'dashboards'
 DOCS = ROOT / 'content' / 'admin'
 DOWNLOADS = ROOT / 'downloads'
@@ -59,7 +124,7 @@ def _read(p: Path) -> str:
 
 def count_asset_profiles(_repo) -> int:
     """资产档案数：AssetProfileInstaller.ASSET_PROFILES 里 put(...) 的条数"""
-    src = _read(JAVA_INSTALL / 'AssetProfileInstaller.java')
+    src = _read(_java_file('AssetProfileInstaller.java'))
     # 只数 static 块里的 put("名字", "说明")
     m = re.search(r'ASSET_PROFILES\s*=\s*new LinkedHashMap<>\(\)\s*\{\{(.*?)\n    \}\}', src, re.S)
     if not m:
@@ -80,7 +145,7 @@ def count_rules(_repo) -> int:
     判定方式：installForProfile 里 `if (!singlePhase) { created += ensureXxx }`
     包住的那些，只对三相生效。
     """
-    src = _read(JAVA_INSTALL / 'DeviceRuleInstaller.java')
+    src = _read(_java_file('DeviceRuleInstaller.java'))
     body = re.search(r'private int installForProfile\(.*?\n    \}', src, re.S)
     if not body:
         raise RuntimeError('DeviceRuleInstaller: 找不到 installForProfile')
@@ -164,7 +229,7 @@ def count_tou_schemes(_repo) -> int:
     {@code TOU_TEMPLATES} 循环 —— 数调用会得到 1，看着像方案只剩一个。
     方案表本身才是真相源，直接数它。
     """
-    src = _read(JAVA_INSTALL / 'EnergyLibraryInstaller.java')
+    src = _read(_java_file('EnergyLibraryInstaller.java'))
     body = re.search(r'TOU_TEMPLATES = new TouTemplate\[\]\{(.*?)\n        \};', src, re.S)
     if not body:
         raise RuntimeError('EnergyLibraryInstaller: 找不到 TOU_TEMPLATES 初始化块')
@@ -173,7 +238,7 @@ def count_tou_schemes(_repo) -> int:
 
 def count_rate_templates(_repo) -> int:
     """费率模板数：createRateTemplate(tenantId, ...) 的调用次数（不含 linkTouSchemes 等）"""
-    src = _read(JAVA_INSTALL / 'EnergyLibraryInstaller.java')
+    src = _read(_java_file('EnergyLibraryInstaller.java'))
     body = re.search(r'private void createRateTemplates\(.*?\n    \}', src, re.S)
     if not body:
         raise RuntimeError('EnergyLibraryInstaller: 找不到 createRateTemplates')
@@ -239,7 +304,7 @@ def count_tenant_menu(_repo) -> int:
     租户菜单顶层项数 = items.add(...) 的次数。
     DEFAULT 引用是循环里批量加的，按数组元素个数算。
     """
-    src = _read(JAVA_INSTALL / 'EnergyMenuInstaller.java')
+    src = _read(_java_file('EnergyMenuInstaller.java'))
     body = re.search(r'private List<MenuItem> tenantItems\(.*?\n    \}', src, re.S)
     if not body:
         raise RuntimeError('EnergyMenuInstaller: 找不到 tenantItems')
@@ -255,7 +320,7 @@ def count_tenant_menu(_repo) -> int:
 
 
 def count_customer_menu(_repo) -> int:
-    src = _read(JAVA_INSTALL / 'EnergyMenuInstaller.java')
+    src = _read(_java_file('EnergyMenuInstaller.java'))
     body = re.search(r'private List<MenuItem> customerItems\(.*?\n    \}', src, re.S)
     if not body:
         raise RuntimeError('EnergyMenuInstaller: 找不到 customerItems')
@@ -392,6 +457,48 @@ def check_script_refs() -> list[str]:
     return errs
 
 
+def check_generated_pages() -> list[str]:
+    """手册里「由脚本从库里生成」的页面是否还与库一致。
+
+    为什么需要（2026-11-25）：
+      「⑭ 菜单→SQL 核对卡」与「运维管理 → 客户 → 功能」逐功能页，内容
+      全部来自数据库（菜单、看板、部件、SQL）。菜单一变，手册就悄悄变成旧版：
+        · 不会报错（页面照样打开）
+        · check-docs 的「页面完整性」也查不出（manifest 与文件是自洽的，
+          只是两者都落后于库）
+      所以直接把生成器的 --check 调一遍，它比的是「库与手册」。
+
+    库不可用时跳过（文档一致性不该依赖数据库是否启动），
+    但**必须把跳过原因打出来**，否则会误以为已经验过。
+    """
+    import subprocess
+
+    repo = Path(__file__).resolve().parent.parent
+    tools = [
+        ('gen-menu-sql-map.py', '⑭ 菜单→SQL 核对卡'),
+        ('gen-ops-customer-pages.py', '运维管理→客户 逐功能页'),
+    ]
+    try:
+        probe = subprocess.run(
+            ['docker', 'exec', 'energy-postgres', 'psql', '-U', 'postgres',
+             '-d', 'thingsboard', '-tAc', 'SELECT 1'],
+            capture_output=True, text=True, timeout=20)
+    except Exception:
+        return ['跳过：docker 不可用']
+    if probe.returncode != 0:
+        return ['跳过：energy-postgres 未运行']
+
+    errs: list[str] = []
+    for script, label in tools:
+        p = subprocess.run([sys.executable, str(repo / 'tools' / script), '--check'],
+                           capture_output=True, text=True, timeout=180, cwd=str(repo))
+        if p.returncode != 0:
+            detail = [ln for ln in (p.stdout or '').splitlines() if ln.strip().startswith('·')]
+            errs.append(f'{label} 与库不一致（{(detail[0].strip() if detail else "见手册生成器输出")}）'
+                        f' → 重跑 tools/{script}')
+    return errs
+
+
 def check_troubleshoot_numbering() -> list[str]:
     """故障手册的「现象 X」编号必须唯一。
 
@@ -482,12 +589,38 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
         # 且与账单/基线快照声称同一套口径。写错了会让人怀疑统计本身有问题，
         # 所以必须和其他页一样逐条真跑。
         ('13-testing.md', None),
+        # 菜单→SQL 核对卡（2026-11-25）：主体由 tools/gen-menu-sql-map.py 生成，
+        # SQL 固化在脚本的 PAGE_SQL 里。它是「按页面核对数字」的唯一入口，
+        # 写错一条就等于教错核对方法 —— 与 08 同等对待，逐条真跑。
+        ('14-menu-sql-map.md', None),
     ]
     blocks: list[str] = []
     for fname, marker in sql_docs:
         src = _read(DOCS / fname)
         tail = src[src.find(marker):] if marker else src
         blocks.extend(re.findall(r'```sql\n(.*?)```', tail, re.S))
+
+    # 「运维管理 → 客户 → 功能」的逐功能页（2026-11-25）。
+    #
+    # 这些页给的 SQL 包在 `docker exec ... <<'SQL'` 的 heredoc 里 ——
+    # 用户是整段复制到终端跑的，所以**必须是能跑的原样**。
+    # 不从 heredoc 里抽出来跑，就等于把这些页排除在自动校验之外。
+    ops_dir = DOCS / 'ops-customer'
+    if ops_dir.is_dir():
+        for f in sorted(ops_dir.glob('*.md')):
+            blocks.extend(re.findall(r"<<'SQL'\n(.*?)\nSQL\n", f.read_text(encoding='utf-8'), re.S))
+
+    # 去重：逐功能页与 14-menu-sql-map 共用同一份 PAGE_SQL，
+    # 同一段 SQL 不必重复跑两遍（几十条 × 每条几百毫秒）。
+    seen_sql: set[str] = set()
+    uniq: list[str] = []
+    for b in blocks:
+        k = b.strip()
+        if k in seen_sql:
+            continue
+        seen_sql.add(k)
+        uniq.append(b)
+    blocks = uniq
 
     # 取一个真实客户 id，用来**验证带占位符的 SQL**。
     #
@@ -708,21 +841,38 @@ def main() -> int:
     if os.path.exists(manifest_path):
         with open(manifest_path, encoding='utf-8') as f:
             manifest = json.load(f)
-        seen_items: set[tuple[str, str]] = set()
+        # 菜单可以嵌套（item.children，用于「运维管理 → 客户 → 功能」这类
+        # 与系统左侧菜单逐级对齐的导航），所以遍历必须递归 ——
+        # 只查一层会把所有子页误报成「未登记」，也会漏查子页文件不存在。
+        def walk_items(items, prefix):
+            for it in items or []:
+                path = prefix + '/' + str(it.get('id', ''))
+                yield path, it
+                if it.get('children'):
+                    yield from walk_items(it['children'], path)
+
+        seen_items: set[str] = set()
+        registered: set[str] = set()
+        n_items = 0
         for section in manifest.get('sections', []):
-            for item in section.get('items', []):
-                key = (section.get('id', ''), item.get('id', ''))
-                if key in seen_items:
-                    manifest_errors.append(f'重复的路由 {key[0]}/{key[1]}（manifest 里登记了两次）')
-                seen_items.add(key)
+            sid = section.get('id', '')
+            for path, item in walk_items(section.get('items', []), sid):
+                n_items += 1
+                if path in seen_items:
+                    manifest_errors.append(f'重复的路由 {path[1:]}（manifest 里登记了两次）')
+                seen_items.add(path)
 
                 rel = item.get('file', '')
+                # 纯分组节点（有 children、没 file）是合法的：它只当标题用。
                 if not rel:
-                    manifest_errors.append(f'{key[0]}/{key[1]} 缺 file 字段')
+                    if not item.get('children'):
+                        manifest_errors.append(
+                            f'{path[1:]} 缺 file 字段（既没有 file 也没有 children）')
                     continue
+                registered.add(rel)
                 fpath = os.path.join(os.path.dirname(manifest_path), rel)
                 if not os.path.exists(fpath):
-                    manifest_errors.append(f'{key[0]}/{key[1]} 指向的 {rel} 不存在')
+                    manifest_errors.append(f'{path[1:]} 指向的 {rel} 不存在')
                     continue
                 if os.path.getsize(fpath) == 0:
                     manifest_errors.append(f'{rel} 是空文件')
@@ -735,9 +885,7 @@ def main() -> int:
                     continue
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, content_dir)
-                if not any(i.get('file') == rel
-                           for sec in manifest.get('sections', [])
-                           for i in sec.get('items', [])):
+                if rel not in registered:
                     manifest_errors.append(f'{rel} 未在 manifest 登记（写了但侧边栏进不去）')
 
     if manifest_errors:
@@ -747,10 +895,7 @@ def main() -> int:
             print(f'    · {e}')
         print('  改完重新运行；页面必须在 manifest 登记，file 必须真实存在。')
     else:
-        n_items = sum(len(sec.get('items', [])) for sec in
-                      json.load(open(manifest_path, encoding='utf-8')).get('sections', [])) \
-                  if os.path.exists(manifest_path) else 0
-        print(f'✓ 手册页面完整（manifest 登记 {n_items} 页，文件全部存在）')
+        print(f'✓ 手册页面完整（manifest 登记 {n_items} 个菜单项，文件全部存在）')
 
     sql_ran, sql_total, sql_errors = check_doc_sql()
     if sql_total:
@@ -768,6 +913,22 @@ def main() -> int:
         print('\n· 运维 SQL 未校验：')
         for e in sql_errors:
             print(f'    · {e}')
+
+    # ---------------- 生成页与库一致 ----------------
+    gen_errors = check_generated_pages()
+    gen_skipped = [e for e in gen_errors if e.startswith('跳过')]
+    gen_real = [e for e in gen_errors if not e.startswith('跳过')]
+    if gen_real:
+        failed += len(gen_real)
+        print(f'\n✗ 生成页与库不一致（{len(gen_real)} 处）：')
+        for e in gen_real:
+            print(f'    · {e}')
+        print('  菜单/看板一改，这两页就会变旧版 —— 重跑对应生成器。')
+    elif gen_skipped:
+        # 跳过也要打出来：否则看到「全部一致」会误以为已经验过
+        print(f'\n· 生成页未校验：{gen_skipped[0]}')
+    else:
+        print('\n✓ 生成页与库一致（⑭ 菜单→SQL 核对卡 + 运维管理→客户 逐功能页）')
 
     # ---------------- 故障手册章节编号唯一性 ----------------
     numbering_errors = check_troubleshoot_numbering()

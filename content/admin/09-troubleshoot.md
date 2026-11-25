@@ -2754,3 +2754,865 @@ WHERE t.entity_id='<设备id>' GROUP BY 1 LIMIT 10;"
 
 # ⑤ 浏览器控制台截图（Network 里失败的请求 + Console 报错）
 ```
+
+---
+
+### 「功率因数与负荷需量」显示 0 / 空（2026-11-25 客户报障）
+
+**客户原话**：「能源概览页面中功率因数与负荷需量为 0 不对」。
+
+#### 先说结论：不是算错，是三层里断了一层
+
+| 层 | 判据 | 断了长什么样 |
+| --- | --- | --- |
+| 档案 | 场站要有 `meterLevel=1` 的关口表 | 表盘指针指到 0（文字是 `—`）、需量 `—` |
+| 遥测 | 关口表要有 `demand_max` | 需量曲线只剩开头两天，KPI 是 8 天前的峰值 |
+| 口径 | 部件 PF ≈ 独立算的 ΣP/ΣS | 数字看着对，其实加权错了 |
+
+**一键体检**：
+
+```bash
+python3 scripts/50-verify-power-load.py
+# 换账号：TB_USER=demo@126.com TB_PASS=*** python3 scripts/50-verify-power-load.py
+```
+
+它按上面三层逐条打印实测值，退出码 1 = 有问题。
+
+#### 实测现场（2026-11-25）
+
+```
+办公园区    0 台关口表   ← 默认场站，所以一登录就是 0
+质量示范站  0 台关口表
+生产园区    2 台关口表（正泰 DTSD3366D / 雅达 YDPQ200-A）
+```
+
+外加：`demand_max` 在**两台生产园区的表上最后一点是 11-16**，
+而 `power_total` / `power_factor_total` 一直在更新 —— 需量断供。
+
+#### 为什么指针会指到 0
+
+`setNeedle(null)` 把角度算成 `Math.PI * (1 - 0)` = 180°，指针停在最左端。
+**「没有数据」和「功率因数是 0」在视觉上完全一样** —— 这就是客户说的「为 0」。
+
+已修：无数据时 `scope.pfHasData = false`，模板用
+`[attr.opacity]="pfHasData ? 1 : 0"` 隐藏指针（不用 `*ngIf`，
+避免踩 A2d 那个 JIT 指令失效的坑）。
+
+#### 为什么需量会断
+
+`23-demo-simulator.py` 的 electric 分支**从来没写过 `demand_max`**
+（只有安装时的一次性快照里有）。已补：
+
+```python
+meter.day_peak = max(meter.day_peak, power)   # 跨天归零
+out["demand_max"] = round(meter.day_peak, 2)
+```
+
+同时补了单相表的 `apparent_power_total` / `reactive_power_total` ——
+缺 S 会让 PF 加权退化成算术平均，标注跟着变，看起来像算错了。
+
+历史缺口用 `scripts/52-backfill-demand-max.py` 按 `power_total` 的当天峰值补齐
+（与安装快照 `dayPeak = max(dayPeak, pTotal)` 同一口径，不是编数）。
+
+#### 为什么每站都要有一台「1#进线总表」
+
+部件只统计 `meterLevel=1`：力率考核对象就是进线总表，回路表混进来会把
+加权值拉偏。**一个场站没有关口表，功率因数就无从谈起**。
+
+补表 + 挂子表（保证「父表 >= Σ 子表」、资产汇总不重复计电）：
+
+```bash
+python3 scripts/51-add-site-gate-meters.py --dry-run
+python3 scripts/51-add-site-gate-meters.py
+```
+
+它同时给已有 level=1 的表补 `capacityKw` —— 部件改为
+**设备铭牌容量优先**（多表求和）> 看板设置 `ratedCapacity` > 实测峰值视在功率。
+容量是设备属性，不是页面属性：办公园区 20 kVA、生产园区 630 kVA，
+一个看板设置值不可能同时正确。
+
+#### 判据（修好后实测）
+
+```
+平均功率因数  0.967   按视在功率加权 · 达标      指针 opacity=1
+额定容量      20.0 kVA  设备铭牌容量
+最大需量      13.9 kW   峰值出现在 2026-11-25
+最高负载率    69.3 %    需量峰值 / 额定容量
+```
+
+三个场站的 PF 与独立 ΣP/ΣS 差都 ≤ 0.0004，需量峰与功率峰比值均为 1.00。
+
+#### ★ 第三个坑（最隐蔽）：锚点把「今天」切掉了
+
+修完上面的东西，页面反而变成「1 台关口表均未上报功率因数」，
+而旁边需量面板明明有数 —— 两个面板自相矛盾。
+
+根因：`/api/energy/time-anchor` 返回的锚点是 **2026-11-24**，而真实时间是 11-25。
+`pfMonthRange()` 与 `computeRange()` 都拿 `anchorNow()` 当「现在」，
+于是窗口右端被截到 11-24 23:59 —— **模拟器今天写的数据整段在窗口外**。
+
+```js
+// 错：锚点是「演示基准日」，不是「现在」
+var nowMs = anchorNow().getTime();
+var endMs = Math.min(r.to, nowMs);
+```
+
+```js
+// 对：右端用真实当前时刻；锚点只决定「看哪个月」
+var nowMs = Date.now();
+```
+
+锚点在更早月份时 `r.to` 早就小于 now，不受影响；只有「锚点=本月」这一种
+会被修正成「算到今天」。
+
+**判据**：任何用 `time-anchor` 的部件，只要「左面板没数、右面板有数」，
+先怀疑窗口右端被锚点截断 —— 不要去找设备。
+
+#### 另外两个小坑
+
+1. **「ΣP / ΣS」必须按 ts 配对**。某台表当天 P 有两个点、S 只有一个
+   （改版前那轮没写 S），直接求和算出 0.9955，而真实 PF 是 0.9445 ——
+   会误判成部件加权算错。
+2. **网关关系不是父表关系**。演示数据里每台表都挂在网关下
+   （`ED1-Gateway Contains 设备`），把「有父节点」当成「已被别的总表管着」
+   会让补表脚本跳过真正该挂的表。只认父节点档案是电能表的那些。
+
+---
+
+### 打开「设备运维」/ 告警页报 longValue NPE（2026-11-25 客户报障）
+
+**客户原话**：「设备运维进入时报错：Cannot invoke "java.lang.Long.longValue()"
+because the return value of "java.util.Map.get(Object)" is null」。
+
+#### 一条命令判断是不是这个原因
+
+```bash
+bash scripts/49-fix-alarm-null-ts.sh --check
+```
+
+- `✓ 没有 NULL 时间戳` → 不是这个原因，往下看别的；
+- `⚠️ 这些行会让对应的 statusList 查询返回 500` → 就是它，`--fix` 修。
+
+#### 根因：某几行 `alarm` 的时间戳列是 SQL NULL
+
+`guard-core` 的 `AlarmDataAdapter`（TB 原生类）：
+
+```java
+alarm.setAckTs((long) row.get("ack_ts"));
+alarm.setClearTs((long) row.get("clear_ts"));
+alarm.setAssignTs((long) row.get("assign_ts"));
+alarm.setEndTs((long) row.get("end_ts"));
+```
+
+`(long) Object` 会先 checkcast 成 `Long` 再拆箱。列值为 NULL 时
+`Map.get` 返回 null → NPE，消息就是客户看到的那句。
+
+**同类还有四个 Boolean 列**（`propagate*`），漏写则 `booleanValue()` NPE，
+报错字符串不同但表现一样：整页打不开。
+
+#### ★ 判据：为什么「有些人打开正常、有些场站炸」
+
+这个错**只在结果集里恰好翻到脏行时才炸**，与参数组合无关：
+
+```
+pageSize=2&page=0&statusList=ACTIVE&siteId=<该场站>  → 200   （前两条干净）
+pageSize=3&page=0&statusList=ACTIVE&siteId=<该场站>  → 500   （第三条 ack_ts 是 NULL）
+```
+
+所以「换个场站就好了」「点一下就好了」都是假象 —— 脏行一直在那里。
+**排查时先按场站把 pageSize 调大可稳定复现，不要去找前端。**
+
+#### 谁写进去的（2026-11-25 现场）
+
+`3d-ngx/scripts/simulate-alarms.mjs` 直接 `INSERT INTO alarm`，
+原来只写了 `assign_ts`，漏了 `ack_ts` / `clear_ts` / `end_ts`。
+
+```sql
+-- 脏数据的指纹
+SELECT count(*) FROM alarm
+WHERE additional_info::text LIKE '%ngx-demo-alarm%'
+  AND (ack_ts IS NULL OR clear_ts IS NULL OR end_ts IS NULL);
+```
+
+**已修**：脚本补齐三列（`end_ts` 取 `start_ts`，语义是「最后活跃时间」），
+并在写完立刻自检 —— 有 NULL 就直接失败退出，不再等到别人翻页才爆。
+
+#### 为什么不改内核代码
+
+AGENTS.md A4：不污染 ThingsBoard 内核。`AlarmDataAdapter` 是 TB 原生类，
+加 null 守卫属于改内核。而 TB 的语义本身就允许 `0` 表示「未设置」
+（`acknowledged` / `cleared` 另有布尔列），所以把 NULL 归 0 是与平台约定一致的最小修复。
+
+修复口径：
+
+| 列 | NULL → | 理由 |
+| --- | --- | --- |
+| `ack_ts` | `0` | 从未确认 |
+| `clear_ts` | `0` | 从未清除 |
+| `assign_ts` | `0` | 从未指派 |
+| `end_ts` | `start_ts` | 最后活跃时间；从未更新过就等于开始时间 |
+
+`--fix` 会先 `CREATE TABLE alarm_backup_null_ts_<时间戳>` 备份，
+再在**一个事务**里改完（中途失败不留半成品），改完回查剩余 NULL 必须为 0。
+
+#### 预防：任何直接写 `alarm` 表的脚本必须写全这两组列
+
+| 组 | 列 | 漏写的后果 |
+| --- | --- | --- |
+| 时间戳 | `ack_ts` `clear_ts` `assign_ts` `end_ts` | `Long.longValue()` NPE |
+| 布尔 | `propagate` `propagate_to_owner` `propagate_to_tenant` `propagate_to_owner_hierarchy` | `Boolean.booleanValue()` NPE |
+
+**两类都不在写入时报错**，只在读取时按「是否翻到那一行」随机爆炸。
+写完立刻自检一句 SQL，比事后排查便宜得多：
+
+```sql
+SELECT count(*) FROM alarm
+WHERE ack_ts IS NULL OR clear_ts IS NULL OR end_ts IS NULL OR assign_ts IS NULL
+   OR propagate IS NULL OR propagate_to_owner_hierarchy IS NULL;
+```
+
+---
+
+### 设备离线告警：TB 原生 inactivity 机制（2026-11-25 定案）
+
+**起因**：客户问我方的页面横幅是否与告警重复、是否该由告警接管。
+追查后发现**平台本来就有一整套 inactivity 检测**，之前一直没用上。
+
+#### 机制（实测确认，不需要写任何 Java 代码）
+
+```
+设备上报 → 更新 lastActivityTime
+   ↓ 超过该设备的 inactivityTimeout（默认 600 秒）
+active=false + 记录 inactivityAlarmTime + 推送 INACTIVITY_EVENT 到规则链
+   ↓ 恢复上报
+active=true + 推送 ACTIVITY_EVENT
+```
+
+关键源码：`DefaultDeviceStateService:607`
+
+```java
+pushRuleEngineMessage(stateData, active ? ACTIVITY_EVENT : INACTIVITY_EVENT);
+```
+
+阈值配置（`thingsboard.yml:1389`）：
+
+```yml
+defaultInactivityTimeoutInSec: "${DEFAULT_INACTIVITY_TIMEOUT:600}"
+```
+
+**按设备覆盖**：给设备写 SERVER_SCOPE 属性 `inactivityTimeout`（毫秒）。
+
+#### 实测数据（2026-11-25）
+
+给 `Sensor-HZ8706` 设 30 秒超时后：
+
+```
+lastActivityTime    = 10:38:22
+inactivityAlarmTime = 10:39:42      ← 平台自动判定
+active: 45 秒后变 False
+```
+
+**HTTP 上报也会更新 active**（不是只有 MQTT 才行）：
+
+```
+上报前 active = False → POST /api/v1/{token}/telemetry → active = True
+```
+
+> 曾误判「HTTP 设备不更新 active」——那是查了 `/api/device/{id}`（该端点
+> 本就不返回 active）。带 active 的是 `/api/customer/{cid}/deviceInfos`。
+
+#### 规则链配置（已落地）
+
+Root Rule Chain 的 Message Type Switch 加两条分支：
+
+| 出站关系 | 目标节点 | 作用 |
+| --- | --- | --- |
+| `Inactivity Event` | 设备离线告警（`TbCreateAlarmNode`，alarmType=设备离线，MAJOR） | 断线产生告警 |
+| `Activity Event` | 设备恢复清除告警（`TbClearAlarmNode`） | 恢复自动清除 |
+
+**★ 配置时踩到的两个坑**：
+
+1. **新节点的 `id` 必须为 `null`**。TB 的 `BaseRuleChainService` 判定：
+   ```java
+   if (node.getId() != null) { ruleNodeIndexMap.put(...) }  // 视为已有节点
+   else { toAddOrUpdate.add(node) }                          // 才新建
+   ```
+   手动给 UUID → 被当成"已有节点"→ 数据库里找不到 → **静默不创建**（API 仍返回 200）。
+
+2. **`TbClearAlarmNodeConfiguration` 只认 4 个字段**：
+   `alarmType` / `scriptLang` / `alarmDetailsBuildJs` / `alarmDetailsBuildTbel`。
+   多传 `relationTypes`（CreateAlarmNode 有）会导致反序列化失败：
+   ```
+   Unrecognized field "relationTypes" (4 known properties: ...)
+   ```
+   失败后事件被丢弃，**告警清不掉**，日志在 `energy-server` 的
+   `Failed to process message: type=ACTIVITY_EVENT`。
+
+#### 验证（实测通过）
+
+```
+上报        → ACTIVITY_EVENT  → 清除旧告警（CLEARED）
+等 60s 超时 → INACTIVITY_EVENT → 产生 ACTIVE 告警（设备离线/MAJOR）
+再上报      → ACTIVITY_EVENT  → 自动清除（CLEARED）
+```
+
+#### ★ 已知边界：只对「配置之后的状态变化」生效
+
+`INACTIVITY_EVENT` 只在状态**变化**时推送。实测：
+
+| 场景 | 是否产生告警 |
+| --- | --- |
+| 在线 → 断线 | ✅ 产生 |
+| 断线 → 恢复 | ✅ 清除 |
+| **一直离线**（从未连接 / 很早以前就断了） | ❌ **不产生** |
+
+实测办公园区 3 台页面上判离线的设备（`PowerMeter-DDSU666` / `ED1-Gateway` /
+`Relay-8CH`）**0 条告警**。`PowerMeter-DDSU666` 的 `inactivityAlarmTime`
+停在 11-17 14:32 —— 那次事件发生时规则链分支还不存在，被路由到 `Other → Log Other`。
+
+**这不是 bug，是事件语义的必然结果**。要覆盖存量离线设备，只有两条路：
+
+- 让设备恢复一次再断（产生一次状态变化）；
+- 或写补录脚本，给当前 `active=false` 的有效设备补一条 ACTIVE 告警
+  （属于「造数据」，需业务确认，不默认执行）。
+
+#### 与页面提醒的分工（回应客户「是否过度设计」）
+
+查清后修正了设计：**不是谁接管谁，而是两个视角**。
+
+| | 告警事件 | 页面横幅 |
+| --- | --- | --- |
+| 语义 | 事件：何时断的、断了多久 | 状态：现在哪些是断的 |
+| 覆盖 | 只覆盖状态变化后的 | **含一直离线的历史遗留** |
+| 价值 | 留痕、通知、ACK、追责 | 零延迟，进页面就看见 |
+
+所以页面保留横幅是**必要的**：它补上了告警表达不了的那部分。
+但页面**不再自己算阈值** —— 状态判定直接读平台 `active`，
+避免「部件说 15 分钟、平台说 10 分钟」两套阈值打架。
+
+> 部件里的 `staleMinutes` 设置项现在只影响「多久前的文字要不要飘红」，
+> 不参与在线/离线判定。
+
+---
+
+### 设备运维：离线 / 长时间无数据的快速提醒（2026-11-25 客户需求）
+
+**客户原话**：「准备运维可以提醒一下设备的离线故障的快速提醒，
+或长时间没有最新数据更新的提醒需求」。
+
+#### 做了什么
+
+| 位置 | 内容 |
+| --- | --- |
+| 顶部横幅 | 有异常才出现：`4 台设备离线，3 台超过 15 分钟无数据更新` + 两个直达筛选的按钮 + 关闭 |
+| 统计卡 | 新增「无数据更新」一档（橙），原「离线」改为红 |
+| 卡片 | 新增一行数据新鲜度：`刚刚更新` / `35 分钟前` / `8.4 天前` / `从未上报`，陈旧时飘红 |
+| 状态筛选 | 新增「无数据更新」「未知（不采集）」 |
+| 部件设置 | `staleMinutes`（默认 15）：多久没数据算停滞 |
+
+#### ★ 判据为什么不能用 `active` 一个字段
+
+实测两个接口返回的 `active` **不一样**：
+
+```
+GET /api/customer/{cid}/devices      → active 全是 null（55 台）
+GET /api/customer/{cid}/deviceInfos  → active 有真值（49 true / 6 false）
+```
+
+本部件用 `deviceInfos`，所以 `active` 可用，但仍不足以单独定状态：
+
+- TB 对「建档后从未连接过」的设备一律 `active=false`，其中包含
+  **2 台虚拟表**（手工填报载体，本来就不该联网）。只按 active 判
+  就会把虚拟表算成「离线」，客户要跑去现场找一块不需要联网的表。
+- 反过来，`active=true` 只说明连接会话还在，不代表**数据在更新**
+  （网关活着但下级表计断线，就是这种）。
+
+所以判据分两条腿：
+
+```
+① 告警优先        → warning
+② 虚拟表          → unknown（不采集，既不算离线也不算停滞）
+③ active === false → offline（真断线）
+④ 不在 meters 台账 → 用 active 兜底（网关 / 继电器等非表计）
+⑤ 其余            → 看 lastTs：超过 staleMinutes 或从未上报 = stale
+```
+
+#### ★ 「离线」与「无数据」是两个视角，会重叠
+
+一台设备可以同时中两条。实测办公园区 `正泰单相电表 DDSU666`：
+TB 报 `active=false`，同时 **8.4 天**没有新数据。
+
+- **卡片状态徽标**用「离线」—— 说明原因（连不上）
+- **卡片新鲜度行**显示「8.4 天前」并飘红 —— 说明后果（数据陈旧）
+
+所以统计卡会出现 `在线 12 + 异常 3 + 无数据 3 + 离线 4 = 22 > 总数 20`。
+**这不是算错**：「无数据」是独立维度，note 里已注明「（含离线）」。
+不要为了凑加法把它们做成互斥分区 —— 那会让客户看不到「几天没数据」这个
+对用能统计最要命的信息。
+
+> 筛选口径已对齐：`status=stale` 走独立的 `isDataStale()`，
+> 不是 `opsStatusOf() === 'stale'`。否则点「查看无数据设备」会筛出 0 台
+> （那些设备的状态是 offline），而卡片明明写着「8.4 天前」——
+> 数字与列表对不上是最容易让客户失去信任的 bug。
+
+#### 数据来源与它的缺口
+
+`GET /api/energy/meters` 的 `lastTs`（后端已算好 `max(ts)`，
+优先查 `ts_kv_latest`，905 行 → 8.7ms），一次请求拿全量，
+与抄表 / 台账**同一口径**。
+
+**缺口**：该接口只返回**非虚拟设备**。所以虚拟表拿不到 lastTs，
+状态归 `unknown`、卡片不显示新鲜度行 —— 不写「不采集」，
+因为网关其实在上报（只是不属于表计台账），断言「不采集」是错的信息。
+
+#### 验收（浏览器实测，2026-11-25）
+
+```
+办公园区（20 台）
+  横幅  4 台设备离线，3 台超过 15 分钟无数据更新
+  统计  在线12 / 异常3 / 无数据3（超过 15 分钟未上报（含离线））/ 离线4
+  点「查看无数据设备」→ 筛出 3 台，下拉显示「无数据更新」
+     正泰单相电表 DDSU666  离线  8.4 天前（红）
+     温湿度传感器          离线  从未上报（红）
+     8路继电器             离线  从未上报（红）
+  点「查看离线设备」→ 筛出 4 台（含上面 3 台 + 数据网关）
+  点关闭 → 横幅消失；刷新后重新出现
+
+生产园区（23 台，数据实时）
+  横幅  不出现（没事时不打扰）
+  统计  在线18 / 异常4 / 无数据0 / 离线0 ← 另 1 台虚拟表归 unknown
+```
+
+#### 阈值怎么调
+
+部件设置里 `staleMinutes`，默认 15。
+
+- 演示/现场设备是分钟级上报 → 15 分钟足够；
+- RTU 若配置成小时级上报 → **调到上报间隔的两倍以上**，
+  否则会一直误报「无数据」。
+
+---
+
+### 设备运维：冷热机 / 水泵被归到「其他」类型（2026-11-25 客户报障）
+
+**客户原话**：「设备运维中的设备类型为什么把冷热机模块和水泵等都放在『其他』里了，
+这个不对吧」。
+
+#### 判据
+
+打开设备运维 → 顶部类型页签。若生产园区只看到
+`全部设备 / 电能 / 蒸汽 / 热力 / 空调 / 网关 / 其他`，
+而「其他」里装着模块机、离心泵、PLC 柜 —— 就是这个问题。
+
+#### 根因：类型归类靠**档案名中文模糊匹配**，差一个字就掉「其他」
+
+`energy_device_ops_page` 的 `energyKindOf(profileName)` 只做正则匹配，
+原来的关键词表只有两档负荷设备：
+
+```js
+if (/空调|新风|冷机|冷水机组|风机盘管|多联机/.test(n)) return '空调';
+if (/锅炉|热力|换热|蒸汽锅炉|热水泵/.test(n))          return '热力';
+return '其他';
+```
+
+对照实际档案名：
+
+| 档案名 | 台数 | 原归类 | 原因 |
+| --- | --- | --- | --- |
+| 风冷冷水机 | 9 | **其他** | 关键词是 `冷水机组`（带"组"），档案叫「冷水**机**」 |
+| 立式管道离心泵 | 2 | **其他** | 不含任何关键词 |
+| PLC控制柜 | 2 | **其他** | 不含任何关键词 |
+| 智能空开 | 1 | **其他** | 不含任何关键词 |
+| 热水泵 | 2 | 热力 | 命中 `热水泵` —— 与同类的水泵分成了两类 |
+
+所以生产园区 23 台设备里有 14 台挤在「其他」。
+而「其他」的设计本意是「档案没配品种」的归宿，不该装主力设备。
+
+#### 修法（`energyKindOf` + 三张表一起改）
+
+分类从 9 档扩到 12 档，新增 **冷热机 / 水泵 / 控制柜**，并修正泵类不一致：
+
+```js
+if (/冷机|冷水机|热泵|制冷机|模块机|冷却塔/.test(n)) return '冷热机';
+if (/泵/.test(n))                                  return '水泵';   // 热水泵也归这里
+if (/空调|新风|风机盘管|多联机/.test(n))            return '空调';
+if (/锅炉|热力|换热/.test(n))                       return '热力';
+if (/PLC|控制柜|配电柜|空开/i.test(n))              return '控制柜';
+```
+
+判定顺序仍是「网关 → 表计 → 负荷设备 → 控制 → 环境」，
+网关必须先判（否则「电能采集网关」会被归成电能）。
+
+**★ 必须同时改三张表，少一张就是静默丢档**：
+
+| 表 | 漏改的后果 |
+| --- | --- |
+| `KIND_ORDER` | `rebuildTypeTabs` 只遍历它建页签 —— 漏掉的类**没有页签**，设备只能在「全部设备」里看到，不报错 |
+| `KIND_ICONS` | 该档页签/卡片退回 `devices_other` 通用图标 |
+| `KIND_ALIAS` | type1 缺失时 `resolveKindCode` 返回空 → 所有测点掉进「其它测点」（显示原始 key） |
+
+> ★ 顺带修掉一个死引用：`KIND_ALIAS['空调'] = 'cooling'`。
+> `/api/energy/metric-params` 实际只返回 6 个品种
+> （elec/water/gas/steam/heat/env），**没有 cooling**。
+> 所以空调/新风在「type1 缺失」时一直查不到指标组。
+> 已改成 `env` —— 那才是这些设备的真实品种（档案属性 `type1=env`）。
+
+#### 验收（浏览器实测）
+
+```
+生产园区（23 台）
+  全部设备23 / 电能3 / 蒸汽1 / 热力1 / 冷热机9 / 水泵2 / 空调1 / 控制柜3 / 网关3
+  → 「其他」页签消失
+  点开「冷热机」第一台：
+    卡片标签 冷热机
+    设备一级类型 冷热机 / 设备二级类型 风冷冷水机
+    共 11 条测点 · 品种：环境系统
+
+办公园区（20 台）
+  电能4 / 水表1 / 燃气1 / 热力3 / 水泵2 / 空调3 / 环境4 / 网关1 / 其他1
+  → 「其他1」是 Relay-8CH，档案名就叫 `default` —— 确实无从判断，留着是对的
+
+质量示范站（12 台）
+  电能12（该站只有电表）
+```
+
+图标必须全部正常渲染（不能出现 `mode_cool` / `plumbing` 这类**文字**）。
+判据：`getComputedStyle(mat-icon).fontFamily` 含 `Material`。
+
+#### 为什么不用 type2 做判据
+
+设备的 `type2` 属性确实带着权威二级类型（`chiller` / `chilled_water_pump` /
+`plc_cabinet` …），但 `/api/customer/{cid}/devices` **不返回 SERVER_SCOPE 属性**，
+拿它要额外发一次批量 `entitiesQuery`。而档案名本身就是设备类型的中文名
+（风冷冷水机 ↔ chiller 一一对应），扩充关键词表零成本。
+
+若将来客户把档案改名成无意义的字符串，再改用 type2 批量查询
+（参考 `query_panel` 的 `loadMeterLevels`）。
+
+> **不要改用设备分组页的判据**：那页用的是字典 `deviceType1` 全集
+> （`buildTypeOptions` 按 type1/type2 统计），是另一套权威体系，
+> 分类名也不同（环境监测/负荷设备/接入设备）。两页各自成立，不要强行统一。
+
+---
+
+### 查询设置 / 分析条件里看不到某类设备（2026-11-25 客户报障）
+
+**客户原话**：「平台中各个仪表板功能『查询设置』或『条件分析』部件是不是都统一
+配置的那五个用能品种，导致我的冷热机组模块、立式管道离心泵都没有获取到」。
+
+#### 先纠正一个推断：品种不是部件配的，是场站声明的
+
+```
+部件 → GET /api/energy/metric-params?siteId=<场站>
+     → 后端读该场站资产的 energyType 属性
+     → 只返回声明过的品种
+```
+
+所以「下拉里有几个品种」= 「这个场站声明了几个」，**不是部件的统一配置**。
+不同场站可以不一样（实测：办公园区 2 个、质量示范站 1 个、生产园区 5 个）。
+
+#### 判据：一条命令
+
+```bash
+python3 scripts/53-check-site-energy-types.py
+```
+
+它比对「场站声明的品种」与「设备实际 type1」，输出缺口：
+
+```
+=== 生产园区 ===
+  已声明品种: ['elec','water','gas','steam','heat']
+  设备实际 type1: {'env': 15, ...}
+  ✗ 有 15 台设备用的品种没被声明 —— 部件里选不到：
+    · env 环境系统（非用能）15 台
+        - 天骄-模块机-1#·生产园区
+        - 天骄-立式管道离心泵-1·生产园区
+        …
+```
+
+#### ★ 两个部件行为不同，这是最容易误判的地方
+
+| 部件 | 看板 | 传 `energyOnly` | 结果 |
+| --- | --- | --- | --- |
+| 查询设置 `query_panel` | 历史能耗/基础报表/实时能耗/峰谷分析/我的账单/手工填报/抄表功能 | 否 | 声明里有的都能选（**含 env**）|
+| 分析条件 `analysis_bar` | 分项能耗/区域能耗/综合能耗/能源流向/能耗概览/闲时能耗 | **是** | `isEnergy=false` 的被滤掉 |
+
+所以「补了声明之后查询设置能看到环境系统、分析条件还是看不到」是**预期行为**，
+不是还没生效。
+
+`energyOnly=true` 的来历（2026-11-04 客户原话）：
+
+> 「查询设置和分析条件部件中，用能品种下拉框中不应该有『环境系统』」
+
+#### 现场数据（2026-11-25 实测）
+
+```
+elec 电能   isEnergy=true   params=39  deviceTypes=7
+env  环境系统 isEnergy=false  params=7   deviceTypes=13   ← 暖通指标全在这里
+cooling 冷热 isEnergy=false  params=0   deviceTypes=1    ← 空壳
+```
+
+**暖通设备只有 env 这一个家**：`chiller`（冷水机组）、`chilled_water_pump`（冷冻水泵）、
+`boiler`、`cooling_tower` 都定义在 env 品种的 `deviceTypes` 里。
+
+> **勘误（2026-11-25 当晚）**：上一版这里写「这是产品口径问题，代码无解」——**错了**。
+> 冲突只存在于「品种下拉要不要出现环境系统」这一层，**不妨碍**「选中环境系统后
+> 设备树里有没有设备」。后者是实打实的两个 bug，已在部件里修掉（见下）。
+> 「下拉里不出现」与「设备能选到」也不是非此即彼：设备型品种可以用
+> 别的入口暴露，而 query_panel 本来就允许它出现。
+
+#### 已做的处置
+
+1. 补场站声明（可回滚）：
+
+   ```
+   生产园区  ["elec","water","gas","steam","heat"]
+          →  ["elec","water","gas","steam","heat","env"]
+   办公园区  ["elec","water"]
+          →  ["elec","water","gas","env"]
+   ```
+
+   写入接口：`POST /api/plugins/telemetry/ASSET/{siteId}/attributes/SERVER_SCOPE`
+   body `{"energyType":[...]}`。**只有加，没有减**，原值记在上面。
+
+2. 回滚：把 body 换回原数组重新 POST 即可。
+
+3. 验证副作用：账单口径**没有被污染**（`/api/energy/billing/summary` 仍然只有 elec），
+   因为账单按 `meterLevel` + 设备类型取数，不看场站声明的品种。
+
+#### ★ 补完声明还不够：另有两个 bug（2026-11-25 修，`query_panel`）
+
+补了 `energyType` 之后，环境系统**从灰变可选**了，但选中后左树依然空白。
+两个独立故障叠在一起，都会让「树是空的」：
+
+**bug ① role 过滤把设备型品种整个清空**
+
+`inSourceProfiles` 的 ⓪ 段按 `role !== 'meter'` 排除设备。这条规则来自
+2026-11-02（电能树里混进了 8 路继电器 / 智能空开 / 逆变器），但它**只对计量型品种成立**：
+
+```
+elec 电能的 deviceTypes：普通表/并网表/关口表/汇流表 = meter，逆变器/空开/发电机组 = sensor/control
+env 环境系统的 deviceTypes：13 种 **一个 meter 都没有**（全是 sensor/control/other）
+```
+
+于是 env 下 19 台设备被整批挡掉。修法：品种对象新增 `meterKind`
+（= `deviceTypes` 里存在 `role=meter`），⓪ 段改成
+`if (... && cur.meterKind !== false)` —— 设备型品种跳过 role 过滤。
+
+`deviceTypes` 为空时 `meterKind` 保持 `undefined`（走原过滤），
+因为空数组是「不知道」不是「没有」——不能让一次字段缺失把继电器放回电能树。
+
+**bug ② `loadMeterLevels` 的 `if (levelsLoaded) return;` 让切场站后 type1 永远只有第一批**
+
+首屏在办公园区，那批设备的 type1 查到了，`levelsLoaded` 置 true。
+**切到生产园区**后 `rawDevices` 换了一批，但函数第一句直接 return ——
+`type1Map` 里仍然只有办公园区的设备。连锁后果：
+
+- `refreshSourceDisabled` 按 type1 数不到新场站的设备 → 品种保持置灰、点不动；
+- `inSourceProfiles` 的 type1 精确匹配全部 miss → 树里没有一台该场站的设备。
+
+修法：按 id 增量补查（`levelLoadedIds`），与 `loadDeviceCodes` 同一套写法。
+换场站只查新出现的那批，已有的一台不重复请求。
+
+#### 验收（必须做到浏览器实测）
+
+```
+场站：生产园区 → 能源品种选「环境系统」
+树里应有 15 台：
+  模块机 1#~9# (9) / 立式管道离心泵 1、2 (2) / PLC控制柜 1、2 (2) /
+  新风机组 (1) / PLC网关 (1)
+```
+
+实测通过（2026-11-25）。办公园区回归：11 台（A栋室内环境 / 热水泵 / 锅炉 / 新风机组…）。
+
+#### ★ 选得到之后仍然「暂无实时数据」—— 还有两层（2026-11-25 续修）
+
+上面两条修完，设备能勾选了，但勾上点「查询」，右侧仍写
+「暂无实时数据（请确认数据源与上报频率）」。再往下挖，还有两个独立故障：
+
+**第三层：模拟器根本不给暖通设备写遥测**
+
+`23-demo-simulator.py` 的档案白名单只有电表 / 水表 / 气表 / 蒸汽表 / 热力表 /
+温湿度变送器，暖通档案在 `discover()` 里直接 `continue`。实测：
+
+```
+天骄-模块机-1#      12 行 / 6 键  最后 11-23 19:43
+天骄-模块机-3#~9#    4 行 / 4 键  最后 11-21 02:00
+天骄-立式管道离心泵  4 行 / 4 键  最后 11-21 02:00
+（同期电表 power_total 是实时的）
+```
+
+修法：新增 `HVAC_PROFILES` + `build_hvac_payload()`，按设备角色写对应键。
+暖通**不写 `energy_reading`**（设备不是表计，否则抄表/账单会多出一行）。
+
+**第四层：实时能耗部件写死 `power_total`**
+
+`realtime_kpi` / `realtime_trend` 的 `deviceKey` 默认 `power`、
+`metricKey` 默认 `power_total`，是**固定字符串**，不随品种变。
+暖通设备没有这两个键 → 即使数据库里有数，图上也永远是空的。
+
+修法：
+
+| 部件 | 改动 |
+| --- | --- |
+| `realtime_trend` | 品种无功率类指标时（判据取 `paramDict`，不是写死 `code='env'`），一次请求带一组候选键 `water_out_temp / water_in_temp / pump_freq / temperature / opening / running`，取**第一个有数据的**；单位与指标名按命中键映射（℃ / Hz / %） |
+| `realtime_kpi` | 设备型品种走 `renderStatEnv()`：**平均**口径 + 设备台数。温度/频率不能求和 —— 9 台模块机供水温度之和是 80℃ 这种没有物理意义的值 |
+
+> **为什么用「逐个试候选键」而不是按设备类型精确映射**：部件只拿到
+> 实体 id/name，没有类型字典；按名字猜「模块机→水温」会把 PLC 柜、
+> 网关全部猜错。逐个试不猜语义，只看有没有数，任何设备类型都成立。
+
+#### 验收（必须做到浏览器实测）
+
+```
+场站：生产园区 → 能源品种选「环境系统」
+树里应有 15 台：
+  模块机 1#~9# (9) / 立式管道离心泵 1、2 (2) / PLC控制柜 1、2 (2) /
+  新风机组 (1) / PLC网关 (1)
+```
+
+实测通过（2026-11-25）。办公园区回归：11 台（A栋室内环境 / 热水泵 / 锅炉 / 新风机组…）。
+
+**实时能耗页（关键判据：有数、单位对）**：
+
+```
+勾选「模块机 1#」
+  KPI  : 当前平均供水温度 9.9 ℃ / 已选 1 台设备，其中 1 台已上报
+  曲线 : 03:56 ~ 04:00 有折线，轴单位 ℃
+勾选「立式管道离心泵 1」
+  曲线 : pump_freq 0.0~0.3 Hz（凌晨停机，接近 0 是对的）
+电表回归（正泰三相表）
+  KPI  : 当前总有功功率 17.9 kW / 契约 1000.0 kW / 今日用电量 45.9 kW·h
+```
+
+判据只有一条：**单位必须与指标一致**（水温标 kW 就是没修好 ——
+数值对了单位错了比空着更容易误导）。
+
+> 生产园区只有一个虚拟表，`/api/energy/manual-entry/meta` 返回
+> `meterType: "电能表"`，所以手工填报的 Tab 写「电能表」而不是
+> 「三相电能表」。设备名本身叫「虚拟三相表·动力」，信息是全的；
+> 要改 Tab 文案得新建同名设备档案，会牵动抄表/账单/分项，需产品定夺。
+
+> **注意 `analysis_bar` 不需要同样处置**：它走资产树 `entitiesQuery/find`，
+> 不含 role / meterOnly / inSourceProfiles。分项/区域/能源流向里看不到暖通设备
+> 是**正确口径** —— 那三块按计量点（meterLevel / parentDeviceId）建树，
+> 暖通设备不是计量表，本来就不该出现在「分项用电量排名」里。
+
+#### 注意后端有 30 秒缓存
+
+`SITE_KINDS_CACHE` 的 TTL 是 `SITE_KINDS_TTL_MS = 30_000`。
+改完 `energyType` 立刻刷新页面可能还是旧的，**等 30 秒或重启后端**。
+实测第一次查没变、3 分钟后再查就对了 —— 别急着怀疑没写进去。
+
+---
+
+### 手工填报：抽屉里是别的场站 / 只有单相电能表 / 设备下拉空（2026-11-25 客户报障）
+
+**客户原话**：「生产园区。综合报表>手工填报……有一个『单项电能表』选项卡，而没有
+三相电能表？而且下面的可编辑表格选择设备下下拉还是空的」。
+
+三个现象，两个根因。
+
+#### 根因一：紧凑模式的抽屉**根本不跟随顶栏场站**
+
+手工填报看板里的部件是 `compact` 模式 —— 页面上只显示一枚「用能数据录入」按钮，
+点开才是抽屉。而启动分支里：
+
+```js
+if (scope.compact) {
+  scope.sitesLoaded = false;
+  scope.loading = false;
+  // ← 原来到此为止，没有 watchTopStation()
+}
+```
+
+于是抽屉里的场站来自 `pickSite()`：**localStorage 里上次选的那个**。
+顶栏切到生产园区，抽屉仍是「办公园区 · 2026 年」，
+Tab 自然是办公园区的「单相电能表」，生产园区的表根本不会出现。
+
+**已修**：紧凑模式也订阅顶栏，但惰性 —— 只记 `pendingSiteId`，不拉数据
+（一个只有按钮的卡片不该在首屏发两组请求）。抽屉打开时才用它。
+
+顺带修了两个健壮性问题：
+
+| 问题 | 后果 |
+| --- | --- |
+| `applyPendingSite()` 先把 `pendingSiteId` 清空再匹配 | 清单未加载时顶栏场站被丢掉，退回 localStorage 旧值 |
+| 顶栏切场站时不看 `dirty` | 抽屉里刚填的 12 个月数据被静默丢弃；现在会提示并保留 |
+
+**判据**（实测，三个场站逐个切）：
+
+```
+顶栏 生产园区   → 抽屉「生产园区 · 2026 年」  Tab 电能表
+顶栏 办公园区   → 抽屉「办公园区 · 2026 年」  Tab 单相电能表
+顶栏 质量示范站 → 抽屉「质量示范站 · 2026 年」Tab 空（该站没有虚拟表）
+```
+
+#### 根因二：Tab 名 = **虚拟设备的档案名**，不是「相数」
+
+```js
+var type = d.meterType || '其他设备';   // meterType 来自 device.getType()，即设备档案名
+```
+
+生产园区只有一台虚拟表：`VirtualMeter-3P-Power`，档案是 **「电能表」**。
+所以 Tab 写的是「电能表」——**永远不会显示「三相电能表」**，
+除非另建一个名叫「三相电能表」的设备档案。
+
+这是命名问题，不是漏设备。要改得先定产品口径：
+新建 profile 会让按档案统计的地方（抄表、账单、分项）都多出一类，
+不是改一个字符串那么简单。
+
+#### 根因三：设备下拉空 —— 那台表**挂错了类目**
+
+`deviceOptions` 做全局去重（一台表只能填在一个类目，否则双计）：
+
+```
+候选 = 本 Tab 全部虚拟表 − 所有 Tab 已用设备
+```
+
+生产园区当时只有 1 台虚拟表，它的 `manualEntryItemId` 却是
+「给排水分项」，而设备名叫「虚拟三相表·**动力**」（安装清单里写的也是动力）。
+唯一那台表被占用 → 所有「新增设备」行都空着，界面上**一句解释都没有**。
+
+**已修数据**：
+
+| 字段 | 修前 | 修后 |
+| --- | --- | --- |
+| `manualEntryItemId` | 给排水分项 | **动力分项** |
+| `wiring` | `1P2W`（单相两线）| **`3P4W`** |
+| `Contains` 关系 | 给排水分项 → 表 | **动力分项 → 表** |
+
+> 关系必须一起改。`EnergyManualEntryController` 的注释写明：分项能耗汇总
+> 遍历的是资产树上的叶子电表，只改属性不改关系 → 手工数据不进分项汇总。
+
+**已修界面**：空下拉旁边给一句原因，两种情形分开说
+
+```
+本类目的表已全部用在其他类目（同一块表只能填一处）
+该场站还没有<档案名>虚拟表，请先到设备管理新建
+```
+
+原来两者都是「请选择设备」+ 一个点不开任何东西的下拉，客户只能猜。
+
+#### 判据（修好后实测）
+
+```
+生产园区 · 2026 年   Tab 电能表
+  动力     虚拟三相表·动力   800.00 kWh
+  照明     合计 —          → 点「新增设备」出现「同一块表只能填一处」
+```
+
+#### 自查清单（下次遇到同类问题）
+
+1. 抽屉抬头写的场站 == 顶栏场站？不等于 → 本节根因一；
+2. Tab 名 == 想要的相数？不等于 → 根因二（档案命名），**不是丢设备**；
+3. 下拉空 → 查 `manualEntryItemId` 是否指向别的类目：
+
+```sql
+SELECT d.name, a.name AS 归属分项
+FROM device d
+JOIN attribute_kv ak ON ak.entity_id = d.id
+JOIN key_dictionary k ON k.key_id = ak.attribute_key
+LEFT JOIN asset a ON a.id::text = ak.str_v
+WHERE k.key = 'manualEntryItemId' AND d.name LIKE 'VirtualMeter%';
+```

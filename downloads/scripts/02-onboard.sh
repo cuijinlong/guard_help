@@ -347,10 +347,27 @@ print(sum(1 for a in rows if a.get('type')=='分项'))" 2>/dev/null || echo 0)
   DEV_N=$(echo "$CUST_DEVICES" | python3 -c "
 import json,sys
 d=json.load(sys.stdin); print(len(d.get('data',[])))" 2>/dev/null || echo 0)
-  TOPO_N=$(echo "$CUST_ASSETS" | python3 -c "
+  # 拓扑数走 \`/api/energy/topologies\`（权威接口），不是数资产里的 type。
+  #
+  # ★ 2026-11-24 修：原来数 \`/api/customer/{id}/assets\` 里 \`type=='topology'\` 的条目，
+  #   两个问题都实测到了：
+  #   ① 口径不对 —— 拓扑是 ASSET，但 customer/assets 不一定带上它，
+  #      数出来恒为 0 或偏少；
+  #   ② **时序不对** —— 建客户后的初始化是异步的，脚本查得太早。
+  #      同一个新客户，脚本报「2 张」，十几秒后再查是「3 张」（与 3 个场站一致）。
+  #      于是明明正常开户，脚本却报「开通失败」并让运维去跑 repair-init。
+  #   误报的开户失败比真失败更糟：会让人重复执行开户脚本。
+  #
+  # 所以这里最多等 30 秒，等到「拓扑数 ≥ 场站数」为止。
+  TOPO_N=0
+  for _try in $(seq 1 15); do
+    TOPO_N=$(api GET "/api/energy/topologies?customerId=$CUSTOMER_ID&pageSize=100&page=0" \
+      | python3 -c "
 import json,sys
-d=json.load(sys.stdin); rows=d.get('data',[])
-print(sum(1 for a in rows if a.get('type')=='topology'))" 2>/dev/null || echo 0)
+d=json.load(sys.stdin); print(d.get('total') or len(d.get('data',[])))" 2>/dev/null || echo 0)
+    [[ "${TOPO_N:-0}" -ge "${SITE_N:-0}" ]] && break
+    sleep 2
+  done
   MENU_N=$(api GET "/api/customer/$CUSTOMER_ID" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
@@ -373,12 +390,32 @@ print(0 if (not mid or mid.startswith('13814000')) else 1)" 2>/dev/null || echo 
   if [[ "$MENU_N" == "1" ]]; then ok "客户菜单已安装"
   else warn "客户菜单未安装 —— 客户登录后侧边栏是空的"; FAIL=1; fi
 
-  DASH_N=$(api GET "/api/customer/$CUSTOMER_ID/dashboards?pageSize=100&page=0" \
+  # 客户可见看板：按 **assigned_customers** 口径，不是 customer_id。
+  #
+  # ★ 2026-11-24 修。2026-11-13 起客户看板改成「共享租户级看板」而不是复制副本
+  #   （客户明确要求：不要每个客户都建一套同名看板）。于是：
+  #     · \`/api/customer/{id}/dashboards\` 恒为 0 —— 它按 customer_id 查，而副本已经不再创建；
+  #     · 客户的真实入口是**左侧菜单**，菜单里的 dashboardId 指向租户级看板，
+  #       能不能打开由 \`checkDashboardIdOrAssigned\` 按 assigned_customers 放行。
+  #
+  #   旧断言按 customer_id 数，永远 0 → 每次开户都报「仪表板页会是空的」，是误报。
+  #   实测同一客户：菜单 26 个看板入口全部可打开（26/26 HTTP 200），而 customer_id 口径是 0。
+  #
+  #   现在的判据：租户级看板里「分配给了这个客户」的数量。
+  DASH_N=$(api GET "/api/tenant/dashboards?pageSize=200&page=0" \
     | python3 -c "
 import json,sys
-d=json.load(sys.stdin); print(len(d.get('data',[])))" 2>/dev/null || echo 0)
-  if [[ "$DASH_N" -ge 10 ]]; then ok "仪表板已分配给客户：$DASH_N 个"
-  else warn "客户名下仪表板只有 $DASH_N 个 —— 「仪表板」页会是空的"; FAIL=1; fi
+cid='$CUSTOMER_ID'
+d=json.load(sys.stdin)
+n=0
+for w in d.get('data',[]):
+    for a in (w.get('assignedCustomers') or []):
+        if str(((a.get('customerId') or {}).get('id')) or a.get('id') or '') == cid:
+            n += 1
+            break
+print(n)" 2>/dev/null || echo 0)
+  if [[ "${DASH_N:-0}" -ge 10 ]]; then ok "看板已共享给客户：$DASH_N 个（走 assigned_customers，不复制副本）"
+  else warn "共享给客户的看板只有 ${DASH_N:-0} 个 —— 客户左侧菜单会有打不开的项"; FAIL=1; fi
 fi
 
 # ---------------------------------------------------------------- 看板占位符

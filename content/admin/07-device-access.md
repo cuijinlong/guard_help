@@ -279,22 +279,105 @@ python3 scripts/20-rtu-simulator.py \
 | 水 / 燃气 / 蒸汽 | 模拟器 | 没有水气汽表 |
 | 温湿度（非 RTU 那台） | 模拟器 | 同上 |
 
-#### 启动模拟（演示前 1 分钟执行）
+#### 启动模拟（★ 2026-11-25 起改为常驻，不再手工跑）
+
+**原来这一节写的是「演示前 1 分钟执行」—— 这是错的。**
+手工跑 `--interval` 只是个前台进程，关终端/断电/换 session 就没了，
+而演示数据恰恰是「越久没写越明显」的东西：
+
+- 看板右上角出现「数据滞后 N 小时」
+- 功率因数/需量/能耗全缩在最后一个点上
+- 客户打开就报「为什么是 0 / 为什么不动」
+
+**实测（2026-11-25）**：全站遥测自 00:52 起停更，到 02:09 已 1 小时 17 分钟
+一个点都没写 —— 因为根本没有任何常驻进程。
+
+##### 常驻已配好，只需确认它是活的
+
+```bash
+launchctl list | grep demo-sim     # 有输出（第一列是 PID）= 在跑
+tail -3 /tmp/demo-sim.log          # 看轮次输出
+```
+
+首次部署/换机器时安装（配置在仓库 `scripts/sim-launchd/`）：
+
+```bash
+mkdir -p ~/energy-app/scripts/demo-sim
+cp scripts/sim-launchd/demo-sim-run.sh ~/energy-app/scripts/demo-sim/run.sh
+chmod +x ~/energy-app/scripts/demo-sim/run.sh
+cp scripts/sim-launchd/com.guard.demo-sim.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.guard.demo-sim.plist
+```
+
+`RunAtLoad` + `KeepAlive`：登录即起、崩了自动拉起。
+环境变量可覆盖：`TB_BASE` / `TB_USER` / `TB_PASS` / `TB_CUSTOMER` / `TB_INTERVAL`。
+
+**临时停**：`launchctl unload ~/Library/LaunchAgents/com.guard.demo-sim.plist`
+
+##### 手工跑一轮（只在排障时用）
 
 ```bash
 cd ~/energy-app
 python3 scripts/23-demo-simulator.py \
   --base http://127.0.0.1:8090 \
   --tenant tenant@126.com --tenant-pass '12345678' \
-  --customer 平台演示中心 \
-  --interval 60 --rebuild-totals
+  --customer 平台演示中心 --once
 ```
+
+> **判据：数据是不是在动**
+> ```sql
+> SELECT to_char(to_timestamp(max(ts)/1000)::timestamp,'MM-DD HH24:MI:SS')
+> FROM ts_kv WHERE key=(SELECT key_id FROM key_dictionary WHERE key='power_total');
+> ```
+> 与当前时间差 **超过 3 分钟**就是模拟器停了 —— 先修数据源，别去查部件。
+
+##### ★ token 过期曾让模拟器「假活着」371 轮（2026-11-25 真事故）
+
+**现场**：看板数据停在 06:09，进程在跑（`launchctl list` 有 PID），日志每分钟一行
+`第 N 轮：0/49 成功` —— 从 06:09 一直刷到 09:51，**371 轮全失败**，没有任何告警。
+
+**根因**：TB access token 默认 **2.5 小时**过期，而脚本只在启动时登录一次，
+把 token 存进局部变量后一直用。过期后每一轮都 401，但进程活着、
+`KeepAlive` 认为一切正常 —— 这正是「进程在跑但什么都没在发生」。
+
+**已修**：
+
+| 改动 | 作用 |
+| --- | --- |
+| `_AUTH` 模块级会话 + `login()` | 记住账号，供续期用 |
+| `api()` 遇 401 自动 `_relogin()` 并重试一次 | 续期后**调用方无需改动**（不再显式传 token） |
+| 连续 3 轮零写入 → 打 `!!!!` 告警条 | 一眼能看见；之后每 10 轮重复，不刷屏也不沉底 |
+
+**判据（一条命令确认续期是否生效）**：
+
+```bash
+grep -E "自动重新登录|已连续" /tmp/demo-sim.log
+```
+
+- 有 `↻ 登录已过期，已自动重新登录（第 N 次）` → 续期工作正常；
+- 有 `!! 已连续 N 轮未写入任何设备` → 续期也失败了，按提示查账号密码 / 平台可达性;
+- 两者都没有且轮次是 `49/49` → 一切正常。
+
+> **为什么这件事比它看起来重要**：这个模拟器喂的是「实时能耗 / 功率因数 / 需量」
+> 这些**分钟级**看板。它一停，客户看到的就是「功率因数掉到 0、需量曲线断头」
+> —— 和上一轮修的「功率因数为 0」问题表现一模一样，极易误判成代码回退。
+> 先查这个判据，再看部件。
 
 它给 **19 台**不能真机演的表持续上报（跳过 RTU 那 4 台，避免两个源同时写表底）：
 
 ```
 electric 11 / gas 2 / sensor 2 / steam 2 / water 2
+hvac 26（风冷冷水机 9 / 新风机组 4 / 网关 4 / 室内环境 3 /
+         PLC控制柜 2 / 热水泵 2 / 立式管道离心泵 2 / 锅炉 2 /
+         智能空开 1 / 换热站控制器 1）
 ```
+
+> **暖通（`hvac`）是 2026-11-25 新增的**。在此之前 `HVAC_PROFILES` 不存在，
+> 暖通设备在 `discover()` 里走到 `continue` —— **一台都不产生遥测**。
+> 客户报障原话：「冷热机组模块、立式管道离心泵都没有获取到」。
+> 设备在查询设置里勾得到（品种过滤那天已修），勾上点查询却是
+> 「暂无实时数据」：9 台模块机、2 台离心泵、2 台 PLC 柜的数据停在 11-21，
+> 而电表是实时的 —— 一眼就看出暖通这块是死的。
 
 **常用开关**
 
@@ -314,6 +397,7 @@ electric 11 / gas 2 / sensor 2 / steam 2 / water 2
   只有月首点。自动上报会让手工填报的演示自相矛盾。
 - **不覆盖历史**：只往当前时间往后写。历史 62 天是初始化时生成的静态数据。
 - **不改表底起点**：首次运行从库内最新 `energy_reading` 接着涨，不会倒走。
+- **不给暖通设备写表底**：它们是设备不是表计，见上面数据模型。
 
 **数据模型（改错会让看板空白）**
 
@@ -322,7 +406,23 @@ electric 11 / gas 2 / sensor 2 / steam 2 / water 2
           voltage_a [current_a]        三相另有 _b / _c、voltage_unbalance、power_factor_*
 水/气/汽   energy  energy_reading  power
 温湿度     temperature  humidity
+暖通     按设备角色分（见 build_hvac_payload）：
+         风冷冷水机   running sys_run_state sys_mode compressor_state
+                      water_in_temp water_out_temp ambient_temp opening alarm_code
+         水泵         running pump_freq opening alarm_code（名字含大/小再加 pump_freq_big/small）
+         锅炉         running water_in_temp water_out_temp boiler_water_temp boiler_run_count
+         新风机组     running spin opening temperature humidity ahu_freq ahu_mode
+         PLC控制柜    running led door alarm_code
+         室内环境     temperature humidity indoor_temp indoor_co2
 ```
+
+> **暖通设备不写 `energy_reading`**（重要）。它们不是表计，
+> 硬塞一个会让抄表把空调算成一台电表（表底从 0 开始、月月不动），
+> 账单里凭空多一行。
+>
+> 键名与「环境系统」品种的指标字典严格对齐（环境参数 / 运行状态 / 调节参数 /
+> 热泵运行 / 机组水温 / 水泵频率 / 报警代码）。写字典里没有的键，
+> 查询设置里指标下拉选了也没数据 —— 客户会以为部件坏了。
 
 > **表底必须单调递增，且父表增量 >= 子表之和。**
 > 脚本按平台已有的 `Contains` 关系建树，父表功率 = 子表实际值之和 × 1.04（线损），
