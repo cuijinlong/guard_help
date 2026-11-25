@@ -427,7 +427,7 @@ docker compose --profile split up -d --build
 
 ```bash
 docker compose exec energy-server sh
-docker compose exec postgres psql -U postgres -d thingsboard
+docker compose exec postgres psql -U administrator -d guarddb
 ```
 
 ---

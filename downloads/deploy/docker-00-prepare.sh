@@ -417,10 +417,21 @@ HTTP_PORT=$ENV_HTTP_PORT
 #   两个都不通              → energy-server 问题
 # ⚠ 不要把前端入口切到这里：它会绕开 /spsspro 反代、gzip、SPA 回退
 SERVER_DIRECT_PORT=$ENV_SERVER_DIRECT_PORT
-DB_NAME=thingsboard
-DB_USER=postgres
+# 库名/用户（2026-11-26 定案）：统一用 guarddb / administrator，
+# 与迁移后的现网库一致。手册里所有 psql 命令都按这两个值写，
+# 改这里就必须同步改手册（否则用户照敲会 role does not exist）。
+DB_NAME=guarddb
+DB_USER=administrator
 DB_PASSWORD=$DB_PASS
 DB_PORT=$ENV_DB_PORT
+# 数据库主机。留空 = 用本机 postgres 容器。
+# 要连另一台机器的库：填对方 IP 并跑 docker-50-use-remote-db.sh（它会校验连通性）。
+DB_HOST=
+# 必须是 5432（容器内端口），不是 DB_PORT（宿主机映射端口）。
+# 只有连远程库时才需要改它。
+DB_HOST_PORT=5432
+# 数据卷名（2026-11-26）：改这个值可让新库用独立卷，旧卷原地保留便于回滚。
+DB_DATA_VOLUME=energy-pgdata
 # 波形对象存储（S3 兼容，SeaweedFS）。guard-server 用这组凭据读写。
 S3_ACCESS_KEY=energy
 S3_SECRET_KEY=$S3_PASS

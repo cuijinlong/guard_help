@@ -19,7 +19,7 @@
 ### 1. 通知相关配置项
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT key AS 配置项, left(json_value, 120) AS 值
 FROM admin_settings
 WHERE key ILIKE '%notification%' OR key ILIKE '%mail%';

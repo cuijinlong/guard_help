@@ -13,7 +13,7 @@
 | 界面 | 抄表功能（4 个功能点）|
 | 部件 | `energy_management.query_panel`、`energy_management.meter_reading_board`、`energy_management.meter_batch_detail`、`energy_management.meter_plan` |
 | 接口 | `/api/asset/`、`/api/auth/user`、`/api/customer/`、`/api/customer/{cid}/devices`、`/api/device/`、`/api/deviceProfileInfo/`… |
-| 数据表 | `customer`、`meter_reading_batch`、`meter_reading_record` |
+| 数据表 | `customer`、`meter_reading_batch`、`meter_reading_record`、`tenant` |
 
 ## 核对 SQL（可直接复制运行）
 
@@ -22,13 +22,13 @@
 ### 1. 最近 10 个抄表批次
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT b.period AS 账期, b.status AS 状态, b.trigger_type AS 触发方式,
        b.total AS 应抄, b.normal_count AS 正常,
        b.missing_count AS 缺抄, b.abnormal_count AS 异常,
        to_timestamp(b.reading_time / 1000) AS 抄表时间
 FROM meter_reading_batch b
-WHERE b.tenant_id = (SELECT tenant_id FROM customer WHERE title = '平台演示中心')
+WHERE b.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 ORDER BY b.created_time DESC LIMIT 10;
 SQL
 ```
@@ -51,8 +51,8 @@ SQL
 ### 2. 明细条数 / 用量按账期汇总
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT period AS 账期, source AS 来源, quality AS 质量,
        count(*) AS 条数, round(sum(usage)::numeric, 2) AS 用量合计
 FROM meter_reading_record

@@ -19,13 +19,13 @@
 ### 1. 网关设备（按设备配置类型识别）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT d.name AS 网关, dp.name AS 配置, dp.type AS 配置类型,
        coalesce(c.title, '—') AS 客户
 FROM device d
 JOIN device_profile dp ON dp.id = d.device_profile_id
 LEFT JOIN customer c ON c.id = d.customer_id
-WHERE d.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') AND dp.type = 'GATEWAY'
+WHERE d.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) AND dp.type = 'GATEWAY'
 ORDER BY d.name;
 SQL
 ```

@@ -19,11 +19,11 @@
 ### 1. 已生成的报表
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT name AS 报表, format AS 格式,
        to_timestamp(created_time / 1000) AS 生成时间
 FROM report
-WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') ORDER BY created_time DESC LIMIT 20;
+WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) ORDER BY created_time DESC LIMIT 20;
 SQL
 ```
 

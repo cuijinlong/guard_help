@@ -202,7 +202,7 @@ topic: v1/gateway/telemetry
 
 ```bash
 # 设备 additional_info 里要含 "gateway": true
-docker compose exec -T postgres psql -U postgres -d thingsboard -tAc \
+docker compose exec -T postgres psql -U administrator -d guarddb -tAc \
   "SELECT name, additional_info FROM device WHERE name='ED1-Gateway';"
 # → ED1-Gateway | {"siteId":"...","gateway":true}
 ```
@@ -705,7 +705,7 @@ ORDER BY v.ts DESC LIMIT 4;
 #    见上文的 curl 验证
 
 # ② 落库了（键名是标准名，不是厂家代号）
-docker exec energy-postgres psql -U postgres -d thingsboard -c "
+docker exec energy-postgres psql -U administrator -d guarddb -c "
 SELECT kd.key, count(*) AS 点数, max(to_timestamp(t.ts/1000)) AS 最新
 FROM ts_kv t JOIN ts_kv_dictionary kd ON kd.key_id = t.key
 WHERE t.entity_id = '<设备id>'

@@ -19,7 +19,7 @@
 ### 1. 看板分组
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT g.name AS 分组,
        count(x.title) AS 成员数
 FROM entity_group g

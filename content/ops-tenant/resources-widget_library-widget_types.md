@@ -19,7 +19,7 @@
 ### 1. 部件类型（自研与平台）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT count(*) FILTER (WHERE fqn LIKE 'energy%' OR fqn LIKE 'idle%'
                           OR fqn LIKE 'hvac%' OR fqn LIKE 'comprehensive%') AS 自研,
        count(*) FILTER (WHERE tenant_id IS NOT NULL) AS 租户私有,

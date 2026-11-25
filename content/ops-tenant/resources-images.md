@@ -19,7 +19,7 @@
 ### 1. 图片资源
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT count(*) AS 数量, pg_size_pretty(sum(length(data))::bigint) AS 占用
 FROM resource WHERE resource_type = 'IMAGE';
 SQL

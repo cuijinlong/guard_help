@@ -13,7 +13,7 @@
 | 界面 | 综合能耗（5 个功能点）|
 | 部件 | `comprehensive.kpi`、`comprehensive.share`、`comprehensive.trend`、`comprehensive.table`、`energy_management.analysis_bar` |
 | 接口 | `/api/asset/`、`/api/asset/{id}`、`/api/auth/user`、`/api/device/`、`/api/device/{id}`、`/api/energy/comprehensive`… |
-| 数据表 | `asset`、`customer`、`key_dictionary`、`ts_kv` |
+| 数据表 | `asset`、`customer`、`key_dictionary`、`now`、`ts_kv` |
 
 ## 核对 SQL（可直接复制运行）
 
@@ -22,14 +22,16 @@
 ### 1. 折标煤 / 碳排 / 费用 的输入：各品种合计
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT kd.key AS 键, count(*) AS 点数, round(sum(k.dbl_v)::numeric, 2) AS 合计
 FROM ts_kv k
 JOIN key_dictionary kd ON kd.key_id = k.key
 JOIN asset a ON a.id = k.entity_id
 WHERE a.customer_id = (SELECT id FROM c)
   AND kd.key LIKE '%\_total' ESCAPE '\'
+  -- 时间范围：与页面顶部「查询设置」一致；下面给的是近 90 天
+  AND k.ts >= (extract(epoch FROM now() - interval '90 day') * 1000)::bigint
 GROUP BY 1 ORDER BY 2 DESC;
 SQL
 ```
@@ -38,17 +40,17 @@ SQL
 
 | 键 | 点数 | 合计 |
 | --- | --- | --- |
-| energy_total | 112323 | 263959.42 |
-| power_total | 112309 | 16623353.49 |
-| gas_total | 24071 | 1152.44 |
-| water_total | 23939 | 1623.67 |
-| steam_total | 19089 | 53.00 |
-| heat_total | 18957 | 184.34 |
+| energy_total | 117896 | 268367.01 |
+| power_total | 117881 | 20075163.47 |
+| gas_total | 24898 | 1154.36 |
+| water_total | 23757 | 1626.32 |
+| steam_total | 17879 | 52.95 |
+| heat_total | 16790 | 176.10 |
 
 ### 2. 折算系数（字典没填时用国标兜底，响应里会告警）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 -- 电能 0.1229 tce/kWh、碳排 0.5703 kg/kWh、电价 0.65 元/kWh
 SELECT 'elec' AS 品种, 0.1229 AS 折标煤系数, 0.5703 AS 碳排系数, 0.65 AS 单价
 UNION ALL SELECT 'water', 0.2429, 0.3440, 3.50

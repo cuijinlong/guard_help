@@ -13,7 +13,7 @@
 | 界面 | 能耗概览（8 个功能点）|
 | 部件 | `energy_management.analysis_bar`、`energy_management.overview_stats`、`energy_management.calendar_heatmap`、`energy_management.asset_stats_chart`、`energy_management.distribution_chart`、`energy_management.ranking_list`… |
 | 接口 | `/api/asset/`、`/api/asset/{id}`、`/api/auth/user`、`/api/customer/{cid}/devices`、`/api/device/`、`/api/device/{id}`… |
-| 数据表 | `asset`、`customer`、`key_dictionary`、`relation`、`ts_kv` |
+| 数据表 | `asset`、`customer`、`key_dictionary`、`now`、`relation`、`ts_kv` |
 
 ## 核对 SQL（可直接复制运行）
 
@@ -22,8 +22,8 @@
 ### 1. 资产汇总键：各品种 *_total 的点数与合计
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT kd.key AS 键, count(*) AS 点数,
        round(sum(t.dbl_v)::numeric, 2) AS 合计,
        to_timestamp(max(t.ts) / 1000) AS 最新
@@ -33,6 +33,8 @@ JOIN asset a ON a.id = t.entity_id
 WHERE a.customer_id = (SELECT id FROM c)
   -- 括号不能省：AND 优先级高于 OR
   AND (kd.key LIKE '%\_total' ESCAPE '\' OR kd.key = 'energy_day')
+  -- 时间范围：与页面顶部「查询设置」一致；下面给的是近 90 天
+  AND t.ts >= (extract(epoch FROM now() - interval '90 day') * 1000)::bigint
 GROUP BY 1 ORDER BY 2 DESC;
 SQL
 ```
@@ -41,19 +43,19 @@ SQL
 
 | 键 | 点数 | 合计 | 最新 |
 | --- | --- | --- | --- |
-| energy_total | 108913 | 263983.88 | 2026-11-25 17:50:15+08 |
-| energy_day | 108913 | 93462110.80 | 2026-11-25 17:50:15+08 |
-| power_total | 108901 | 16209030.15 | 2026-11-25 17:50:15+08 |
-| gas_total | 24072 | 1152.45 | 2026-11-25 17:50:13+08 |
-| water_total | 23940 | 1623.68 | 2026-11-25 17:50:13+08 |
-| steam_total | 19087 | 53.00 | 2026-11-25 17:50:13+08 |
-| heat_total | 18955 | 184.33 | 2026-11-25 17:50:13+08 |
+| energy_total | 110754 | 264728.80 | 2026-11-26 01:43:38+08 |
+| energy_day | 110751 | 106857723.20 | 2026-11-26 01:43:38+08 |
+| power_total | 110739 | 17464826.33 | 2026-11-26 01:43:38+08 |
+| gas_total | 24898 | 1154.36 | 2026-11-26 01:43:27+08 |
+| water_total | 23757 | 1626.32 | 2026-11-26 01:43:26+08 |
+| steam_total | 17879 | 52.95 | 2026-11-25 23:36:32+08 |
+| heat_total | 16790 | 176.10 | 2026-11-25 23:36:32+08 |
 
 ### 2. 哪些场站的汇总没写（空节点也要写，否则整页空白）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT s.name AS 场站,
        count(t.*) AS 该场站资产上的汇总点数
 FROM asset s
@@ -70,8 +72,8 @@ SQL
 
 | 场站 | 该场站资产上的汇总点数 |
 | --- | --- |
-| 三相园区·平台演示中心 | 20709 |
-| 单相园区·平台演示中心 | 20709 |
-| 质量示范·平台演示中心 | 20709 |
+| 三相园区·平台演示中心 | 21062 |
+| 单相园区·平台演示中心 | 21062 |
+| 质量示范·平台演示中心 | 21062 |
 
 **判据**：电/水/气/汽/热各有对应的 `*_total`；`最新` 在近 1 小时内（数据滞后会显示「数据滞后 N 小时」标记，那是数据源停了，不是看板坏）。

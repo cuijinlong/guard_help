@@ -19,7 +19,7 @@
 ### 1. 资源按类型统计
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT resource_type AS 类型, count(*) AS 数量,
        pg_size_pretty(sum(length(coalesce(data, '')))::bigint) AS 占用
 FROM resource GROUP BY 1 ORDER BY 2 DESC;

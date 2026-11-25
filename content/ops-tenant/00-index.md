@@ -11,7 +11,7 @@
 ## 先确认租户名
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT id, title FROM tenant ORDER BY created_time;
 SQL
 ```

@@ -22,8 +22,8 @@
 ### 1. 已保存的盘查版本
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 版本, a.label AS 范围, count(ak.*) AS 属性数,
        to_timestamp(a.created_time / 1000) AS 创建时间
 FROM asset a

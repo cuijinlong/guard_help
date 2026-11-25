@@ -59,6 +59,7 @@ python3 scripts/23-demo-simulator.py ... --interval 60 --rebuild-totals
 
 import argparse
 import json
+import os
 import math
 import random
 import sys
@@ -66,6 +67,16 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# 演示环境是否 24 小时运行（2026-11-26）。
+#
+# 原来的判据是 `working = 6 <= hour < 23` —— 深夜机组停机、风扇不转。
+# 那是**仿真工厂作息**的合理设定，但对「演示大屏」是反效果：
+# 2026-11-26 凌晨客户打开天骄大屏，9 台机组全部停转，以为模型坏了。
+#
+# 演示数据的目的是展示大屏效果，不是复刻作息。所以默认 24 小时运行；
+# 需要仿真作息时设 `TB_ALWAYS_ON=0`。
+ALWAYS_ON = os.environ.get("TB_ALWAYS_ON", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # 与 21-rtu-onboard.py / 30-rtu-env-init.py / 31-rtu-simulate.py 保持一致：
 # 这几台由真实 RTU 出数，模拟器不能碰。
@@ -345,9 +356,12 @@ def build_hvac_payload(meter):
             x = min(hi, x)
         return round(x, 2)
 
-    # 设备在不在运行：按一天中的时段决定，深夜部分设备停机
+    # 设备在不在运行。
+    #
+    # 默认（ALWAYS_ON）24 小时运行 —— 演示大屏任何时刻打开都要有观感。
+    # 设 TB_ALWAYS_ON=0 时按作息仿真：6~23 点运行，深夜停机。
     hour = time.localtime().tm_hour
-    working = 6 <= hour < 23
+    working = True if ALWAYS_ON else (6 <= hour < 23)
 
     if t == "chiller":
         # 冷水机组 / 模块机：供水 7~12℃、回水比供水高 4~6℃

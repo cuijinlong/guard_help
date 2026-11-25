@@ -19,7 +19,7 @@
 ### 1. 设备清单（含所属客户与配置）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT d.name AS 设备, d.type AS 类型,
        coalesce(c.title, '（未分配客户）') AS 客户,
        dp.name AS 设备配置,
@@ -27,7 +27,7 @@ SELECT d.name AS 设备, d.type AS 类型,
 FROM device d
 LEFT JOIN customer c ON c.id = d.customer_id
 LEFT JOIN device_profile dp ON dp.id = d.device_profile_id
-WHERE d.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE d.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 ORDER BY d.name;
 SQL
 ```

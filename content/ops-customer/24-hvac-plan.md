@@ -22,8 +22,8 @@
 ### 1. 运行模式资产：配置在单个 JSON 属性 hvacMode 里
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 模式, a.label AS 季节,
        ak.str_v::json->>'season'   AS 季节码,
        ak.str_v::json->>'dateType' AS 日期类型,

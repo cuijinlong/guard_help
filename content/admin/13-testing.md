@@ -1182,13 +1182,13 @@ curl -X POST "$BASE/api/energy/asset-totals/rebuild" \
 
 ```bash
 cd ~/energy-app
-docker compose exec -T postgres psql -U postgres -d thingsboard -v ON_ERROR_STOP=1 < 查询.sql
+docker compose exec -T postgres psql -U administrator -d guarddb -v ON_ERROR_STOP=1 < 查询.sql
 ```
 
 或者交互式进去粘贴：
 
 ```bash
-docker compose exec postgres psql -U postgres -d thingsboard
+docker compose exec postgres psql -U administrator -d guarddb
 ```
 
 > **两条铁律，先记住再看 SQL**

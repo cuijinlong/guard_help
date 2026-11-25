@@ -19,7 +19,7 @@
 ### 1. 用户清单（含权限与所属客户）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT u.email AS 邮箱, u.authority AS 权限,
        coalesce(c.title, '（租户级）') AS 所属客户,
        uc.enabled AS 已启用,
@@ -27,7 +27,7 @@ SELECT u.email AS 邮箱, u.authority AS 权限,
 FROM tb_user u
 LEFT JOIN customer c ON c.id = u.customer_id
 LEFT JOIN user_credentials uc ON uc.user_id = u.id
-WHERE u.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE u.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 ORDER BY u.authority, u.email;
 SQL
 ```
@@ -37,6 +37,6 @@ SQL
 | 邮箱 | 权限 | 所属客户 | 已启用 | 最近登录 |
 | --- | --- | --- | --- | --- |
 | demo@126.com | CUSTOMER_USER | 平台演示中心 | t | 2026-11-25 12:42:34+08 |
-| tenant@126.com | TENANT_ADMIN | （租户级） | t | 2026-11-25 17:44:45+08 |
+| tenant@126.com | TENANT_ADMIN | （租户级） | t | 2026-11-26 01:44:08+08 |
 
 **判据**：「最近登录」为空 = 从没登录过。`authority` 决定能进租户端还是客户端。

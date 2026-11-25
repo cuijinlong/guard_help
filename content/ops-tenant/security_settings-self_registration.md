@@ -19,7 +19,7 @@
 ### 1. 自助注册配置
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT key AS 配置项, left(json_value, 160) AS 值
 FROM admin_settings
 WHERE key ILIKE '%self%registration%' OR key ILIKE '%signup%';

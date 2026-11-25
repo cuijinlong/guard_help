@@ -22,8 +22,8 @@
 ### 1. 流向的骨架：Contains 关系（谁包含谁）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT pa.name AS 上级, pa.type AS 上级类型,
        ca.name AS 下级, ca.type AS 下级类型
 FROM relation r

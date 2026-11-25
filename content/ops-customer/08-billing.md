@@ -22,8 +22,8 @@
 ### 1. 账单列表（金额在 asset 属性里，不在 billing 表）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 账单元, a.label,
        max(CASE WHEN kd.key = 'period' THEN ak.str_v END) AS 账期,
        max(CASE WHEN kd.key = 'usage'  THEN ak.dbl_v END) AS 用量,
@@ -42,17 +42,17 @@ SQL
 
 | 账单元 | label | 账期 | 用量 | 金额 | 状态 |
 | --- | --- | --- | --- | --- | --- |
+| BILL-7CE48900-2026-11-elec-D24DA920 | 2026-11 平台演示中心 elec 账单 | 2026-11 |  |  | draft |
+| BILL-7CE48900-2026-11-elec-D6C217A0 | 2026-11 平台演示中心 elec 账单 | 2026-11 |  |  | draft |
 | BILL-7CE48900-2026-11-elec-A5DF94F0 | 2026-11 平台演示中心 elec 账单 | 2026-11 |  |  | draft |
 | BILL-7CE48900-2026-11-elec-A65A6A40 | 2026-11 平台演示中心 elec 账单 | 2026-11 |  |  | draft |
 | BILL-7CE48900-2026-11-elec-D0D19070 | 2026-11 平台演示中心 elec 账单 | 2026-11 |  |  | draft |
-| BILL-7CE48900-2026-11-elec-D24DA920 | 2026-11 平台演示中心 elec 账单 | 2026-11 |  |  | draft |
-| BILL-7CE48900-2026-11-elec-D6C217A0 | 2026-11 平台演示中心 elec 账单 | 2026-11 |  |  | draft |
 
 ### 2. 金额分解：amount 应等于四项之和
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name,
        max(CASE WHEN kd.key = 'amount'        THEN ak.dbl_v END) AS 金额,
        max(CASE WHEN kd.key = 'energyFee'     THEN ak.dbl_v END) AS 电度电费,
@@ -71,16 +71,16 @@ SQL
 
 | name | 金额 | 电度电费 | 基本电费 | 力调电费 | 附加费 |
 | --- | --- | --- | --- | --- | --- |
+| BILL-7CE48900-2026-11-elec-D24DA920 |  |  |  |  |  |
+| BILL-7CE48900-2026-11-elec-D6C217A0 |  |  |  |  |  |
 | BILL-7CE48900-2026-11-elec-A5DF94F0 |  |  |  |  |  |
 | BILL-7CE48900-2026-11-elec-A65A6A40 |  |  |  |  |  |
 | BILL-7CE48900-2026-11-elec-D0D19070 |  |  |  |  |  |
-| BILL-7CE48900-2026-11-elec-D24DA920 |  |  |  |  |  |
-| BILL-7CE48900-2026-11-elec-D6C217A0 |  |  |  |  |  |
 
 ### 3. 确认 billing 表确实是空的（别再白查一次）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT (SELECT count(*) FROM billing)        AS "billing 行数",
        (SELECT count(*) FROM billing_detail) AS "billing_detail 行数";
 SQL

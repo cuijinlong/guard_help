@@ -138,7 +138,7 @@ curl -s --noproxy '*' -H "X-Authorization: Bearer $TOKEN" \
   'http://127.0.0.1:8090/api/<出问题的接口>' | python3 -m json.tool
 
 # ③ 若返回里有别家的实体 id，查它归谁
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc \
+docker exec energy-postgres psql -U administrator -d guarddb -tAc \
   "SELECT id,name,customer_id FROM device WHERE id='<可疑 id>';"
 
 # ④ 在代码里定位：该接口的 WHERE 是否只有 tenant_id
@@ -244,7 +244,7 @@ asset.setType(assetProfile.getName());   // type 是从 assetProfileId 反推的
 #### 快速判断
 
 ```bash
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+docker exec energy-postgres psql -U administrator -d guarddb -tAc "
 SELECT name, type, coalesce(label,'(空)') FROM asset WHERE name='<你改的那个名字>';"
 ```
 
@@ -300,7 +300,7 @@ const columns = config.entityGroup.configuration.columns.filter(...)
 **怎么查**：
 
 ```bash
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+docker exec energy-postgres psql -U administrator -d guarddb -tAc "
 SELECT name, CASE WHEN configuration IS NULL THEN 'NULL ← 就是它' ELSE 'ok' END
 FROM entity_group WHERE type='DASHBOARD' ORDER BY name"
 ```
@@ -1684,7 +1684,7 @@ python3 scripts/24-device-categories.py --tenant <邮箱> --tenant-pass '<密码
 **先确认不是数据问题**（这两条都正常就继续往下）：
 
 ```bash
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc \
+docker exec energy-postgres psql -U administrator -d guarddb -tAc \
  "select relation_type, from_type, to_type, count(*) from relation
    where relation_type_group='COMMON' group by 1,2,3 order by 4 desc;"
 # 期望看到 Contains|ASSET|ASSET 与 Contains|ASSET|DEVICE 都有记录
@@ -1727,7 +1727,7 @@ KPI 有非零数字。改完用 `31-deploy-widget.sh <名>` 推库，**不用重
 **先看库里到底有没有**（把 `<CID>` 换成客户 id）：
 
 ```bash
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+docker exec energy-postgres psql -U administrator -d guarddb -tAc "
 select name, type from device where customer_id='<CID>'
   and (type='网关' or name ~ 'DDSU666|HZ8706|Relay-8CH') order by name;"
 ```
@@ -1755,7 +1755,7 @@ python3 scripts/30-rtu-env-init.py --base http://127.0.0.1:8090 \
 
 ```bash
 # 网关下应挂 11 台（8 SIM + DDSU666 + HZ8706 + Relay-8CH）
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+docker exec energy-postgres psql -U administrator -d guarddb -tAc "
 select g.name||'  └─ '||d.name from device g
  join relation r on r.from_id=g.id and r.relation_type='Contains' and r.from_type='DEVICE'
  join device d on d.id=r.to_id
@@ -1784,7 +1784,7 @@ select g.name||'  └─ '||d.name from device g
 **先别慌，先核实其他客户还在不在**：
 
 ```bash
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+docker exec energy-postgres psql -U administrator -d guarddb -tAc "
 select c.title, count(distinct d.id) as 设备,
        count(k.entity_id) as 遥测点
   from customer c
@@ -2055,7 +2055,7 @@ console.log(inst.getOption().series.map(s => s.name));
 查当前菜单指向（把 `<菜单id>` 换成本客户的 `custom_menu_id`）：
 
 ```bash
-docker exec energy-postgres psql -U postgres -d thingsboard -t -A -c \
+docker exec energy-postgres psql -U administrator -d guarddb -t -A -c \
  "SELECT config FROM custom_menu WHERE id='<菜单id>';" \
  | python3 -c 'import sys,json; c=json.load(sys.stdin);\
 def w(x,d=0):\
@@ -2637,7 +2637,7 @@ cp -R guard-server/src/main/data/sql ~/energy-app/data/sql
 ```bash
 cd ~/energy-app
 PW=$(grep -E '^POSTGRES_PASSWORD=' .env | cut -d= -f2)
-docker exec -e PGPASSWORD="$PW" energy-postgres psql -U postgres -d thingsboard -c "
+docker exec -e PGPASSWORD="$PW" energy-postgres psql -U administrator -d guarddb -c "
 -- 设备侧（应该有最新点）
 SELECT 'DEVICE' src, d.name, k.key,
   to_char(to_timestamp(max(kv.ts)/1000),'MM-DD HH24:MI') last_ts
@@ -2708,7 +2708,7 @@ ENERGY_ASSET_TOTALS_REFRESH_INTERVAL_MS=300000
 ```bash
 # 今天资产侧的数据时间跨度
 PW=$(grep -E '^POSTGRES_PASSWORD=' .env | cut -d= -f2)
-docker exec -e PGPASSWORD="$PW" energy-postgres psql -U postgres -d thingsboard -tAc "
+docker exec -e PGPASSWORD="$PW" energy-postgres psql -U administrator -d guarddb -tAc "
 SELECT to_char(to_timestamp(min(kv.ts)/1000),'HH24:MI') || ' → ' ||
        to_char(to_timestamp(max(kv.ts)/1000),'HH24:MI') || '  (' || count(*) || ' 点)'
 FROM ts_kv kv JOIN key_dictionary k ON k.key_id=kv.key JOIN asset a ON a.id=kv.entity_id
@@ -2747,7 +2747,7 @@ docker ps --format '{{.Names}}\t{{.Status}}'
 docker logs --tail 100 energy-server 2>&1 | grep -iE "error|exception" | tail -20
 
 # ④ 数据是否在动（换成一个真实设备 id）
-docker exec energy-postgres psql -U postgres -d thingsboard -c "
+docker exec energy-postgres psql -U administrator -d guarddb -c "
 SELECT kd.key, count(*), max(to_timestamp(ts/1000)) AS 最新
 FROM ts_kv t JOIN ts_kv_dictionary kd ON kd.key_id=t.key
 WHERE t.entity_id='<设备id>' GROUP BY 1 LIMIT 10;"

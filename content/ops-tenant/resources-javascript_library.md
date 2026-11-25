@@ -19,7 +19,7 @@
 ### 1. JavaScript 资源
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT title AS 名称, resource_key AS 键, length(data) AS 字节数
 FROM resource WHERE resource_type = 'JS_MODULE'
 ORDER BY title;

@@ -31,7 +31,7 @@
 ## 0. 怎么进库
 
 ```bash
-docker exec -it energy-postgres psql -U postgres -d thingsboard
+docker exec -it energy-postgres psql -U administrator -d guarddb
 ```
 
 三个必须知道的事（写错会得出相反结论）：
@@ -382,7 +382,7 @@ LEFT JOIN LATERAL (
   WHERE entity_id=dp.id AND attribute_type=2
     AND attribute_key=(SELECT key_id FROM key_dictionary WHERE key='energyTypeCode')) pk ON TRUE
 WHERE d.customer_id = (
-    SELECT id FROM customer WHERE title = '平台演示中心')
+    SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 ORDER BY 层级 NULLS LAST, d.name;
 ```
 

@@ -19,10 +19,10 @@
 ### 1. 收件人组
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT name AS 收件人组, left(configuration::text, 100) AS 配置
 FROM notification_target
-WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') ORDER BY name;
+WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) ORDER BY name;
 SQL
 ```
 

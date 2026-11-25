@@ -19,12 +19,12 @@
 ### 1. 客户层级（父子关系）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT coalesce(p.title, '（顶级）') AS 上级,
        c.title AS 客户, count(*) OVER () AS 客户总数
 FROM customer c
 LEFT JOIN customer p ON p.id = c.parent_customer_id
-WHERE c.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE c.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 ORDER BY 1, 2;
 SQL
 ```

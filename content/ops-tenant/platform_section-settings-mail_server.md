@@ -19,7 +19,7 @@
 ### 1. 邮件服务器配置
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT key AS 配置项, left(json_value, 200) AS 值
 FROM admin_settings WHERE key = 'mail';
 SQL

@@ -22,8 +22,8 @@
 ### 1. 预测的输入：近 7 天逐小时功率
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT date_trunc('day', to_timestamp(k.ts / 1000)) AS 日期,
        count(*) AS 点数,
        round(avg(k.dbl_v)::numeric, 2) AS 平均功率,
@@ -38,7 +38,7 @@ GROUP BY 1 ORDER BY 1;
 SQL
 ```
 
-**本机实测结果**（显示前 6 行，共可能更多）：
+**本机实测结果**（显示前 7 行，共可能更多）：
 
 | 日期 | 点数 | 平均功率 | 最大功率 |
 | --- | --- | --- | --- |
@@ -47,6 +47,7 @@ SQL
 | 2026-11-21 00:00:00+08 | 2492 | 8.14 | 18.98 |
 | 2026-11-22 00:00:00+08 | 1484 | 24.03 | 57.55 |
 | 2026-11-24 00:00:00+08 | 1792 | 12.26 | 28.71 |
-| 2026-11-25 00:00:00+08 | 10410 | 27.02 | 220.28 |
+| 2026-11-25 00:00:00+08 | 15751 | 33.11 | 220.28 |
+| 2026-11-26 00:00:00+08 | 1107 | 35.30 | 217.26 |
 
 **判据**：每天都有点。历史不足 7 天时预测会退化（算法需要至少两个完整周期）。

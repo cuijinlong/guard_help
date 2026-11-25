@@ -19,11 +19,11 @@
 ### 1. 告警规则（自研表，不是 TB 原生 alarm_rule）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT name AS 规则, enabled AS 启用, alarm_type AS 告警类型,
        ts_key AS 监控键, direction AS 方向, threshold AS 阈值, severity AS 级别
 FROM alarm_rule
-WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 ORDER BY enabled DESC, name;
 SQL
 ```

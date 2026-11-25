@@ -19,10 +19,10 @@
 ### 1. 峰谷时段方案（租户级，不按客户过滤）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT name AS 方案, label AS 说明
 FROM asset
-WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') AND type = 'tou_scheme'
+WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) AND type = 'tou_scheme'
 ORDER BY name;
 SQL
 ```

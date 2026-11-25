@@ -19,7 +19,7 @@
 ### 1. OAuth2 客户端
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT title AS 名称, type AS 类型, created_time
 FROM oauth2_client ORDER BY created_time DESC;
 SQL

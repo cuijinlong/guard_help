@@ -22,7 +22,7 @@
 ### 1. 场站清单（顶栏一级/二级下拉的来源）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT a.id AS 场站id, a.name AS 场站, a.label, c.title AS 客户,
        (SELECT count(*) FROM relation r
         WHERE r.to_id = a.id AND r.relation_type = 'Contains') AS 下级数
@@ -44,8 +44,8 @@ SQL
 ### 2. 场站绑定的电价方案（关系类型 uses，不是属性）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT s.name AS 场站, t.name AS 方案模板,
        (SELECT ak.str_v FROM attribute_kv ak JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
         WHERE ak.entity_id = t.id AND kd.key = 'energy' LIMIT 1) AS 能源品种

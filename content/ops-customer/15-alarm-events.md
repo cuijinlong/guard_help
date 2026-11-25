@@ -22,8 +22,8 @@
 ### 1. 按类型与级别统计（含未清除数）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT type AS 类型, severity AS 级别, count(*) AS 条数,
        count(*) FILTER (WHERE clear_ts IS NULL) AS 未清除
 FROM alarm
@@ -36,10 +36,10 @@ SQL
 
 | 类型 | 级别 | 条数 | 未清除 |
 | --- | --- | --- | --- |
-| 功率因数偏低 | MINOR | 3189 | 0 |
-| 演示·生产园区电压偏低 | WARNING | 531 | 0 |
-| 演示·单相表功率因数偏低 | MINOR | 345 | 0 |
-| 设备离线 | MAJOR | 52 | 0 |
+| 功率因数偏低 | MINOR | 4217 | 0 |
+| 演示·生产园区电压偏低 | WARNING | 687 | 0 |
+| 演示·单相表功率因数偏低 | MINOR | 477 | 0 |
+| 设备离线 | MAJOR | 101 | 0 |
 | 演示·单相表频率偏低 | MAJOR | 2 | 0 |
 | 设备遥测上报中断（超过 24 小时未收到数据） | MINOR | 1 | 0 |
 | 演示·空开电流越限 | CRITICAL | 1 | 0 |
@@ -48,7 +48,7 @@ SQL
 ### 2. 告警规则是否启用
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT name AS 规则, enabled AS 启用, count(*) OVER () AS 规则总数
 FROM alarm_rule ORDER BY enabled DESC, name;
 SQL

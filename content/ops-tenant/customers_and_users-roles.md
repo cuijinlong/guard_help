@@ -19,13 +19,13 @@
 ### 1. 角色与权限条目数
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 -- permissions 是 JSON **文本**列（不是 jsonb），所以按长度看规模；
 -- 要看具体权限就把该列完整取出来。
 SELECT name AS 角色, type AS 类型,
        length(coalesce(permissions, '')) AS 权限串长度,
        length(coalesce(excluded_permissions, '')) AS 排除串长度
-FROM role WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') ORDER BY 2, 1;
+FROM role WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) ORDER BY 2, 1;
 SQL
 ```
 

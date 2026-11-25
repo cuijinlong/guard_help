@@ -19,7 +19,7 @@
 ### 1. 部件包
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT count(*) AS 包数,
        count(*) FILTER (WHERE alias LIKE 'energy%' OR alias LIKE 'idle%') AS 自研
 FROM widgets_bundle;

@@ -19,11 +19,11 @@
 ### 1. 报表调度任务
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT name AS 任务, enabled AS 启用, type AS 类型,
        schedule AS 计划, to_timestamp(created_time / 1000) AS 创建时间
 FROM scheduler_event
-WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') ORDER BY enabled DESC, name;
+WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) ORDER BY enabled DESC, name;
 SQL
 ```
 

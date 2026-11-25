@@ -13,7 +13,7 @@
 | 界面 | 闲时能耗（6 个功能点）|
 | 部件 | `idle_energy.kpi`、`idle_energy.share`、`idle_energy.trend`、`idle_energy.curve`、`idle_energy.table`、`energy_management.analysis_bar` |
 | 接口 | `/api/asset/`、`/api/asset/{id}`、`/api/auth/user`、`/api/device/`、`/api/device/{id}`、`/api/energy/entity-briefs`… |
-| 数据表 | `asset`、`attribute_kv`、`customer`、`key_dictionary`、`ts_kv` |
+| 数据表 | `asset`、`attribute_kv`、`customer`、`key_dictionary`、`now`、`ts_kv` |
 
 ## 核对 SQL（可直接复制运行）
 
@@ -22,8 +22,8 @@
 ### 1. 场站的闲时配置（JSON 属性 idleConfig）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 场站, left(ak.json_v::text, 200) AS 配置
 FROM asset a
 JOIN attribute_kv ak ON ak.entity_id = a.id
@@ -43,11 +43,13 @@ SQL
 ### 2. 闲时计算的产出键（规则链写的遥测）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT kd.key AS 键, count(*) AS 点数, round(sum(k.dbl_v)::numeric, 2) AS 合计
 FROM ts_kv k
 JOIN key_dictionary kd ON kd.key_id = k.key
-WHERE kd.key LIKE 'idle\_%' ESCAPE '\' OR kd.key = 'work_energy'
+WHERE (kd.key LIKE 'idle\_%' ESCAPE '\' OR kd.key = 'work_energy')
+  -- 时间范围：与页面顶部「查询设置」一致；下面给的是近 90 天
+  AND k.ts >= (extract(epoch FROM now() - interval '90 day') * 1000)::bigint
 GROUP BY 1 ORDER BY 2 DESC;
 SQL
 ```

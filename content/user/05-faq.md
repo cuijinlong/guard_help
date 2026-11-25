@@ -69,7 +69,7 @@
 2. 还不行就是库里菜单没更新，查：
 
 ```sql
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc \
+docker exec energy-postgres psql -U administrator -d guarddb -tAc \
   "SELECT config FROM custom_menu WHERE config ILIKE '%ngxai/biz%';"
 ```
 

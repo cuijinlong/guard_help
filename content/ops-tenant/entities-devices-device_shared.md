@@ -19,11 +19,11 @@
 ### 1. 分配给客户的设备
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT coalesce(c.title, '（未分配）') AS 客户, count(*) AS 设备数
 FROM device d
 LEFT JOIN customer c ON c.id = d.customer_id
-WHERE d.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE d.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 GROUP BY 1 ORDER BY 2 DESC;
 SQL
 ```

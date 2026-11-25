@@ -19,11 +19,11 @@
 ### 1. 租户下的看板（首页就是其中指定的一块）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT d.title AS 看板, d.created_time,
        (SELECT count(*) FROM jsonb_object_keys(d.configuration::jsonb->'widgets')) AS 部件数
 FROM dashboard d
-WHERE d.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE d.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 ORDER BY d.created_time DESC LIMIT 10;
 SQL
 ```

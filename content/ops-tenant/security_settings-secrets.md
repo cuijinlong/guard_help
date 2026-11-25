@@ -19,8 +19,8 @@
 ### 1. 密钥存储条目
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-SELECT count(*) AS 条目数 FROM secret WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团');
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+SELECT count(*) AS 条目数 FROM secret WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1);
 SQL
 ```
 

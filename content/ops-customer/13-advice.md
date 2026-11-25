@@ -22,10 +22,10 @@
 ### 1. 诊断结论（intent=energy_advice）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 -- 坑：这张表的 customer_id 目前**全为空**（历史回填没补上），
 --     按客户过滤会一条都查不到，看起来像「没跑过诊断」。按租户查。
-WITH t AS (SELECT tenant_id FROM customer WHERE title = '平台演示中心')
+WITH t AS (SELECT tenant_id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT intent AS 类别, kind AS 类型, severity AS 级别,
        site_id AS 场站, count(*) AS 条数,
        max(run_at) AS 最近运行

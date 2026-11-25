@@ -19,11 +19,11 @@
 ### 1. 资产清单（按类型分组）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT a.type AS 资产类型, count(*) AS 数量,
        count(*) FILTER (WHERE a.customer_id IS NULL) AS 租户级
 FROM asset a
-WHERE a.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE a.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 GROUP BY 1 ORDER BY 2 DESC;
 SQL
 ```

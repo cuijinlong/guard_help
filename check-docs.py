@@ -39,6 +39,15 @@ import re
 import sys
 from pathlib import Path
 
+# 校验用 psql 的库用户/库名（2026-11-26）。
+#
+# ★ 这两个值必须与实际库一致。写错的表现是 **静默跳过** ——
+#   脚本打印「跳过：energy-postgres 未运行」，看起来像环境问题，
+#   实际是认证失败。手册的运维 SQL 就一条都没被校验过。
+DOCS_DB_CONTAINER = os.environ.get("DOCS_DB_CONTAINER", "energy-postgres")
+DOCS_DB_USER = os.environ.get("DOCS_DB_USER", "administrator")
+DOCS_DB_NAME = os.environ.get("DOCS_DB_NAME", "guarddb")
+
 ROOT = Path(__file__).resolve().parent          # shiyongshouce/
 REPO = ROOT.parent                              # 仓库根
 GS = REPO / 'guard-server' / 'src' / 'main'
@@ -481,8 +490,8 @@ def check_generated_pages() -> list[str]:
     ]
     try:
         probe = subprocess.run(
-            ['docker', 'exec', 'energy-postgres', 'psql', '-U', 'postgres',
-             '-d', 'thingsboard', '-tAc', 'SELECT 1'],
+            ['docker', 'exec', DOCS_DB_CONTAINER, 'psql', '-U', DOCS_DB_USER,
+             '-d', DOCS_DB_NAME, '-tAc', 'SELECT 1'],
             capture_output=True, text=True, timeout=20)
     except Exception:
         return ['跳过：docker 不可用']
@@ -566,13 +575,18 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
 
     try:
         probe = subprocess.run(
-            ['docker', 'exec', 'energy-postgres', 'psql', '-U', 'postgres', '-d', 'thingsboard',
+            ['docker', 'exec', DOCS_DB_CONTAINER, 'psql', '-U', DOCS_DB_USER, '-d', DOCS_DB_NAME,
              '-tAc', 'SELECT 1'],
             capture_output=True, text=True, timeout=20)
     except Exception:
         return 0, 0, ['跳过：docker 不可用']
     if probe.returncode != 0:
-        return 0, 0, ['跳过：energy-postgres 未运行']
+        # 区分「容器没起」与「认证/库名不对」—— 两者的处理完全不同。
+        # 原来一律写「未运行」，实测库用户改成 administrator 后
+        # 认证失败也报这个，把排查引到「是不是容器挂了」上。
+        rc_msg = (probe.stderr or '').strip().splitlines()
+        detail = rc_msg[-1][:120] if rc_msg else '无输出'
+        return 0, 0, [f'跳过：连不上 {DOCS_DB_CONTAINER}（{DOCS_DB_USER}@{DOCS_DB_NAME}）— {detail}']
 
     # ★ 遥测后端是 Cassandra 时，库里根本**没有 ts_kv 表**（TB 把遥测写到
     #   Cassandra，PostgreSQL 只存实体元数据）。此时手册里那些 ts_kv 查询
@@ -583,7 +597,7 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
     #   导致 ./sync.sh 被卡住、手册推不到 guard_help。
     try:
         tsq = subprocess.run(
-            ['docker', 'exec', 'energy-postgres', 'psql', '-U', 'postgres', '-d', 'thingsboard',
+            ['docker', 'exec', DOCS_DB_CONTAINER, 'psql', '-U', DOCS_DB_USER, '-d', DOCS_DB_NAME,
              '-tAc', "SELECT to_regclass('public.ts_kv')"],
             capture_output=True, text=True, timeout=20)
         if tsq.returncode == 0 and (tsq.stdout or '').strip() == '':
@@ -655,15 +669,23 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
     #   实测就抓到一条：`WHERE t.key = 'energy'` —— ts_kv.key 是整数 key id，
     #   直接比字符串报 invalid input syntax for type integer。
     #   现在把占位符替换成真实 id 再跑，语法/列名/类型错误一律暴露。
-    sample_cid = ''
-    try:
-        r = subprocess.run(
-            ['docker', 'exec', 'energy-postgres', 'psql', '-U', 'postgres', '-d', 'thingsboard',
-             '-tAc', 'SELECT id FROM customer ORDER BY created_time LIMIT 1'],
-            capture_output=True, text=True, timeout=20)
-        sample_cid = (r.stdout or '').strip()
-    except Exception:
-        pass
+    def _one(sql):
+        try:
+            r = subprocess.run(
+                ['docker', 'exec', DOCS_DB_CONTAINER, 'psql', '-U', DOCS_DB_USER,
+                 '-d', DOCS_DB_NAME, '-tAc', sql],
+                capture_output=True, text=True, timeout=20)
+            return (r.stdout or '').strip()
+        except Exception:
+            return ''
+
+    sample_cid = _one('SELECT id FROM customer ORDER BY created_time LIMIT 1')
+    # ★ 租户/设备 id 也要分别取（2026-11-25 修）：
+    #   原先所有 `<...id>` 一律替换成**客户** id，于是 `<租户id>` 会被换成
+    #   客户 id —— 语法能过、类型也对（都是 uuid），但查不到任何行，
+    #   校验「通过」而实际无意义。占位符按名字区分才对得上语义。
+    sample_tid = _one('SELECT id FROM tenant ORDER BY created_time LIMIT 1')
+    sample_did = _one('SELECT id FROM device ORDER BY created_time LIMIT 1')
 
     # 不能安全替换的占位符（需要用户自己拿的令牌之类）仍然跳过
     UNSAFE = re.compile(r'_TOKEN|你的|xxx')
@@ -674,6 +696,19 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
     # 报 `syntax error at or near "id"`。实测踩过：`AS 源 id`。
     # 静态检查先拦一道，比等 psql 报错更容易定位。
     BAD_ALIAS = re.compile(r'\bAS\s+[\u4e00-\u9fff]+\s+[\u4e00-\u9fffa-zA-Z_]+\s*(?:,|$)', re.M)
+
+    # 按名称做过滤：**手册允许这么做**（2026-11-25 客户明确要求）。
+    #
+    # 手册的读者是人，复制 SQL 就要能直接跑。要求他先去查 UUID、每页查一次，
+    # 反而拖慢核对。所以不再拦截。
+    #
+    # 但这条只适用于手册 —— **代码里一律按 id 查**
+    # （后台 getTenantId() 取自 JWT、getCurrentUser().getCustomerId() 取自登录用户）。
+    # 前提与风险：tenant.title 没有唯一索引，customer 的唯一约束是
+    # (tenant_id, title)（跨租户可同名）。手册的 SQL 统一带 `LIMIT 1`，
+    # 重名时不报错；多租户环境核对时请把名称换成 UUID。
+    NAME_FILTER = None   # 保留名字，便于将来需要时重新启用
+
     for i, sql in enumerate(blocks, 1):
         if UNSAFE.search(sql):
             continue
@@ -691,18 +726,26 @@ def check_doc_sql() -> tuple[int, int, list[str]]:
         #   报 `trailing junk after numeric literal`，而真凶是校验器自己。
         #   现在要求 `<` 后面不是 `=` 或 `<`，且占位符内部不含空白。
         PLACEHOLDER = re.compile(r'<(?![=<])[^<>\s]{1,40}id>')
+
+        def _repl(m):
+            name = m.group(0)
+            if '租户' in name or 'tenant' in name.lower():
+                return sample_tid or name
+            if '设备' in name or 'device' in name.lower():
+                return sample_did or name
+            return sample_cid or name
+
         if PLACEHOLDER.search(body):
             if not sample_cid:
                 continue          # 库里没客户，无从替换
-            # 把 <客户id> / <CID> / <设备id> 统一换成真实客户 id
-            body = PLACEHOLDER.sub(sample_cid, body)
+            body = PLACEHOLDER.sub(_repl, body)
         with tempfile.NamedTemporaryFile('w', suffix='.sql', delete=False, encoding='utf-8') as f:
             f.write(body)
             path = f.name
         try:
             r = subprocess.run(
-                ['docker', 'exec', '-i', 'energy-postgres', 'psql', '-U', 'postgres',
-                 '-d', 'thingsboard', '-v', 'ON_ERROR_STOP=1', '-o', '/dev/null', '-f', '-'],
+                ['docker', 'exec', '-i', DOCS_DB_CONTAINER, 'psql', '-U', DOCS_DB_USER,
+                 '-d', DOCS_DB_NAME, '-v', 'ON_ERROR_STOP=1', '-o', '/dev/null', '-f', '-'],
                 stdin=open(path), capture_output=True, text=True, timeout=60)
         finally:
             os.unlink(path)

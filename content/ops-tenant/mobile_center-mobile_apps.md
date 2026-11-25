@@ -19,9 +19,9 @@
 ### 1. 移动应用
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT title AS 应用, pkg_name AS 包名, platform_type AS 平台, status AS 状态
-FROM mobile_app WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') ORDER BY title;
+FROM mobile_app WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) ORDER BY title;
 SQL
 ```
 

@@ -19,10 +19,10 @@
 ### 1. 厂商与设备型号
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT a.type AS 类型, count(*) AS 数量
 FROM asset a
-WHERE a.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') AND a.type IN ('厂商', '设备型号')
+WHERE a.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) AND a.type IN ('厂商', '设备型号')
 GROUP BY 1;
 SQL
 ```

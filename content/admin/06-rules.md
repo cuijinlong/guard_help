@@ -217,15 +217,15 @@ TB 原生的告警规则 API **全部要求租户管理员权限**，而且规�
 
 ```bash
 # ① 计算字段存在吗（应 5 种，租户 + 系统各一份）
-docker exec energy-postgres psql -U postgres -d thingsboard -c "
+docker exec energy-postgres psql -U administrator -d guarddb -c "
 SELECT name, type, tenant_id IS NULL AS 系统级 FROM calculated_field ORDER BY name;"
 
 # ② 告警有没有产生（空 = 条件从没满足，或规则没生效）
-docker exec energy-postgres psql -U postgres -d thingsboard -c "
+docker exec energy-postgres psql -U administrator -d guarddb -c "
 SELECT type, severity, count(*) FROM alarm GROUP BY 1,2;"
 
 # ③ 派生指标有没有落库
-docker exec energy-postgres psql -U postgres -d thingsboard -c "
+docker exec energy-postgres psql -U administrator -d guarddb -c "
 SELECT kd.key, count(*) FROM ts_kv t
 JOIN ts_kv_dictionary kd ON kd.key_id = t.key
 WHERE kd.key IN ('load_rate','carbon','idle_exceed') GROUP BY 1;"

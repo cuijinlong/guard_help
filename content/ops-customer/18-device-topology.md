@@ -22,7 +22,7 @@
 ### 1. 拓扑图资产与它的属性数
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT a.name AS 拓扑图, a.label, count(ak.*) AS 属性数
 FROM asset a
 LEFT JOIN attribute_kv ak ON ak.entity_id = a.id

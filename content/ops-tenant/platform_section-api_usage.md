@@ -19,7 +19,7 @@
 ### 1. API 使用量
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT * FROM api_usage_state LIMIT 5;
 SQL
 ```

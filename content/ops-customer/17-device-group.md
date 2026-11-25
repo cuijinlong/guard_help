@@ -22,7 +22,7 @@
 ### 1. 设备档案（device_profile）与设备数
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT dp.name AS 档案, dp.type AS 类型, count(d.id) AS 设备数
 FROM device_profile dp
 LEFT JOIN device d ON d.device_profile_id = dp.id

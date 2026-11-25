@@ -19,12 +19,12 @@
 ### 1. 通知规则与启用状态
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT r.name AS 规则, r.enabled AS 启用, r.trigger_type AS 触发类型,
        t.name AS 模板, left(r.recipients_config::text, 80) AS 收件配置
 FROM notification_rule r
 LEFT JOIN notification_template t ON t.id = r.template_id
-WHERE r.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') ORDER BY r.enabled DESC, r.name;
+WHERE r.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) ORDER BY r.enabled DESC, r.name;
 SQL
 ```
 

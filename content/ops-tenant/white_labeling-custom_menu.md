@@ -19,12 +19,12 @@
 ### 1. 自定义菜单（谁在用哪一份）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT name AS 菜单, scope AS 作用域,
        count(*) OVER () AS 总数,
        length(config) AS 配置长度
 FROM custom_menu
-WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') OR tenant_id IS NULL
+WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) OR tenant_id IS NULL
 ORDER BY scope, name;
 SQL
 ```

@@ -22,8 +22,8 @@
 ### 1. 节能项目与其核验字段
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 项目,
        max(CASE WHEN kd.key = 'actualSaving'  THEN ak.dbl_v END) AS 实际节约,
        max(CASE WHEN kd.key = 'targetSaving'  THEN ak.dbl_v END) AS 目标节约,

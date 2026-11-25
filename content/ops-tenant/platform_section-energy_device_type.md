@@ -19,7 +19,7 @@
 ### 1. 设备类型字典
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT jsonb_array_length(
          (json_value::jsonb -> 'deviceType1' -> 'items')
        ) AS 设备类型数

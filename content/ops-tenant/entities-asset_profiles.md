@@ -19,11 +19,11 @@
 ### 1. 资产配置
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT ap.name AS 配置, ap.is_default AS 默认, count(a.id) AS 资产数
 FROM asset_profile ap
 LEFT JOIN asset a ON a.asset_profile_id = ap.id
-WHERE ap.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE ap.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 GROUP BY ap.id, ap.name, ap.is_default ORDER BY 3 DESC;
 SQL
 ```

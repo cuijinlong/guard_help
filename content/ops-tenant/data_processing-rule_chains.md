@@ -19,11 +19,11 @@
 ### 1. 规则链与节点数
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT rc.name AS 规则链, rc.root AS 根链,
        (SELECT count(*) FROM rule_node rn WHERE rn.rule_chain_id = rc.id) AS 节点数
 FROM rule_chain rc
-WHERE rc.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') ORDER BY rc.root DESC, rc.name;
+WHERE rc.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) ORDER BY rc.root DESC, rc.name;
 SQL
 ```
 

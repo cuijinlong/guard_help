@@ -19,9 +19,9 @@
 ### 1. 公开（is_public）客户
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT title AS 客户, is_public AS 是否公开
-FROM customer WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') ORDER BY is_public DESC, title;
+FROM customer WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) ORDER BY is_public DESC, title;
 SQL
 ```
 

@@ -24,6 +24,19 @@
 
 name: energy
 
+# 容器 stdout 的日志驱动（给 `docker compose logs` / `docker logs` 用）。
+#
+# ★ 它不是归档：json-file 只能按大小滚动（50MB × 5），**不按天**。
+#   写满 5 份后从最旧的丢 —— 回溯「昨天那条报错」时常常已经没了。
+#
+#   真正按天的日志在容器内的 /opt/energy/logs（挂载到 ${APP_HOME}/logs）：
+#     guard-server.log              当天
+#     guard-server.YYYY-MM-DD.log   历史（最多 30 天，总量上限 2GB）
+#   由 guard-app/src/main/resources/logback-spring.xml 负责，
+#   所有 profile 都生效（2026-11-26 起，之前只有 pro）。
+#   客户要求：「无论是怎么运行，也要保证 1 天是一个 log 日志文件」。
+#
+#   所以：实时排障看 docker logs，按日期回溯看 logs/ 下的文件。
 x-logging: &default-logging
   driver: json-file
   options:
@@ -45,7 +58,15 @@ x-db-env: &db-env
   #
   # 想用其他时区：在 .env 里写 TZ=Asia/Tokyo 即可覆盖。
   TZ: ${TZ:-Asia/Shanghai}
-  SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-thingsboard}
+  # 数据库地址可指向**另一台机器**（2026-11-26 加）。
+  #
+  #   DB_HOST 默认 postgres = compose 里的本机容器（常规部署，行为不变）；
+  #   另一台电脑想共用同一份数据时，设 DB_HOST=192.168.x.x + DB_HOST_PORT=15432，
+  #   并**不要启动本机的 postgres 服务**（用 50-use-remote-db.sh 一键切）。
+  #
+  #   注意 DB_HOST_PORT 是**远程库对外的端口**（宿主机映射端口），
+  #   而本机 postgres 容器内部始终是 5432 —— 两者不能混用。
+  SPRING_DATASOURCE_URL: jdbc:postgresql://${DB_HOST:-postgres}:${DB_HOST_PORT:-5432}/${DB_NAME:-thingsboard}
   SPRING_DATASOURCE_USERNAME: ${DB_USER:-postgres}
   SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
   # 实体元数据恒在 Postgres（不可改）。
@@ -239,6 +260,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+        # 远程库模式（DB_HOST 指向别的机器）时本机没有 postgres 服务，
+        # 此时依赖必须可缺省，否则 compose 会报「找不到服务 postgres」。
+        required: false
     environment:
       <<: *db-env
       # RTU / 网关要能上报，就必须让本进程监听设备侧协议。

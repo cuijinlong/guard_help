@@ -19,7 +19,7 @@
 ### 1. 品种指标字典（标准 key）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT count(*) AS 字典项数,
        left(json_value, 120) AS 内容开头
 FROM admin_settings

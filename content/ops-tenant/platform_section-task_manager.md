@@ -19,7 +19,7 @@
 ### 1. 后台任务
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT count(*) AS 任务数,
        count(*) FILTER (WHERE status = 'RUNNING') AS 执行中
 FROM job;

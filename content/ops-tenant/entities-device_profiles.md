@@ -19,12 +19,12 @@
 ### 1. 设备配置
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT dp.name AS 配置, dp.type AS 类型, dp.transport_type AS 传输,
        count(d.id) AS 设备数
 FROM device_profile dp
 LEFT JOIN device d ON d.device_profile_id = dp.id
-WHERE dp.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE dp.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 GROUP BY dp.id, dp.name, dp.type, dp.transport_type ORDER BY 4 DESC;
 SQL
 ```
@@ -35,11 +35,11 @@ SQL
 | --- | --- | --- | --- |
 | 电能表 | DEFAULT | DEFAULT | 15 |
 | 风冷冷水机 | DEFAULT | DEFAULT | 9 |
-| 网关 | DEFAULT | DEFAULT | 4 |
 | 新风机组 | DEFAULT | DEFAULT | 4 |
 | 单相电能表 | DEFAULT | DEFAULT | 4 |
+| 网关 | DEFAULT | DEFAULT | 4 |
 | 室内环境变送器 | DEFAULT | DEFAULT | 3 |
+| PLC控制柜 | DEFAULT | DEFAULT | 2 |
 | 立式管道离心泵 | DEFAULT | DEFAULT | 2 |
-| 热水泵 | DEFAULT | DEFAULT | 2 |
 
 **判据**：设备数为 0 的配置是残留。改了配置里的规则链，只影响之后创建的设备。

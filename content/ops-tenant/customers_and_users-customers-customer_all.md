@@ -19,13 +19,13 @@
 ### 1. 客户清单
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT c.title AS 客户, count(d.id) AS 设备数,
        (SELECT count(*) FROM asset a WHERE a.customer_id = c.id) AS 资产数,
        to_timestamp(c.created_time / 1000) AS 创建时间
 FROM customer c
 LEFT JOIN device d ON d.customer_id = c.id
-WHERE c.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE c.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 GROUP BY c.id, c.title, c.created_time ORDER BY c.created_time;
 SQL
 ```

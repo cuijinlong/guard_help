@@ -440,7 +440,7 @@ command:
 docker exec energy-server date        # 期望带 CST，且与宿主机 `date` 一致
 
 # ② 数据库会话时区（最容易漏的一条）
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc \
+docker exec energy-postgres psql -U administrator -d guarddb -tAc \
   "SELECT now(), current_setting('TimeZone')"
 # 期望：...+08 | Asia/Shanghai
 
@@ -928,7 +928,7 @@ curl -s --noproxy '*' -H "X-Authorization: Bearer $TOKEN" \
 #### 校验 SQL（改完方案后必跑）
 
 ```bash
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+docker exec energy-postgres psql -U administrator -d guarddb -tAc "
 SELECT s.name, a.json_v::text FROM attribute_kv a
 JOIN key_dictionary kd ON kd.key_id=a.attribute_key
 JOIN asset s ON s.id=a.entity_id

@@ -19,10 +19,10 @@
 ### 1. 白标配置项
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT coalesce(type::text, '(默认)') AS 类型, left(settings::text, 120) AS 配置
 FROM white_labeling
-WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') OR tenant_id IS NULL
+WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) OR tenant_id IS NULL
 ORDER BY 1;
 SQL
 ```

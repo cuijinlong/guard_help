@@ -19,10 +19,10 @@
 ### 1. 计算字段
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT name AS 名称, type AS 类型, entity_type AS 实体类型, count(*) OVER () AS 总数
 FROM calculated_field
-WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') ORDER BY entity_type, name;
+WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) ORDER BY entity_type, name;
 SQL
 ```
 

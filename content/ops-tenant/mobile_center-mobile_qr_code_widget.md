@@ -19,7 +19,7 @@
 ### 1. 二维码配置
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT count(*) AS 配置数 FROM qr_code_settings;
 SQL
 ```

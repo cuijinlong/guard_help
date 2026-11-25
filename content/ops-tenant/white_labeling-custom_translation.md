@@ -19,10 +19,10 @@
 ### 1. 自定义翻译条目
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT locale_code AS 语言, count(*) AS 键数
 FROM custom_translation
-WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') OR tenant_id IS NULL
+WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) OR tenant_id IS NULL
 GROUP BY 1 ORDER BY 1;
 SQL
 ```

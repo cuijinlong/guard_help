@@ -22,8 +22,8 @@
 ### 1. 复盘用到的机组遥测（当日）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT kd.key AS 键, count(*) AS 点数,
        round(avg(k.dbl_v)::numeric, 2) AS 均值,
        to_timestamp(max(k.ts) / 1000) AS 最新
@@ -41,8 +41,8 @@ SQL
 
 | 键 | 点数 | 均值 | 最新 |
 | --- | --- | --- | --- |
-| ahu_freq | 2167 | 28.34 | 2026-11-25 17:51:22+08 |
-| indoor_co2 | 1632 | 675.02 | 2026-11-25 17:51:23+08 |
-| indoor_temp | 1632 | 24.16 | 2026-11-25 17:51:23+08 |
+| ahu_freq | 3700 | 28.07 | 2026-11-26 01:46:19+08 |
+| indoor_co2 | 2799 | 671.65 | 2026-11-26 01:46:23+08 |
+| indoor_temp | 2799 | 23.36 | 2026-11-26 01:46:23+08 |
 
 **判据**：当日有数才算得出口径。空白报告 = 当天机组没上报。

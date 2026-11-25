@@ -22,8 +22,8 @@
 ### 1. 空调设备的实时键
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT d.name AS 设备, kd.key AS 键, k.dbl_v AS 值,
        to_timestamp(k.ts / 1000) AS 时间
 FROM ts_kv_latest k
@@ -40,13 +40,13 @@ SQL
 
 | 设备 | 键 | 值 | 时间 |
 | --- | --- | --- | --- |
-| AHU-SIM·平台演示中心 | ahu_freq | 42.7 | 2026-11-25 17:51:19+08 |
-| A栋 1#锅炉·平台演示中心 | boiler_run_count |  | 2026-11-25 17:51:22+08 |
-| A栋 2#锅炉·平台演示中心 | boiler_run_count |  | 2026-11-25 17:51:22+08 |
-| A栋 室内环境·平台演示中心 | indoor_co2 | 490 | 2026-11-25 17:51:22+08 |
-| A栋 室内环境·平台演示中心 | indoor_temp | 22.9 | 2026-11-25 17:51:22+08 |
-| A栋 新风机组·平台演示中心 | ahu_freq | 42.5 | 2026-11-25 17:51:22+08 |
-| A栋 热水泵(大)·平台演示中心 | pump_freq_big | 40.72 | 2026-11-25 17:51:22+08 |
-| A栋 热水泵(大)·平台演示中心 | pump_run_big |  | 2026-11-25 17:51:22+08 |
+| AHU-SIM·平台演示中心 | ahu_freq | 41.79 | 2026-11-26 01:46:10+08 |
+| A栋 1#锅炉·平台演示中心 | boiler_run_count |  | 2026-11-26 01:46:20+08 |
+| A栋 2#锅炉·平台演示中心 | boiler_run_count |  | 2026-11-26 01:46:20+08 |
+| A栋 室内环境·平台演示中心 | indoor_co2 | 804 | 2026-11-26 01:46:22+08 |
+| A栋 室内环境·平台演示中心 | indoor_temp | 23.9 | 2026-11-26 01:46:22+08 |
+| A栋 新风机组·平台演示中心 | ahu_freq | 38.56 | 2026-11-26 01:46:19+08 |
+| A栋 热水泵(大)·平台演示中心 | pump_freq_big | 46.4 | 2026-11-26 01:46:21+08 |
+| A栋 热水泵(大)·平台演示中心 | pump_run_big |  | 2026-11-26 01:46:21+08 |
 
 **判据**：室内温湿度/CO₂ 有空值 = 该设备没接环境传感器（不影响机组本身）。

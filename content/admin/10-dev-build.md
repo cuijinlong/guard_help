@@ -113,6 +113,33 @@ bash scripts/dev-fast-build.sh --sync
 
 脚本里有个兜底：检测到「改动文件 > 20 个」会自动退回全量 javac。
 
+### 2.3b 不想记这些？用 `run.sh` 的自动判断（2026-11-26）
+
+上表列的判断条件不用人脑记 —— `run.sh` 会自己比 mtime：
+
+```bash
+cd ~/Documents/workspace/iot-rule-engine
+
+bash guard-server/run.sh dev --check       # 只诊断：要不要打、为什么
+bash guard-server/run.sh dev --build-only  # 只打包 + 同步 jar（不启动）
+bash guard-server/run.sh dev               # 需要时打包，然后启动
+bash guard-server/run.sh dev --no-build    # 跳过打包（源码较新时会警告）
+bash guard-server/run.sh --help            # 完整矩阵
+```
+
+它扫的后缀覆盖 `resources` 下全部类型：
+`.java .kt .yml .yaml .xml .properties .json .sql .ftl .mustache .html .css .js`
+
+**两个它替你避开的坑**：
+
+| 坑 | 症状 |
+| --- | --- |
+| 只比 `.java` | 改 `logback-spring.xml` / 能源 seed `.json` 后不重打包，改动静默失效 |
+| `find -name *.xml` 不加引号 | shell 先展开成 `pom.xml`，别的 xml 永远查不到 |
+
+> 前端（`ui-ngx/src`）**不在** `run.sh` 能力范围：它只告警「前端产物比源码旧」，
+> 不会替你 `npm run build:prod`。改前端仍走 `pack.sh`。
+
 ### 2.4 实测记录
 
 ```bash

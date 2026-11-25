@@ -19,12 +19,12 @@
 ### 1. 实体视图
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT ev.name AS 视图, ev.type AS 类型, ev.entity_type AS 实体类型,
        coalesce(c.title, '—') AS 客户
 FROM entity_view ev
 LEFT JOIN customer c ON c.id = ev.customer_id
-WHERE ev.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') ORDER BY ev.name;
+WHERE ev.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) ORDER BY ev.name;
 SQL
 ```
 

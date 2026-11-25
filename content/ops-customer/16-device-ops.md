@@ -22,8 +22,8 @@
 ### 1. 每台设备最近上报时间（最上面的是掉线的）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT d.name AS 设备, d.type AS 类型,
        to_timestamp(max(k.ts) / 1000) AS 最近上报,
        count(*) AS 键数
@@ -39,13 +39,13 @@ SQL
 
 | 设备 | 类型 | 最近上报 | 键数 |
 | --- | --- | --- | --- |
-| ED1-Gateway | 网关 |  | 1 |
 | Relay-8CH | default |  | 1 |
-| VirtualMeter-1P-Socket | 单相电能表 | 2026-11-01 00:00:00+08 | 1 |
+| ED1-Gateway | 网关 |  | 1 |
 | VirtualMeter-3P-Power | 电能表 | 2026-11-01 00:00:00+08 | 1 |
+| VirtualMeter-1P-Socket | 单相电能表 | 2026-11-01 00:00:00+08 | 1 |
 | PowerMeter-DDSU666 | 单相电能表 | 2026-11-16 23:59:59+08 | 34 |
 | Sensor-HZ8706 | 温湿度变送器 | 2026-11-25 10:48:49+08 | 2 |
-| WaterMeter-SIM·平台演示中心 | 水表 | 2026-11-25 17:51:18+08 | 4 |
-| 天骄-PLC网关·生产园区 | 网关 | 2026-11-25 17:51:18+08 | 4 |
+| 演示进线-4 电机启动分析 | 电能表 | 2026-11-26 01:46:07+08 | 25 |
+| 天骄-PLC网关·生产园区 | 网关 | 2026-11-26 01:46:07+08 | 8 |
 
 **判据**：`最近上报` 为空 = 从没上报过；超过 24 小时 = 掉线。

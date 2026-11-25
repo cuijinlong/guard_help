@@ -19,11 +19,11 @@
 ### 1. Trend 分析的数据集（spsspro 侧，存在同一个库）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT name AS 数据集, source_type AS 来源, status AS 状态,
        point_count AS 点数, completeness AS 完整率
 FROM pq_dataset
-WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 ORDER BY created_time DESC LIMIT 20;
 SQL
 ```

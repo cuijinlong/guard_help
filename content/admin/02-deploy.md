@@ -234,7 +234,7 @@ bash docker-01-install.sh
 想确认真的建好了，再查一次：
 
 ```bash
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc \
+docker exec energy-postgres psql -U administrator -d guarddb -tAc \
   "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"
 ```
 
@@ -246,6 +246,105 @@ docker exec energy-postgres psql -U postgres -d thingsboard -tAc \
 | --- | --- |
 | `库已有 N 张表` | 这台装过了。**不要重来**，直接去第 5 步 |
 | `NoSuchFileException: .../sql/schema-entities.sql` | 部署目录不完整，回第 3 步 |
+
+---
+
+## 第 4b 步　用另一台电脑的数据库（可选，2026-11-26）
+
+### 什么时候用
+
+两台电脑，其中一台（A）已经跑着完整平台和数据库，另一台（B）想直接
+连 A 的库做开发 —— **不装第二个数据库、不复制数据**。
+
+本文的现网环境就是这种：数据库在 **A**（`192.168.31.198`），B 连过去。
+
+### A 机（数据库服务器）要做的事
+
+只有一件：让库能被局域网访问。
+
+```bash
+# 确认 .env 里这两行
+DB_BIND_ADDR=0.0.0.0     # 绑所有网卡，局域网才能连
+DB_PORT=15432            # 对外端口（容器内始终 5432）
+```
+
+改完 `docker compose --profile split up -d postgres` 重建容器。
+验证（在 B 机上跑）：
+
+```bash
+nc -z -v 192.168.31.198 15432    # 出现 succeeded 就通
+```
+
+> ⚠ **不要把 `pg_hba.conf` 改成 `trust`**。局域网能访问之后，
+> 安全性完全依赖密码强度。
+
+### B 机（开发机）要做的事
+
+```bash
+# 1. 拉同一份代码
+git clone <仓库地址> iot-rule-engine
+cd iot-rule-engine/shiyongshouce/downloads/deploy
+
+# 2. 生成 .env（不会建库，只生成配置）
+bash docker-00-prepare.sh
+
+# 3. 把 jar 放到位（文件名必须是 guard-server-4.4.0.jar）
+#    从 A 机拷，或在本机构建：
+#    cd ../../../guard-server && bash pack.sh --skip-ui --no-sync
+
+# 4. 一键切到 A 的库
+bash docker-50-use-remote-db.sh \
+  --host 192.168.31.198 --port 15432 \
+  --db guarddb --user administrator --password 'CJLqh@163'
+```
+
+脚本会依次做四件事（每步失败就停，不会留下半配状态）：
+
+1. 校验远程库**真的连得上**（连不上直接退出）；
+2. 校验库里有 **≥50 张表**（空库说明连错了，连上去也只会白屏）；
+3. 把 `DB_HOST` / `DB_HOST_PORT` / 库名 / 用户 / 密码写进 `.env`；
+4. 停本机 postgres，用 `--no-deps` 起 `energy-server` / `gateway` / `waveform-store`
+   —— **跳过 install**，因为远程库已有完整 schema 与数据。
+
+成功的样子：
+
+```
+  ✓ 连接成功
+  ✓ 库结构正常（153 张表）
+  ✓ .env 已更新
+  ✓ 已停
+  ✓ healthy（45s）
+  ✓ 登录成功 —— 本机已连上 192.168.31.198:15432/guarddb
+```
+
+### 开发模式（不跑 Docker 后端）
+
+想直接 `bash guard-server/run.sh` 在宿主机调试时，用 `dev-db.env`：
+
+```bash
+cd guard-server
+cp dev-db.env.example dev-db.env     # 已填好本次的地址，按需改
+bash run.sh
+# 输出里应出现：读取本机数据库配置：guard-server/dev-db.env
+#                SPRING_DATASOURCE_URL = jdbc:postgresql://192.168.31.198:15432/guarddb
+```
+
+`dev-db.env` **不入库**（`.gitignore` 已排除），每台机器各写各的。
+
+### 三条硬性限制
+
+| 限制 | 为什么 |
+| --- | --- |
+| **不要**在 B 机跑 `docker-01-install.sh` | 它会重跑 TB install，在共享库上重复建表/装资源 |
+| **不要**在 B 机跑 `docker-99-uninstall.sh --purge` | 那个删的是**本机**数据卷；但若误配成远程库，删的是共享卷（极端情况下同名卷会被清） |
+| **不要**在 B 机开演示模拟器 | 两台机器同时写同一份数据会互相覆盖（`.env` 里 `SPSSPRO_SIMULATOR_ENABLED=false`） |
+
+### 改回本机库
+
+```bash
+# .env：把 DB_HOST 改回空（或 postgres），DB_HOST_PORT 改回 5432
+docker compose --profile split up -d postgres energy-server
+```
 
 ---
 
@@ -5314,7 +5413,7 @@ bash scripts/34-rtu-diagnose.sh --customer '某某厂区'
 cd ~/energy-app
 
 # ① 三台设备有遥测（把名字换成核对卡上的）
-docker exec energy-postgres psql -U postgres -d thingsboard -tAc "
+docker exec energy-postgres psql -U administrator -d guarddb -tAc "
 select d.name, count(*) from ts_kv k join device d on d.id=k.entity_id
  where d.name in ('PowerMeter-DDSU666','Sensor-HZ8706','Relay-8CH')
  group by d.name;"
@@ -5382,6 +5481,47 @@ sudo firewall-cmd --add-port=8090/tcp --permanent && sudo firewall-cmd --reload
 ```
 
 云服务器还要在控制台安全组放行 8090。放行方法见本页末尾「附录：出问题时查」的第一节。
+
+---
+
+## 日志在哪（一天一个文件）
+
+**客户要求**：「无论是怎么运行，也要保证 1 天是一个 log 日志文件」。
+
+| 文件 | 内容 | 保留 |
+| --- | --- | --- |
+| `~/energy-app/logs/guard-server.log` | **今天**的应用日志 | — |
+| `~/energy-app/logs/guard-server.2026-11-25.log` | 昨天的 | 30 天 |
+| `~/energy-app/logs/guard-server.2026-11-24.log` | 前天… | 30 天 |
+
+过 0 点，当天的 `guard-server.log` 会被重命名成带日期的归档，再开新的一份。
+总量上限 2GB，超了从最旧的删。
+
+**常用命令**：
+
+```bash
+tail -f ~/energy-app/logs/guard-server.log          # 实时跟今天
+ls -lt ~/energy-app/logs/guard-server.*.log | head  # 有哪几天的
+less ~/energy-app/logs/guard-server.2026-11-25.log  # 看某一天
+```
+
+**验收（装完必须看一眼）**：
+
+```bash
+ls -l ~/energy-app/logs/guard-server.log
+head -2 ~/energy-app/logs/guard-server.log
+```
+
+必须**存在、不是 0 字节、第一行是启动日志**。
+
+> ⚠ **`docker logs energy-server` 不是归档**。
+> 它按大小滚动（50MB × 5 份），写满就丢最旧的，**不按天**。
+> 实时排障可以用它，但要回溯「昨天某条报错」只能看 `logs/` 下的文件。
+> 两者都要留：前者方便，后者可查。
+
+> 早期版本（2026-11-26 之前）只有在 `SPRING_PROFILE=pro` 时才写文件，
+> 而默认安装是 `dev` —— 所以 `logs/` 里**一个文件都没有**。
+> 如果你在旧环境看到 `logs/` 是空的，就是这个原因；升级 jar 即可。
 
 ---
 

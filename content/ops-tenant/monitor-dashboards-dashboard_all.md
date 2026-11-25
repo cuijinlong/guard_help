@@ -19,14 +19,14 @@
 ### 1. 全部看板（含共享给客户的）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT d.title AS 看板,
        coalesce(c.title, '—') AS 所属客户,
        d.assigned_customers AS 共享客户,
        (SELECT count(*) FROM jsonb_object_keys(d.configuration::jsonb->'widgets')) AS 部件数
 FROM dashboard d
 LEFT JOIN customer c ON c.id = d.customer_id
-WHERE d.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE d.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 ORDER BY d.created_time DESC;
 SQL
 ```

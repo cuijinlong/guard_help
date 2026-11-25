@@ -19,7 +19,7 @@
 ### 1. OAuth2 域名
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT name AS 域名, oauth2_enabled AS 启用OAuth2
 FROM domain ORDER BY name;
 SQL

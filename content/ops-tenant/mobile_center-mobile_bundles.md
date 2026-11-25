@@ -19,9 +19,9 @@
 ### 1. 移动应用包
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT title AS 包名, oauth2_enabled AS 启用OAuth2
-FROM mobile_app_bundle WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') ORDER BY title;
+FROM mobile_app_bundle WHERE tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) ORDER BY title;
 SQL
 ```
 

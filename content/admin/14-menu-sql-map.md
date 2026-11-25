@@ -9,7 +9,7 @@
 ## 0. 通用前置（每页都要用）
 
 ```bash
-docker exec -it energy-postgres psql -U postgres -d thingsboard
+docker exec -it energy-postgres psql -U administrator -d guarddb
 ```
 
 **取客户 id（顶栏一级：先选客户）**
@@ -24,7 +24,7 @@ FROM customer ORDER BY created_time;
 ```sql
 SELECT id, name, label
 FROM asset
-WHERE type = '场站' AND customer_id = (SELECT id FROM customer WHERE title = '平台演示中心')
+WHERE type = '场站' AND customer_id = '<客户id>'::uuid
 ORDER BY name;
 ```
 
@@ -41,7 +41,7 @@ UNION ALL SELECT 'key_dictionary（重复项提醒）', count(*),
 FROM (SELECT key FROM key_dictionary GROUP BY key HAVING count(*) > 1) d;
 ```
 
-> 下面所有 SQL 里的客户名都是 `'平台演示中心'` —— **换成你自己的客户名**即可。
+> 下面所有 SQL 都按**客户名/租户名**过滤（`平台演示中心` / `星河能源集团`），换环境时替换成你的名字即可 —— 不必先去查 id。
 > 时间字段 `ts` 是 epoch 毫秒，`to_timestamp(ts/1000)` 出来是北京时间。
 
 > 三个会得出相反结论的坑：`attribute_kv` 没有 `entity_type` 列（只能按 entity_id join）、
@@ -114,7 +114,7 @@ FROM dashboard d WHERE d.id = '73dd2240-d2bd-11f1-b794-31725d9e3862';
 *1. 资产汇总键：各品种 *_total 的点数与合计*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT kd.key AS 键, count(*) AS 点数,
        round(sum(t.dbl_v)::numeric, 2) AS 合计,
        to_timestamp(max(t.ts) / 1000) AS 最新
@@ -124,13 +124,15 @@ JOIN asset a ON a.id = t.entity_id
 WHERE a.customer_id = (SELECT id FROM c)
   -- 括号不能省：AND 优先级高于 OR
   AND (kd.key LIKE '%\_total' ESCAPE '\' OR kd.key = 'energy_day')
+  -- 时间范围：与页面顶部「查询设置」一致；下面给的是近 90 天
+  AND t.ts >= (extract(epoch FROM now() - interval '90 day') * 1000)::bigint
 GROUP BY 1 ORDER BY 2 DESC;
 ```
 
 *2. 哪些场站的汇总没写（空节点也要写，否则整页空白）*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT s.name AS 场站,
        count(t.*) AS 该场站资产上的汇总点数
 FROM asset s
@@ -172,7 +174,7 @@ FROM dashboard d WHERE d.id = '74466b60-d2bd-11f1-b794-31725d9e3862';
 *1. 每台设备的最新值（看板读的就是 ts_kv_latest）*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT d.name AS 设备, kd.key AS 键, t.dbl_v AS 值,
        to_timestamp(t.ts / 1000) AS 时间
 FROM ts_kv_latest t
@@ -212,7 +214,7 @@ FROM dashboard d WHERE d.id = '73e6bf30-d2bd-11f1-b794-31725d9e3862';
 *1. 区间用量 = 末值 − 初值（表底差，不是求和）*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心'),
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1),
 w AS (SELECT (extract(epoch FROM now() - interval '7 day') * 1000)::bigint AS f,
              (extract(epoch FROM now()) * 1000)::bigint AS e)
 SELECT d.name AS 设备,
@@ -266,14 +268,14 @@ SELECT b.period AS 账期, b.status AS 状态, b.trigger_type AS 触发方式,
        b.missing_count AS 缺抄, b.abnormal_count AS 异常,
        to_timestamp(b.reading_time / 1000) AS 抄表时间
 FROM meter_reading_batch b
-WHERE b.tenant_id = (SELECT tenant_id FROM customer WHERE title = '平台演示中心')
+WHERE b.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 ORDER BY b.created_time DESC LIMIT 10;
 ```
 
 *2. 明细条数 / 用量按账期汇总*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT period AS 账期, source AS 来源, quality AS 质量,
        count(*) AS 条数, round(sum(usage)::numeric, 2) AS 用量合计
 FROM meter_reading_record
@@ -310,7 +312,7 @@ FROM dashboard d WHERE d.id = '745670f0-d2bd-11f1-b794-31725d9e3862';
 *1. 五个时段键各自的点数与合计*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT kd.key AS 时段键, count(*) AS 点数,
        round(sum(k.dbl_v)::numeric, 2) AS 合计
 FROM ts_kv k
@@ -318,6 +320,8 @@ JOIN key_dictionary kd ON kd.key_id = k.key
 JOIN device d ON d.id = k.entity_id
 WHERE d.customer_id = (SELECT id FROM c)
   AND kd.key IN ('energy_tip', 'energy_peak', 'energy_flat', 'energy_valley', 'energy_deep')
+  -- 时间范围：与页面顶部「查询设置」一致；下面给的是近 90 天
+  AND k.ts >= (extract(epoch FROM now() - interval '90 day') * 1000)::bigint
 GROUP BY 1 ORDER BY 1;
 ```
 
@@ -365,7 +369,7 @@ FROM dashboard d WHERE d.id = '7412d840-d2bd-11f1-b794-31725d9e3862';
 *1. 分项资产上各品种的汇总*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 分项, kd.key AS 键, count(*) AS 点数,
        round(sum(k.dbl_v)::numeric, 2) AS 合计
 FROM ts_kv k
@@ -373,6 +377,8 @@ JOIN key_dictionary kd ON kd.key_id = k.key
 JOIN asset a ON a.id = k.entity_id
 WHERE a.type = '分项' AND a.customer_id = (SELECT id FROM c)
   AND kd.key LIKE '%\_total' ESCAPE '\'
+  -- 时间范围：与页面顶部「查询设置」一致；下面给的是近 90 天
+  AND k.ts >= (extract(epoch FROM now() - interval '90 day') * 1000)::bigint
 GROUP BY 1, 2 ORDER BY 1, 2;
 ```
 
@@ -408,7 +414,7 @@ FROM dashboard d WHERE d.id = '7397b4d0-d2bd-11f1-b794-31725d9e3862';
 *1. 区域资产上各品种的汇总*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 区域, kd.key AS 键, count(*) AS 点数,
        round(sum(k.dbl_v)::numeric, 2) AS 合计
 FROM ts_kv k
@@ -416,6 +422,8 @@ JOIN key_dictionary kd ON kd.key_id = k.key
 JOIN asset a ON a.id = k.entity_id
 WHERE a.type = '区域' AND a.customer_id = (SELECT id FROM c)
   AND kd.key LIKE '%\_total' ESCAPE '\'
+  -- 时间范围：与页面顶部「查询设置」一致；下面给的是近 90 天
+  AND k.ts >= (extract(epoch FROM now() - interval '90 day') * 1000)::bigint
 GROUP BY 1, 2 ORDER BY 1, 2;
 ```
 
@@ -448,7 +456,7 @@ FROM dashboard d WHERE d.id = '7431aae0-d2bd-11f1-b794-31725d9e3862';
 *1. 账单列表（金额在 asset 属性里，不在 billing 表）*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 账单元, a.label,
        max(CASE WHEN kd.key = 'period' THEN ak.str_v END) AS 账期,
        max(CASE WHEN kd.key = 'usage'  THEN ak.dbl_v END) AS 用量,
@@ -465,7 +473,7 @@ ORDER BY 账期 DESC;
 *2. 金额分解：amount 应等于四项之和*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name,
        max(CASE WHEN kd.key = 'amount'        THEN ak.dbl_v END) AS 金额,
        max(CASE WHEN kd.key = 'energyFee'     THEN ak.dbl_v END) AS 电度电费,
@@ -515,7 +523,7 @@ FROM dashboard d WHERE d.id = '73b500d0-d2bd-11f1-b794-31725d9e3862';
 *1. 报表取数的设备键（与历史能耗同一口径）*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT d.name AS 设备, kd.key AS 键, count(*) AS 点数,
        to_timestamp(max(k.ts) / 1000) AS 最新
 FROM ts_kv k
@@ -523,6 +531,8 @@ JOIN key_dictionary kd ON kd.key_id = k.key
 JOIN device d ON d.id = k.entity_id
 WHERE d.customer_id = (SELECT id FROM c)
   AND kd.key IN ('energy_reading', 'energy', 'power_total')
+  -- 时间范围：与页面顶部「查询设置」一致；下面给的是近 90 天
+  AND k.ts >= (extract(epoch FROM now() - interval '90 day') * 1000)::bigint
 GROUP BY 1, 2 ORDER BY 1, 2;
 ```
 
@@ -602,7 +612,7 @@ FROM dashboard d WHERE d.id = '74091440-d2bd-11f1-b794-31725d9e3862';
 *1. 场站的闲时配置（JSON 属性 idleConfig）*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 场站, left(ak.json_v::text, 200) AS 配置
 FROM asset a
 JOIN attribute_kv ak ON ak.entity_id = a.id
@@ -617,7 +627,9 @@ WHERE a.type = '场站' AND a.customer_id = (SELECT id FROM c)
 SELECT kd.key AS 键, count(*) AS 点数, round(sum(k.dbl_v)::numeric, 2) AS 合计
 FROM ts_kv k
 JOIN key_dictionary kd ON kd.key_id = k.key
-WHERE kd.key LIKE 'idle\_%' ESCAPE '\' OR kd.key = 'work_energy'
+WHERE (kd.key LIKE 'idle\_%' ESCAPE '\' OR kd.key = 'work_energy')
+  -- 时间范围：与页面顶部「查询设置」一致；下面给的是近 90 天
+  AND k.ts >= (extract(epoch FROM now() - interval '90 day') * 1000)::bigint
 GROUP BY 1 ORDER BY 2 DESC;
 ```
 
@@ -651,7 +663,7 @@ FROM dashboard d WHERE d.id = '741d86a0-d2bd-11f1-b794-31725d9e3862';
 *1. 预测的输入：近 7 天逐小时功率*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT date_trunc('day', to_timestamp(k.ts / 1000)) AS 日期,
        count(*) AS 点数,
        round(avg(k.dbl_v)::numeric, 2) AS 平均功率,
@@ -695,7 +707,7 @@ FROM dashboard d WHERE d.id = '1cebb370-da6f-11f1-aec2-1192e109281d';
 ```sql
 -- 坑：这张表的 customer_id 目前**全为空**（历史回填没补上），
 --     按客户过滤会一条都查不到，看起来像「没跑过诊断」。按租户查。
-WITH t AS (SELECT tenant_id FROM customer WHERE title = '平台演示中心')
+WITH t AS (SELECT tenant_id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT intent AS 类别, kind AS 类型, severity AS 级别,
        site_id AS 场站, count(*) AS 条数,
        max(run_at) AS 最近运行
@@ -732,7 +744,7 @@ FROM dashboard d WHERE d.id = '1d661390-da6f-11f1-aec2-1192e109281d';
 *1. 电能质量结论（intent=power_quality）*
 
 ```sql
-WITH t AS (SELECT tenant_id FROM customer WHERE title = '平台演示中心')
+WITH t AS (SELECT tenant_id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT intent AS 类别, kind AS 类型, severity AS 级别, metric AS 指标,
        site_id AS 场站, count(*) AS 条数, max(run_at) AS 最近运行
 FROM energy_analysis_finding
@@ -768,7 +780,7 @@ FROM dashboard d WHERE d.id = '573f38b0-d3d2-11f1-9ee9-c3a7be535a93';
 *1. 按类型与级别统计（含未清除数）*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT type AS 类型, severity AS 级别, count(*) AS 条数,
        count(*) FILTER (WHERE clear_ts IS NULL) AS 未清除
 FROM alarm
@@ -812,7 +824,7 @@ FROM dashboard d WHERE d.id = 'a9061a40-d3ca-11f1-9ee9-c3a7be535a93';
 *1. 每台设备最近上报时间（最上面的是掉线的）*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT d.name AS 设备, d.type AS 类型,
        to_timestamp(max(k.ts) / 1000) AS 最近上报,
        count(*) AS 键数
@@ -924,13 +936,15 @@ FROM dashboard d WHERE d.id = '73ba09e0-d2bd-11f1-b794-31725d9e3862';
 *1. 折标煤 / 碳排 / 费用 的输入：各品种合计*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT kd.key AS 键, count(*) AS 点数, round(sum(k.dbl_v)::numeric, 2) AS 合计
 FROM ts_kv k
 JOIN key_dictionary kd ON kd.key_id = k.key
 JOIN asset a ON a.id = k.entity_id
 WHERE a.customer_id = (SELECT id FROM c)
   AND kd.key LIKE '%\_total' ESCAPE '\'
+  -- 时间范围：与页面顶部「查询设置」一致；下面给的是近 90 天
+  AND k.ts >= (extract(epoch FROM now() - interval '90 day') * 1000)::bigint
 GROUP BY 1 ORDER BY 2 DESC;
 ```
 
@@ -974,7 +988,7 @@ FROM dashboard d WHERE d.id = '744ef6e0-d2bd-11f1-b794-31725d9e3862';
 *1. 流向的骨架：Contains 关系（谁包含谁）*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT pa.name AS 上级, pa.type AS 上级类型,
        ca.name AS 下级, ca.type AS 下级类型
 FROM relation r
@@ -1014,7 +1028,7 @@ FROM dashboard d WHERE d.id = '73abb200-d2bd-11f1-b794-31725d9e3862';
 *1. 已保存的盘查版本*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 版本, a.label AS 范围, count(ak.*) AS 属性数,
        to_timestamp(a.created_time / 1000) AS 创建时间
 FROM asset a
@@ -1052,7 +1066,7 @@ FROM dashboard d WHERE d.id = '7452c770-d2bd-11f1-b794-31725d9e3862';
 *1. 节能项目与其核验字段*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 项目,
        max(CASE WHEN kd.key = 'actualSaving'  THEN ak.dbl_v END) AS 实际节约,
        max(CASE WHEN kd.key = 'targetSaving'  THEN ak.dbl_v END) AS 目标节约,
@@ -1093,7 +1107,7 @@ FROM dashboard d WHERE d.id = '73f58c40-d2bd-11f1-b794-31725d9e3862';
 *1. 空调设备的实时键*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT d.name AS 设备, kd.key AS 键, k.dbl_v AS 值,
        to_timestamp(k.ts / 1000) AS 时间
 FROM ts_kv_latest k
@@ -1133,7 +1147,7 @@ FROM dashboard d WHERE d.id = '74001390-d2bd-11f1-b794-31725d9e3862';
 *1. 运行模式资产：配置在单个 JSON 属性 hvacMode 里*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT a.name AS 模式, a.label AS 季节,
        ak.str_v::json->>'season'   AS 季节码,
        ak.str_v::json->>'dateType' AS 日期类型,
@@ -1175,7 +1189,7 @@ FROM dashboard d WHERE d.id = '73ed9d00-d2bd-11f1-b794-31725d9e3862';
 *1. 复盘用到的机组遥测（当日）*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT kd.key AS 键, count(*) AS 点数,
        round(avg(k.dbl_v)::numeric, 2) AS 均值,
        to_timestamp(max(k.ts) / 1000) AS 最新
@@ -1228,7 +1242,7 @@ ORDER BY c.title, a.name;
 *2. 场站绑定的电价方案（关系类型 uses，不是属性）*
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT s.name AS 场站, t.name AS 方案模板,
        (SELECT ak.str_v FROM attribute_kv ak JOIN key_dictionary kd ON kd.key_id = ak.attribute_key
         WHERE ak.entity_id = t.id AND kd.key = 'energy' LIMIT 1) AS 能源品种
@@ -1264,15 +1278,16 @@ ORDER BY 1, 3;
 ## 4. 全量体检（一条 SQL 看八件事）
 
 ```sql
-WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心')
+WITH c AS (SELECT id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT '客户'  AS 检查项, (SELECT count(*) FROM customer)::text AS 值, '至少 1 个' AS 期望
 UNION ALL SELECT '场站', (SELECT count(*) FROM asset WHERE type='场站' AND customer_id=(SELECT id FROM c))::text, '≥1'
 UNION ALL SELECT '设备', (SELECT count(*) FROM device WHERE customer_id=(SELECT id FROM c))::text, '>0'
 UNION ALL SELECT '有遥测的设备', (SELECT count(DISTINCT entity_id) FROM ts_kv_latest
        WHERE entity_id IN (SELECT id FROM device WHERE customer_id=(SELECT id FROM c)))::text, '= 设备数'
-UNION ALL SELECT '资产汇总键', (SELECT count(*) FROM ts_kv k
+UNION ALL SELECT '资产汇总键（近7天）', (SELECT count(*) FROM ts_kv k
        JOIN key_dictionary kd ON kd.key_id=k.key JOIN asset a ON a.id=k.entity_id
-       WHERE a.customer_id=(SELECT id FROM c) AND kd.key LIKE '%\_total' ESCAPE '\')::text, '>0'
+       WHERE a.customer_id=(SELECT id FROM c) AND kd.key LIKE '%\_total' ESCAPE '\'
+         AND k.ts >= (extract(epoch FROM now() - interval '7 day') * 1000)::bigint)::text, '>0'
 UNION ALL SELECT '未清除告警', (SELECT count(*) FROM alarm
        WHERE customer_id=(SELECT id FROM c) AND clear_ts IS NULL)::text, '可多可少'
 UNION ALL SELECT '诊断结论', (SELECT count(*) FROM energy_analysis_finding

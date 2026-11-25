@@ -19,7 +19,7 @@
 ### 1. 双因素配置（存在 admin_settings 里）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT key AS 配置项, left(json_value, 120) AS 值
 FROM admin_settings
 WHERE key ILIKE '%twofa%' OR key ILIKE '%two_factor%';

@@ -15,7 +15,7 @@
 所有页面的 SQL 都按客户名过滤。先确认你的客户叫什么：
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT id, title FROM customer ORDER BY created_time;
 SQL
 ```

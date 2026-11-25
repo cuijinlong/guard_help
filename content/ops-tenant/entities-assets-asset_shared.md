@@ -19,11 +19,11 @@
 ### 1. 按客户归属统计资产
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT coalesce(c.title, '（租户级/未分配）') AS 客户, a.type AS 类型, count(*) AS 数量
 FROM asset a
 LEFT JOIN customer c ON c.id = a.customer_id
-WHERE a.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团')
+WHERE a.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1)
 GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 30;
 SQL
 ```

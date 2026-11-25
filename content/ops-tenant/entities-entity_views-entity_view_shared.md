@@ -19,11 +19,11 @@
 ### 1. 分配给客户的实体视图
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT coalesce(c.title, '（未分配）') AS 客户, count(*) AS 视图数
 FROM entity_view ev
 LEFT JOIN customer c ON c.id = ev.customer_id
-WHERE ev.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') GROUP BY 1 ORDER BY 2 DESC;
+WHERE ev.tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) GROUP BY 1 ORDER BY 2 DESC;
 SQL
 ```
 

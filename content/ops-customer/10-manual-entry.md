@@ -22,7 +22,7 @@
 ### 1. 填报属性挂在设备或分项资产上
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT coalesce(d.name, a.name) AS 实体,
        coalesce(d.type, a.type) AS 类型,
        kd.key AS 属性,

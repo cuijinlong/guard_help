@@ -22,8 +22,8 @@
 ### 1. 电能质量结论（intent=power_quality）
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
-WITH t AS (SELECT tenant_id FROM customer WHERE title = '平台演示中心')
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
+WITH t AS (SELECT tenant_id FROM customer WHERE title = '平台演示中心' LIMIT 1)
 SELECT intent AS 类别, kind AS 类型, severity AS 级别, metric AS 指标,
        site_id AS 场站, count(*) AS 条数, max(run_at) AS 最近运行
 FROM energy_analysis_finding

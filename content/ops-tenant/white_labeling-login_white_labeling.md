@@ -19,10 +19,10 @@
 ### 1. 登录页白标
 
 ```bash
-docker exec -i energy-postgres psql -U postgres -d thingsboard <<'SQL'
+docker exec -i energy-postgres psql -U administrator -d guarddb <<'SQL'
 SELECT coalesce(type::text, '(默认)') AS 类型, left(settings::text, 160) AS 配置
 FROM white_labeling
-WHERE type::text LIKE '%LOGIN%' AND (tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团') OR tenant_id IS NULL);
+WHERE type::text LIKE '%LOGIN%' AND (tenant_id = (SELECT id FROM tenant WHERE title = '星河能源集团' LIMIT 1) OR tenant_id IS NULL);
 SQL
 ```
 
